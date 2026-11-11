@@ -1,0 +1,247 @@
+// Presence beacons: which agent sessions recently took a turn, and where.
+//
+// One JSON file `{beacons: [...]}` keyed by (session id, cwd), so two sessions
+// sharing one working directory stay visible as two beacons. A UserPromptSubmit
+// hook refreshes one entry per session on every turn; entries older than
+// PRESENCE_STALE_MS, and entries whose recorded writer pid is dead, read as
+// absent (an older one whose pid is alive is kept as an idle seat, up to
+// PRESENCE_IDLE_MAX_MS). Advisory only: every write is best-effort
+// and every reader treats a missing file as "nobody here".
+//
+// Store root: AGENT_SWITCHBOARD_DIR (default
+// `${XDG_STATE_HOME:-$HOME/.local/state}/agent-switchboard`). Presence lives
+// at $AGENT_SWITCHBOARD_DIR/presence.json unless AGENT_SWITCHBOARD_PRESENCE_FILE
+// overrides it. The mailbox keeps its own overrides (AGENT_SWITCHBOARD_MAILBOX_DIR
+// / AGENT_MAILBOX_DIR); see lib/agent-mailbox.mjs.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { withRetriedStore } from './store.mjs';
+
+export const switchboardDir = () =>
+  process.env.AGENT_SWITCHBOARD_DIR ??
+  path.join(process.env.XDG_STATE_HOME ?? path.join(os.homedir(), '.local', 'state'), 'agent-switchboard');
+
+export const PRESENCE_FILE =
+  process.env.AGENT_SWITCHBOARD_PRESENCE_FILE ?? path.join(switchboardDir(), 'presence.json');
+
+// A beacon outlives a single tool call but not a parked afternoon: 20 minutes.
+// The mailbox prune imports this; do not restate the number.
+export const PRESENCE_STALE_MS = 20 * 60 * 1000;
+
+// An idle seat keeps its beacon past the TTL so it stays addressable: the
+// writer prunes only a beacon whose pid is dead or that is older than this.
+// Whether an idle beacon still counts as a seat is the reader's call (its
+// kitty window must exist; lib/agent-mailbox.mjs idleBeacons).
+export const PRESENCE_IDLE_MAX_MS = 7 * 24 * 60 * 60 * 1000;
+
+const readPresenceFile = (file) => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return parsed && Array.isArray(parsed.beacons) ? parsed : { beacons: [] };
+  } catch {
+    return { beacons: [] };
+  }
+};
+
+// A beacon may carry the pid of the long-lived process that wrote it (the
+// opencode plugin passes its own; a Claude Code hook is a short-lived child
+// and passes none). A hand-closed opencode window delivers no exit event, so
+// without this its beacon would read as live for the whole TTL.
+// EPERM means the process exists under another user.
+// No pid keeps the TTL rule alone, so older writers read as before.
+export const pidAlive = (pid) => {
+  if (pid == null) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e?.code === 'EPERM';
+  }
+};
+
+export const isLiveBeacon = (b, now = Date.now()) => {
+  const tick = Date.parse(b.lastTick);
+  return Number.isFinite(tick) && now - tick < PRESENCE_STALE_MS && pidAlive(b.pid);
+};
+
+// Past the TTL, writer pid alive, inside the retention horizon: parked, not gone.
+export const isIdleBeacon = (b, now = Date.now()) => {
+  const tick = Date.parse(b.lastTick);
+  return Number.isFinite(tick) && now - tick >= PRESENCE_STALE_MS && now - tick < PRESENCE_IDLE_MAX_MS && pidAlive(b.pid);
+};
+
+const prunePresence = (beacons, now) => beacons.filter((b) => isLiveBeacon(b, now));
+// What a writer keeps on disk: live and idle beacons.
+const retainPresence = (beacons, now) => beacons.filter((b) => isLiveBeacon(b, now) || isIdleBeacon(b, now));
+
+// File backend stays while an explicit {file} override points at JSON, or
+// while the legacy AGENT_SWITCHBOARD_PRESENCE_FILE env is set without an
+// explicit AGENT_SWITCHBOARD_DB (which wins). Otherwise the beacon lives in
+// the SQLite store; the first open imports the legacy file once and leaves
+// it in place.
+const legacyPresenceEnv = () =>
+  process.env.AGENT_MAILBOX_PRESENCE_FILE ?? process.env.AGENT_SWITCHBOARD_PRESENCE_FILE ?? null;
+const usePresenceDb = (file) =>
+  file === undefined && (process.env.AGENT_SWITCHBOARD_DB != null || legacyPresenceEnv() == null);
+const resolvePresenceFile = (file) => file ?? legacyPresenceEnv() ?? PRESENCE_FILE;
+
+// Call-time source: a temp HOME in tests never reads the live file.
+const withPresenceDb = (fn) =>
+  withRetriedStore(() => ({ presenceFile: legacyPresenceEnv() ?? path.join(switchboardDir(), 'presence.json') }), fn);
+
+export const presenceRowToBeacon = (r) => ({
+  sessionId: r.session_id,
+  cwd: r.cwd,
+  ...(r.home_cwd != null ? { homeCwd: r.home_cwd } : {}),
+  branch: r.branch,
+  repo: r.repo,
+  ...(r.mailbox != null ? { mailbox: !!r.mailbox } : {}),
+  ...(r.window_id != null ? { windowId: r.window_id } : {}),
+  ...(r.pid != null ? { pid: r.pid } : {}),
+  ...(r.last_work_tick != null ? { lastWorkTick: r.last_work_tick } : {}),
+  lastWorkCwd: r.last_work_cwd ?? null,
+  firstTick: r.first_tick,
+  lastTick: r.last_tick,
+});
+
+const beaconKey = (b) => `${b.sessionId ?? 'anon'}:${b.cwd}`;
+
+// Refresh this session's presence (call from a UserPromptSubmit hook). Returns
+// the OTHER live beacons.
+export const recordPresence = ({
+  file = undefined,
+  cwd = process.cwd(),
+  homeCwd = null,
+  branch = null,
+  repo = null,
+  sessionId = null,
+  mailbox = null,
+  windowId = null,
+  pid = null,
+  work = false,
+  now = Date.now(),
+} = {}) => {
+  if (usePresenceDb(file)) {
+    return withPresenceDb((store) => {
+      const iso = new Date(now).toISOString();
+      const sid = sessionId ?? 'anon';
+      store.transaction(() => {
+        // Read before the prune: the row that last worked may be the one it deletes.
+        const inherited = store.get(
+          'SELECT last_work_cwd FROM presence_beacons WHERE session_id = ? AND last_work_cwd IS NOT NULL LIMIT 1',
+          sid,
+        )?.last_work_cwd ?? null;
+        store.run('DELETE FROM presence_beacons WHERE last_tick < ?', new Date(now - PRESENCE_IDLE_MAX_MS).toISOString());
+        const me = store.get('SELECT * FROM presence_beacons WHERE session_id = ? AND cwd = ?', sid, cwd);
+        if (me) {
+          store.run(
+            `UPDATE presence_beacons SET last_tick = ?, branch = ?, cwd = ?,
+              home_cwd = COALESCE(?, home_cwd), mailbox = COALESCE(?, mailbox), window_id = COALESCE(?, window_id),
+              pid = COALESCE(?, pid), last_work_tick = COALESCE(?, last_work_tick)
+             WHERE session_id = ? AND cwd = ?`,
+            iso, branch, cwd,
+            homeCwd, mailbox == null ? null : mailbox ? 1 : 0, windowId == null ? null : Number(windowId),
+            pid == null ? null : Number(pid), work ? iso : null,
+            sid, me.cwd,
+          );
+        } else {
+          store.run(
+            `INSERT INTO presence_beacons
+               (session_id, cwd, home_cwd, branch, repo, mailbox, window_id, pid, last_work_tick, last_work_cwd, first_tick, last_tick)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            sid, cwd, homeCwd, branch, repo,
+            mailbox == null ? null : mailbox ? 1 : 0, windowId == null ? null : Number(windowId),
+            pid == null ? null : Number(pid), work ? iso : null, work ? cwd : inherited,
+            iso, iso,
+          );
+        }
+        // Work moves the session's latest work tree on every row it owns.
+        if (work) store.run('UPDATE presence_beacons SET last_work_cwd = ? WHERE session_id = ?', cwd, sid);
+      });
+      const mineKey = beaconKey({ sessionId, cwd });
+      const all = store.all('SELECT * FROM presence_beacons').map(presenceRowToBeacon);
+      // A beacon whose writer is gone is deleted here, not only hidden, so
+      // the next reader does not have to probe it again.
+      for (const b of all) {
+        if (!pidAlive(b.pid)) store.run('DELETE FROM presence_beacons WHERE session_id = ? AND cwd = ?', b.sessionId, b.cwd);
+      }
+      return all.filter((b) => beaconKey(b) !== mineKey && isLiveBeacon(b, now));
+    });
+  }
+  file = resolvePresenceFile(file);
+  const raw = readPresenceFile(file).beacons;
+  const kept = retainPresence(raw, now);
+  // Read from the unpruned list: the beacon that last worked may be pruned now.
+  const inherited = raw.find((b) => (b.sessionId ?? 'anon') === (sessionId ?? 'anon') && b.lastWorkCwd)?.lastWorkCwd ?? null;
+  const iso = new Date(now).toISOString();
+  const mineKey = beaconKey({ sessionId, cwd });
+  const me = kept.find((b) => beaconKey(b) === mineKey);
+  if (me) {
+    me.lastTick = iso;
+    me.branch = branch;
+    me.cwd = cwd;
+    if (homeCwd !== null) me.homeCwd = homeCwd;
+    // Optional consumer flag (the mailbox prompt hook sets true). Merge-only:
+    // an omitted argument must never clear an existing true, since callers
+    // that do not know about the flag run every turn.
+    if (mailbox !== null) me.mailbox = mailbox;
+    // Kitty window id (the mailbox hook sets it from KITTY_WINDOW_ID) so a
+    // window id resolves to the session living in that window, not to
+    // whoever shares its cwd. Same merge-only rule: never clear once set.
+    if (windowId !== null) me.windowId = windowId;
+    if (pid !== null) me.pid = pid;
+    if (work) me.lastWorkTick = iso;
+    if (me.lastWorkCwd == null && inherited !== null) me.lastWorkCwd = inherited;
+  } else {
+    kept.push({ sessionId, cwd, ...(homeCwd ? { homeCwd } : {}), branch, repo, ...(mailbox !== null ? { mailbox } : {}), ...(windowId !== null ? { windowId } : {}), ...(pid !== null ? { pid } : {}), ...(work ? { lastWorkTick: iso } : {}), ...(work ? { lastWorkCwd: cwd } : inherited !== null ? { lastWorkCwd: inherited } : {}), firstTick: iso, lastTick: iso });
+  }
+  // Work moves the session's latest work tree on every beacon it owns.
+  if (work) for (const b of kept) if ((b.sessionId ?? 'anon') === (sessionId ?? 'anon')) b.lastWorkCwd = cwd;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ beacons: kept }, null, 2));
+    fs.renameSync(tmp, file);
+  } catch {
+    // Best-effort — presence is advisory.
+  }
+  return kept.filter((b) => beaconKey(b) !== mineKey && isLiveBeacon(b, now));
+};
+
+// Drop this session's beacons on clean session end. Keyed on sessionId when
+// known — removes ALL of that session's beacons. Without a sessionId only
+// anon beacons matching cwd are dropped, so a co-located sibling's beacon is
+// never clobbered.
+export const releasePresence = ({ file = undefined, sessionId = null, cwd = null } = {}) => {
+  if (usePresenceDb(file)) {
+    return withPresenceDb((store) => {
+      if (sessionId) store.run('DELETE FROM presence_beacons WHERE session_id = ?', sessionId);
+      else if (cwd) store.run("DELETE FROM presence_beacons WHERE session_id = 'anon' AND cwd = ?", cwd);
+    });
+  }
+  file = resolvePresenceFile(file);
+  const data = readPresenceFile(file);
+  const kept = data.beacons.filter((b) =>
+    sessionId ? b.sessionId !== sessionId : !(b.sessionId == null && cwd && b.cwd === cwd),
+  );
+  if (kept.length === data.beacons.length) return;
+  try {
+    const tmp = `${file}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ beacons: kept }, null, 2));
+    fs.renameSync(tmp, file);
+  } catch {
+    // Best-effort — presence is advisory.
+  }
+};
+
+// Every live beacon (no exclusion), raw rows including the `mailbox`
+export const readAllPresence = ({ file = undefined, now = Date.now() } = {}) => {
+  if (usePresenceDb(file)) {
+    return withPresenceDb((store) =>
+      prunePresence(store.all('SELECT * FROM presence_beacons').map(presenceRowToBeacon), now),
+    );
+  }
+  return prunePresence(readPresenceFile(resolvePresenceFile(file)).beacons, now);
+};

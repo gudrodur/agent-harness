@@ -1,0 +1,15 @@
+{
+  "name": "agent-switchboard",
+  "version": "0.1.0",
+  "description": "Mailbox-first messaging between agent sessions on one machine, with a kitty tab launcher.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "npm run test:node && npm run test:kitty",
+    "test:node": "node --import ./tests/helpers/isolate-setup.mjs --test --test-reporter=dot tests/*.test.mjs",
+    "test:kitty": "bash tests/kitty-send.test.sh"
+  },
+  "license": "MIT"
+}
