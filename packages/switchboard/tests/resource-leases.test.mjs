@@ -131,6 +131,27 @@ test('a human hold is not ended by a dead-session check, only by its TTL', () =>
   assert.equal(authorize(db, { resource: R, sessionId: 'A', now: 101 }).allowed, true);
 });
 
+test('during a human hold the displaced holder keeps its place however long the hold lasts', () => {
+  acquire(db, { resource: R, sessionId: 'A', now: 1000 });
+  holdHuman(db, { resource: R, purpose: 'OTP', now: 2000 });
+  const late = 2000 + 10 * QUEUE_STALE_MS;
+  assert.deepEqual(status(db, { resource: R, now: late }).queue.map((q) => q.session), ['A'], 'not aged out while the person holds it');
+  release(db, { resource: R, human: true, now: late + 1 });
+  assert.equal(authorize(db, { resource: R, sessionId: 'B', now: late + 2 }).reason, 'queued', 'A is still first');
+  assert.equal(authorize(db, { resource: R, sessionId: 'A', now: late + 3 }).allowed, true);
+});
+
+test('a refused authorize keeps a waiting session fresh in the line', () => {
+  acquire(db, { resource: R, sessionId: 'A', now: 1000 });
+  acquire(db, { resource: R, sessionId: 'B', now: 1000 });
+  for (let t = 1000; t <= 1000 + 3 * QUEUE_STALE_MS; t += QUEUE_STALE_MS / 2) {
+    heartbeat(db, { resource: R, sessionId: 'A', now: t });
+    assert.equal(authorize(db, { resource: R, sessionId: 'B', now: t }).allowed, false);
+  }
+  assert.deepEqual(status(db, { resource: R, now: 1000 + 3 * QUEUE_STALE_MS }).queue.map((q) => q.session), ['B']);
+  assert.equal(authorize(db, { resource: R, sessionId: 'C', now: 1000 + 3 * QUEUE_STALE_MS }).queue.length, 1, 'a stranger is still never enqueued');
+});
+
 test('resource names are validated', () => {
   assert.throws(() => validateResource('has space'), /invalid resource/);
   assert.throws(() => acquire(db, { resource: R }), /needs a session id/);

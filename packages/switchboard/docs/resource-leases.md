@@ -15,7 +15,7 @@ A seat role is an address, so the latest claim wins. A lease is the opposite: wh
 | `holdHuman({purpose, ttlMs})` | The person at the device takes it. Every session is refused, the session it displaced goes to the head of the line, and only an explicit `release({human: true})` or the TTL ends it. |
 | `status` | The live lease and the line. |
 
-A lease also ends when no heartbeat arrives within its TTL. With an `isLive(sessionId)` callback, it ends as soon as the holder's session is gone. A waiter that stops polling for `QUEUE_STALE_MS` drops out of the line.
+A lease also ends when no heartbeat arrives within its TTL. With an `isLive(sessionId)` callback, it ends as soon as the holder's session is gone. A waiter that stops polling (`acquire`, or a refused `authorize`) for `QUEUE_STALE_MS` drops out of the line. During a human hold no waiter ages out, and when the hold ends every waiter's clock restarts, so the session it displaced keeps its place however long the person held the resource.
 
 Defaults: explicit lease 10 min, implicit 90 s, human hold 15 min, line staleness 60 s.
 

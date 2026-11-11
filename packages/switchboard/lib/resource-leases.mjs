@@ -59,20 +59,29 @@ const fmtLease = (row, now) =>
 const fmtQueue = (rows) => rows.map((r, i) => ({ position: i + 1, session: r.session_id, window: r.window_id ?? null, purpose: r.purpose ?? null }));
 
 // Drop an expired or orphaned lease and stale or dead waiters. Returns the live lease row or null.
+// While a human hold is on, nobody can be served, so waiters do not age out (only a dead session leaves);
+// when the hold ends, by release or TTL, every waiter's clock restarts so the line survives the hold.
 const prune = (db, resource, now, isLive) => {
-  const row = db.get('SELECT * FROM resource_leases WHERE resource = ?', resource);
+  let row = db.get('SELECT * FROM resource_leases WHERE resource = ?', resource);
   if (row) {
     const expired = now - row.heartbeat_at > row.ttl_ms;
     const dead = row.mode !== HUMAN && isLive && isLive(row.holder_session) === false;
-    if (expired || dead) db.run('DELETE FROM resource_leases WHERE resource = ?', resource);
+    if (expired || dead) {
+      db.run('DELETE FROM resource_leases WHERE resource = ?', resource);
+      if (row.mode === HUMAN) freshenWaiters(db, resource, now);
+      row = null;
+    }
   }
+  const humanHold = row?.mode === HUMAN;
   for (const w of db.all('SELECT session_id, seen_at FROM resource_queue WHERE resource = ?', resource)) {
-    if (now - w.seen_at > QUEUE_STALE_MS || (isLive && isLive(w.session_id) === false)) {
+    if ((!humanHold && now - w.seen_at > QUEUE_STALE_MS) || (isLive && isLive(w.session_id) === false)) {
       db.run('DELETE FROM resource_queue WHERE resource = ? AND session_id = ?', resource, w.session_id);
     }
   }
-  return db.get('SELECT * FROM resource_leases WHERE resource = ?', resource) ?? null;
+  return row;
 };
+
+const freshenWaiters = (db, resource, now) => db.run('UPDATE resource_queue SET seen_at = ? WHERE resource = ?', now, resource);
 
 const queueRows = (db, resource) =>
   db.all('SELECT * FROM resource_queue WHERE resource = ? ORDER BY enqueued_at, rowid', resource);
@@ -139,6 +148,8 @@ export const authorize = (db, { resource, sessionId, windowId = null, purpose = 
   const sid = needSession(sessionId, 'authorize');
   return db.transaction(() => {
     const held = prune(db, resource, now, isLive);
+    // A refusal is how a waiting session polls: it keeps its place fresh (never joins the line here).
+    db.run('UPDATE resource_queue SET seen_at = ? WHERE resource = ? AND session_id = ?', now, resource, sid);
     const queue = fmtQueue(queueRows(db, resource));
     if (held?.mode === HUMAN) return { allowed: false, reason: 'human', holder: fmtLease(held, now), queue };
     if (held && held.holder_session === sid) {
@@ -179,6 +190,7 @@ export const release = (db, { resource, sessionId = null, human = false, now = D
     const mine = human ? held.mode === HUMAN : held.mode !== HUMAN && held.holder_session === String(sessionId);
     if (!mine) return { released: false, holder: fmtLease(held, now) };
     db.run('DELETE FROM resource_leases WHERE resource = ?', resource);
+    if (held.mode === HUMAN) freshenWaiters(db, resource, now);
     return { released: true };
   });
 };
