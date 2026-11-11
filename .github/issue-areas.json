@@ -1,0 +1,23 @@
+{
+  "$comment": "Issue-title vocabulary for this repo. ONE source of truth, read by .github/workflows/issue-title-guard.yml. Grammar is global (`area: description`); this list is not. Adding an area is a PR against this file, on purpose: the friction is what keeps it a vocabulary rather than a word-list.",
+  "areas": [
+    "switchboard",
+    "launcher",
+    "messaging",
+    "live-values",
+    "ci",
+    "docs",
+    "repo"
+  ],
+  "nearMisses": {
+    "doc": "docs",
+    "documentation": "docs",
+    "workflow": "ci",
+    "actions": "ci",
+    "chore": "repo",
+    "meta": "repo",
+    "mailbox": "switchboard",
+    "message": "messaging",
+    "messages": "messaging"
+  }
+}
