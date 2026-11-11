@@ -26,5 +26,5 @@ A companion configuration repo can point `AGENT_SWITCHBOARD_HOME` at a checkout 
 
 - Channel map, install, sending and launching: `README.md`.
 - Env vars and timers: `docs/configuration.md`. Exit codes: `docs/exit-codes.md`.
-- Seat roles: `docs/seat-roles.md`. Launchers: `docs/launchers.md`.
+- Seat roles: `docs/seat-roles.md`. Resource leases: `docs/resource-leases.md`. Launchers: `docs/launchers.md`.
 - Message exchange patterns: `docs/patterns.md`.
