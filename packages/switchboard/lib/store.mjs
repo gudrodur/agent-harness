@@ -90,6 +90,32 @@ CREATE TABLE IF NOT EXISTS seat_nudges (
   session_id TEXT PRIMARY KEY,
   nudged_at INTEGER NOT NULL
 );
+-- An exclusive lease on a shared resource (a device, a port): one holder at a
+-- time, no takeover, released explicitly or by missing heartbeats. mode
+-- 'human' means the person at the device holds it and no session may act.
+CREATE TABLE IF NOT EXISTS resource_leases (
+  resource TEXT PRIMARY KEY,
+  holder_session TEXT NOT NULL,
+  holder_window TEXT,
+  purpose TEXT,
+  mode TEXT NOT NULL DEFAULT 'agent',
+  scope_json TEXT,
+  implicit INTEGER NOT NULL DEFAULT 0,
+  acquired_at INTEGER NOT NULL,
+  heartbeat_at INTEGER NOT NULL,
+  ttl_ms INTEGER NOT NULL
+);
+-- Sessions waiting for a resource, served first come first served. A waiter
+-- that stops polling (seen_at goes stale) drops out of the line.
+CREATE TABLE IF NOT EXISTS resource_queue (
+  resource TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  window_id TEXT,
+  purpose TEXT,
+  enqueued_at INTEGER NOT NULL,
+  seen_at INTEGER NOT NULL,
+  PRIMARY KEY (resource, session_id)
+);
 `;
 
 // One-time import marker: which legacy file set has been absorbed into this db.
