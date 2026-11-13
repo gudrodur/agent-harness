@@ -79,6 +79,19 @@ test('a composer whose top rule carries the session title is proven', () => {
   assert.equal(v.kind, PROVEN, JSON.stringify(v));
 });
 
+// A narrow split gives the rule fewer leading characters, and a long title is
+// cut off at the edge: no trailing rule characters at all.
+test('a narrow top rule whose long title runs to the edge is proven', () => {
+  const screen = ['● Done.', `${'─'.repeat(4)} a very long example seat title that is cut off at the ed…`, '❯\u00a0', RULE, '  ? for shortcuts'].join('\n');
+  const v = verdict({ screen });
+  assert.equal(v.kind, PROVEN, JSON.stringify(v));
+});
+
+test('a labelled top rule with no trailing rule characters is proven', () => {
+  const screen = ['● Done.', `${'─'.repeat(40)} example seat title`, '❯\u00a0', RULE, '  ? for shortcuts'].join('\n');
+  assert.equal(verdict({ screen }).kind, PROVEN);
+});
+
 test('a labelled top rule with text in the composer is still refused', () => {
   const screen = ['● Done.', LABELLED_RULE, '❯ a draft', RULE, '  ? for shortcuts'].join('\n');
   const v = verdict({ screen });

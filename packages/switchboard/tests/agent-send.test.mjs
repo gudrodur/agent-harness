@@ -2051,7 +2051,7 @@ test('a busy recipient that ends queued prints one verdict line by default', asy
   assert.equal(code, 3, stderr);
   const lines = nonEmptyLines(stderr);
   assert.equal(lines.length, 1, `one line, got:\n${stderr}`);
-  assert.match(lines[0], /^agent-send: queued for 991001, delivered at its next tool call.*\(id \S+; exit 3: pending, do not resend/);
+  assert.match(lines[0], /^agent-send: queued for 991001 \(not typed: idle wait ran out\), delivered at its next tool call.*\(id \S+; exit 3: pending, do not resend/);
   assert.doesNotMatch(stderr, /falling back|withdrew|sent nothing/);
   for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
 });
@@ -2161,6 +2161,127 @@ test('a long role name keeps its own notice topic', async () => {
   for (const r of [a, b]) await runSend(['--to', `role:${r}`, '--text', 'x'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
   assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 2, 'one notice per role');
 });
+
+// ---- review round 3 (supervisor findings on f32fecc) ---------------------------
+
+const exitStub = (name, code, noise = null) => {
+  const f = path.join(binDir, `kitty-send-${name}.sh`);
+  fs.writeFileSync(f, `#!/usr/bin/env bash\n${noise ? `echo ${JSON.stringify(noise)} >&2\n` : ''}exit ${code}\n`, { mode: 0o755 });
+  return f;
+};
+const clearKey = (key) => { for (const r of readUnacked(key, { dir: mboxDir })) cancelQueued({ key, id: r.id, dir: mboxDir }); };
+
+// A quiet --queue send waits unbounded; a caller killed during the wait must
+// still know the row id to --cancel.
+test('--queue prints the queued id line at once, not only when it exits', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const child = spawn('node', [SEND, '--to', KEY_S1, '--text', 'id early', '--queue', '--deadline', '3'], { env: childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2' })) });
+  let stderr = '';
+  let closed = false;
+  child.stderr.on('data', (d) => { stderr += d; });
+  const done = new Promise((resolve) => child.on('close', () => { closed = true; resolve(); }));
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(closed, false, 'still waiting');
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1);
+  assert.match(stderr, new RegExp(`queued for ${KEY_S1}.*id ${left[0].id}.*--cancel --id ${left[0].id}`));
+  await done;
+  clearKey(KEY_S1);
+});
+
+// A re-queue after kitty-send sent nothing must keep the reason, and must not
+// promise a tool-call delivery to a seat that sits on a dialog or a draft.
+for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds unsubmitted text/]]) {
+  test(`a re-queue after kitty-send exit ${st} names the reason and does not promise a tool-call delivery`, async () => {
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`exit${st}`, st) }));
+    assert.equal(code, 3, stderr);
+    assert.match(stderr, reason);
+    assert.doesNotMatch(stderr, /next tool call/);
+    assert.equal(nonEmptyLines(stderr).length, 1, stderr);
+    clearKey(KEY_S1);
+  });
+}
+
+// --no-wait only writes a row. Against an idle seat (or no consumer) it used
+// to fall into the kitty fallback and type, then block on the proof.
+const IDLE_BEACON = () => {
+  const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  return [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }];
+};
+
+test('--no-wait to an idle seat only queues: nothing is typed', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: IDLE_BEACON() }));
+    fs.rmSync(fallbackArgv, { force: true });
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { code, stderr } = await runSend(['--to', '991001', '--text', 'wake later', '--no-wait'], childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_PROC_DIR: procDir })));
+    assert.equal(code, 3, stderr);
+    assert.ok(!fs.existsSync(fallbackArgv), 'kitty-send was not run');
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1);
+    assert.match(stderr, /queued for 991001/);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+    clearKey(KEY_S1);
+  }
+});
+
+test('--no-wait to a seat with no mailbox key fails: nothing typed, nothing queued', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  const { code, stderr } = await runSend(['--to', '991002', '--text', 'x', '--no-wait'], childEnv(quiet()));
+  assert.equal(code, 1, stderr);
+  assert.ok(!fs.existsSync(fallbackArgv), 'kitty-send was not run');
+  assert.match(stderr, /--no-wait.*nothing is queued/);
+});
+
+test('--no-wait with --deadline is refused with exit 2: the deadline would be ignored', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'x', '--no-wait', '--deadline', '5'], childEnv(quiet()));
+  assert.equal(code, 2, stderr);
+  assert.match(stderr, /--no-wait.*--deadline/);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 0);
+});
+
+// The no-reader notice is the switchboard's, not the original sender's, and
+// reading it does not make the next send raise a new one inside the window.
+test('the no-reader notice comes from a switchboard label, not the original sender', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  await runSend(['--to', 'role:unheld-role', '--text', 'ci fault'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  const [notice] = readUnacked('role:watch-role', { dir: mboxDir });
+  assert.equal(notice.from, 'switchboard');
+  assert.match(notice.text, /row \S+ \(from \S+\) waits/);
+});
+
+test('a notice already read is not raised again inside the notice window', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  const env = childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' }));
+  await runSend(['--to', 'role:unheld-role', '--text', 'one'], env);
+  const [first] = readUnacked('role:watch-role', { dir: mboxDir });
+  ack({ key: 'role:watch-role', id: first.id, dir: mboxDir });
+  await runSend(['--to', 'role:unheld-role', '--text', 'two'], env);
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 0, 'read once, not raised again');
+  await runSend(['--to', 'role:unheld-role', '--text', 'three'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role', AGENT_SEND_NOTICE_WINDOW_MIN: '0' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 1, 'a zero window raises one every time');
+});
+
+// kitty-send's own stderr is trace in the quiet default: agent-send's line is
+// the verdict. Failures it cannot explain itself still pass through.
+for (const st of [0, 10]) {
+  test(`kitty-send stderr is not replayed on exit ${st} in the quiet default`, async () => {
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`noise${st}`, st, 'kitty-send: chatty detail') }));
+    assert.doesNotMatch(stderr, /chatty detail/);
+    clearKey(KEY_S1);
+  });
+}
 
 // Output larger than the 64 KiB pipe buffer must arrive whole: a write
 // followed by process.exit() drops whatever the pipe has not yet taken. The

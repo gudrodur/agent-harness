@@ -259,6 +259,14 @@ const KITTY_NOTHING_REASON = {
   11: 'screen unreadable or composer not clear',
   12: 'kitty remote control not answering',
 };
+// When a re-queued row is delivered. A seat stuck on a selection dialog (4) or
+// holding a draft or an unclear composer (9, 11) takes nothing at a tool call:
+// someone has to clear it first, and the line must not promise otherwise.
+const whenDelivered = (status, dflt = 'at its next tool call, next prompt or when its turn ends') => {
+  if (status === 4) return 'delivered only after the seat clears its selection dialog';
+  if (status === 9 || status === 11) return 'delivered only after the seat clears its composer';
+  return `delivered ${dflt}`;
+};
 // Exit 10 is typed-but-unproven (row 57): the text reached the window but no
 // session row proves the target submitted it — NOT re-queued (the composer
 // may already hold it; a mailbox re-delivery would double-deliver).
@@ -593,6 +601,7 @@ const main = (argv) => {
   const priority = mode ?? 'now';
   // --no-wait only leaves a mailbox row; --now, --stop and --idle-when promise an
   // interrupt or a parked proof it would silently drop.
+  if (noWait && deadline != null) die('--no-wait returns at once and has no wait to bound: drop --deadline, or drop --no-wait', 2);
   if (noWait && ['now', 'stop', 'idle'].includes(mode)) die('--no-wait only writes a mailbox row and cannot interrupt: use it bare or with --queue, not with --now, --stop or --idle-when', 2);
   // Default ack wait: 120 s for a recipient that can ack while idle (a
   // consumer with an idle poll acks within seconds; a busy consumer acks at its next
@@ -675,7 +684,9 @@ const main = (argv) => {
     const r = spawnSync(kittySend(), args, { stdio: ['inherit', 'inherit', holdErr ? 'pipe' : 'inherit'] });
     // Exit 1 and 11 carry kitty-send's own reason (no window, composer not clear),
     // which the generic re-queue line cannot know: always pass it on.
-    if (holdErr && r.stderr?.length && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11)) process.stderr.write(r.stderr);
+    // On success, pending (8) and unproven (3, 10) agent-send prints its own line,
+    // so kitty-send's chatter is trace; a failure it cannot explain still shows.
+    if (holdErr && r.stderr?.length && ![0, 3, 8, 10].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
     if (typedKey != null && [0, 8, 10].includes(r.status) && !args.includes('--queue')) {
@@ -734,15 +745,25 @@ const main = (argv) => {
   // the seat's own drain and the exit is 3; without one nothing is queued and
   // the exit is 1, so the sender knows the message did not go.
   const kittyFallback = (why, queueKey = null) => {
+    // --no-wait only writes a mailbox row: never type, never wait on a proof.
+    if (noWait) {
+      if (queueKey == null) die(`${why}; --no-wait only queues, there is no mailbox to queue in, so nothing was sent and nothing is queued`);
+      const nrow = appendMessage({ to: queueKey, from: recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null }), priority, text, topic });
+      verdict(
+        `agent-send: queued for ${to} (${why}), delivered at its next prompt (id ${nrow.id}; exit 3: pending, do not resend; --cancel --id ${nrow.id} withdraws)\n`,
+        `agent-send: ${why}; --no-wait: queued ${nrow.id} for ${queueKey} in ${mailboxPath(queueKey)}, nothing typed (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${nrow.id})\n`,
+      );
+      process.exit(3);
+    }
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
-    const requeueForSeat = (reason, kittyStatus = null) => {
+    const requeueForSeat = (reason, kittyStatus = null, detail = null) => {
       if (queueKey == null) return false;
       const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
       const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
       verdict(
-        `agent-send: queued for ${to}, delivered at its next prompt (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
+        `agent-send: queued for ${to}${detail ? ` (${detail})` : ''}, ${whenDelivered(kittyStatus, 'at its next prompt')} (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
         `agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`,
       );
       if (rcDown(kittyStatus)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: qrow.id });
@@ -760,7 +781,7 @@ const main = (argv) => {
         // else (a dialog, a draft, a slash text, a gone window) is refused.
         const waitable = v.kind === REFUSED && /^title shows a turn|^session record status|^not a Claude Code tab/.test(v.reason ?? '');
         (queueKey != null ? trace : (m) => process.stderr.write(m))(`agent-send: ${why}; not typed into ${t}: ${v.reason}\n`);
-        if (queueKey != null) requeueForSeat('not typed');
+        if (queueKey != null) requeueForSeat('not typed', null, `not typed: ${v.reason}`);
         if (!waitable) noQueueDie(`nothing was sent to ${t}`);
         const wst = runKittySend(why, t, text);
         if (wst === 0) process.exit(3);
@@ -775,7 +796,7 @@ const main = (argv) => {
     const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
     if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
-      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st);
+      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st, `not typed: ${reason}`);
       process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
       if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
       process.exit(exitOfKittySend(st));
@@ -821,9 +842,18 @@ const main = (argv) => {
     try {
       validateRoleName(noticeRole);
       const target = resolveRecipient(`role:${noticeRole}`, { senderSessionId, senderCwd: process.cwd(), senderWindowId: senderWindowId() });
+      // A notice the role already read stays read for the window: the unread
+      // mail it points at is still there, and a second notice adds nothing.
+      const windowMin = Number(process.env.AGENT_SEND_NOTICE_WINDOW_MIN ?? 60);
+      const seen = findRecentTopicDelivery({ key: target.key, topic: roleUnreadTopic(role), windowMs: (Number.isFinite(windowMin) ? windowMin : 60) * 60_000 });
+      if (seen) {
+        trace(`agent-send: role ${noticeRole} already read a notice about role ${role} at ${seen.ts}; not raising another\n`);
+        return;
+      }
       appendMessage({
         to: target.key,
-        from: qfrom,
+        // The switchboard's notice, not the sender's: the sender is in the text.
+        from: 'switchboard',
         priority: 'now',
         text: `Mail for role ${role} has no reader: no live session holds it, and row ${rowId} (from ${qfrom}) waits for the next claimant.`,
         topic: roleUnreadTopic(role),
@@ -853,13 +883,18 @@ const main = (argv) => {
   const mbox = mailboxPath(recipient.key);
   trace(`agent-send: queued ${row.id} for ${recipient.key} in ${mbox}; withdraw with --cancel --id ${row.id}\n`);
   // The one line a caller reads when the message is safely queued (exit 3).
-  const pendingLine = (id, full = undefined, note = '') => verdict(
-    `agent-send: queued for ${to}${note}, delivered at its next tool call, next prompt or when its turn ends (id ${id}; exit 3: pending, do not resend; --cancel --id ${id} withdraws)\n`,
+  const pendingLine = (id, full = undefined, note = '', status = null) => verdict(
+    `agent-send: queued for ${to}${note}, ${whenDelivered(status)} (id ${id}; exit 3: pending, do not resend; --cancel --id ${id} withdraws)\n`,
     full,
   );
   if (noWait) {
     pendingLine(row.id);
     process.exit(3);
+  }
+  // A --queue send may wait unbounded; in the quiet default nothing else prints
+  // until it exits, so a killed caller would not know the id to withdraw.
+  if (priority === 'queue' && !verbose) {
+    process.stderr.write(`agent-send: queued for ${to} (id ${row.id}); waiting for delivery, --cancel --id ${row.id} withdraws\n`);
   }
   // Row 58: a Claude Code consumer drains its mailbox only on
   // UserPromptSubmit, so an IDLE recipient cannot ack — waiting the full
@@ -1017,7 +1052,7 @@ const main = (argv) => {
   // is withdrawn, so without this the message is gone: put it back.
   if (KITTY_SENT_NOTHING.has(status)) {
     const again = appendMessage({ to: recipient.key, from, priority, text, topic });
-    pendingLine(again.id, `agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`);
+    pendingLine(again.id, `agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, ${whenDelivered(status, "at the recipient's next tool call, next prompt or when its current turn ends")} (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`, ` (not typed: ${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'})`, status);
     if (rcDown(status)) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);
   }

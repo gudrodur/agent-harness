@@ -49,11 +49,12 @@ export const DIALOG_RE = /Enter to select|Esc to cancel|↑\/↓ to navigate|Ent
 const DIALOG_ROWS = 15;
 const RULE_RE = /^\s*[─━]{5,}\s*$/;
 // Claude Code prints a session's custom title inside the composer's TOP rule
-// (`───── example seat title ─`). That rule starts with five or more rule
-// characters, then a label set off by spaces, and ends in rule characters. Only
-// the top rule is read this way; the bottom rule stays strict, so a draft line
-// cannot widen what ends the box.
-const TOP_RULE_RE = /^\s*[─━]{5,}(?:\s.*\s[─━]+)?\s*$/;
+// (`───── example seat title ─`). That rule is rule characters, a label set off
+// by a space, and usually more rule characters; a title that runs to the edge
+// or is cut off has none after it, and a narrow split gives it as few as three
+// leading ones. A bare top rule still needs five. Only the top rule is read this
+// way; the bottom rule stays strict, so a draft line cannot widen what ends the box.
+const TOP_RULE_RE = /^\s*(?:[─━]{5,}|[─━]{3,}\s\S.*)\s*$/;
 const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
