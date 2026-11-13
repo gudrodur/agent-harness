@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   switchboard:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["ubuntu-latest"]') }}
     defaults:
       run:
         working-directory: packages/switchboard
@@ -46,7 +46,7 @@ jobs:
           bash tests/kitty-send.test.sh
 
   live-values:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["ubuntu-latest"]') }}
     defaults:
       run:
         working-directory: packages/live-values
