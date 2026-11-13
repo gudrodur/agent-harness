@@ -66,6 +66,29 @@ const verdict = (kind, reason = null) => ({ kind, reason });
 export const BUSY_TITLE_RE = /[\u2800-\u28FF\u25D0-\u25D3]/;
 export const titleShowsBusy = (title) => BUSY_TITLE_RE.test(title ?? '');
 
+// The Claude Code process of a `kitty @ ls` window record, or undefined.
+const claudeProcOf = (win) => (win.foreground_processes ?? []).find((p) => /(^|\/)claude$/.test(p.cmdline?.[0] ?? ''));
+// Claude Code's own session record for that process, or null.
+const sessionRecordOf = (proc) => {
+  const sessionsDir = process.env.KITTY_SEND_CLAUDE_SESSIONS_DIR ?? process.env.CLAUDE_SESSIONS_DIR
+    ?? path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'sessions');
+  try { return JSON.parse(fs.readFileSync(path.join(sessionsDir, `${proc.pid}.json`), 'utf-8')); } catch { return null; }
+};
+// The busy decision for a window (`kitty @ ls` record), the same order as
+// kitty-send.sh's target_busy: Claude Code's session record first (busy is
+// busy, idle and shell are idle), the title spinner only when there is no
+// usable record. The title alone is not enough: a renamed Claude Code seat
+// never shows a spinner while it works. A seat waiting on a dialog (record
+// status waiting or blocked) is not "working" here: that is the DIALOG verdict,
+// which refuses typing in every mode and carries its own reason.
+export const windowIsBusy = (win) => {
+  const proc = claudeProcOf(win);
+  const status = proc != null ? sessionRecordOf(proc)?.status : null;
+  if (status === 'busy') return true;
+  if (QUEUE_IDLE_STATUSES.has(status) || DIALOG_STATUSES.has(status)) return false;
+  return titleShowsBusy(win.title);
+};
+
 export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
@@ -78,20 +101,15 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   if (lsOut == null) return verdict(REFUSED, 'window list could not be read');
   const win = flattenWindows(lsOut).find((w) => w.id === Number(winId));
   if (win == null) return verdict(REFUSED, 'window not found');
-  const proc = (win.foreground_processes ?? []).find((p) => /(^|\/)claude$/.test(p.cmdline?.[0] ?? ''));
+  const proc = claudeProcOf(win);
   // otherTabs (kitty-send, which also delivers to pi and opencode tabs): a tab
   // with no Claude Code process has no composer this module can read, and the
   // old path typed into it under the dialog check alone. Keep that: dialog
   // verdict only. A Claude Code process with no record still gets the full proof.
   const dialogOnly = !idleMode || (otherTabs && proc == null);
   if (!dialogOnly && slashRefusal != null) return slashRefusal;
-  let record = null;
-  if (proc != null) {
-    const sessionsDir = process.env.KITTY_SEND_CLAUDE_SESSIONS_DIR ?? process.env.CLAUDE_SESSIONS_DIR
-      ?? path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'sessions');
-    try { record = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${proc.pid}.json`), 'utf-8')); } catch { record = null; }
-    if (DIALOG_STATUSES.has(record?.status)) return verdict(DIALOG, `session record status ${record.status}: a permission prompt, question or stuck turn is waiting on the human`);
-  }
+  const record = proc != null ? sessionRecordOf(proc) : null;
+  if (DIALOG_STATUSES.has(record?.status)) return verdict(DIALOG, `session record status ${record.status}: a permission prompt, question or stuck turn is waiting on the human`);
   let screen;
   try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return verdict(REFUSED, 'screen could not be read'); }
   const lines = screen.split('\n').map((l) => l.trimEnd());

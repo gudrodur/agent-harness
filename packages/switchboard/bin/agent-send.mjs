@@ -86,7 +86,7 @@ import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
-import { typingVerdict, proofVerdict, titleShowsBusy, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
+import { typingVerdict, proofVerdict, windowIsBusy as recordIsBusy, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
 
 // --verbose / AGENT_SEND_VERBOSE: the trace of every step. Off, only the final
 // verdict line and errors reach stderr.
@@ -123,8 +123,10 @@ const usage = () => `Usage:
   agent-send.mjs --who [--json]
 
   --now         priority now (default when no mode is given: a bare send types and
-                submits at once to an idle recipient, a busy one keeps kitty-send's mid-turn guard)
-  --stop        priority stop: interrupts the consumer's current run
+                submits at once to an idle recipient; a busy one (session record, else title spinner)
+                is never typed into: the row stays queued for its next tool call)
+  --stop        priority stop: the mailbox row is delivered at the consumer's next tool call;
+                a window that is busy (session record, else title spinner) is never typed into
   --idle-when   priority idle (REGEX is the consumer's parked proof)
   --queue       priority queue: deliver without interrupting the recipient's turn.
                 A recipient proven idle (Claude Code tab, session status idle or shell,
@@ -635,21 +637,27 @@ const main = (argv) => {
   // pre-mailbox path supervisors steer tabs with. The MCP cannot type
   // into a window, so send_message keeps those as errors.
   const senderSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? null;
-  // Idle = the window exists and its title carries no braille spinner
-  // (U+2800-28FF) or half-circle spinner (U+25D0-25D3, Claude Code's busy
-  // title mark, ◐◑◒◓; idle shows ✳). Unreadable kitty, unknown window or a non-numeric id is
-  // "not idle": callers then keep the cautious (busy) behaviour.
+  // Busy is read the way kitty-send.sh's target_busy reads it (lib/typing-proof.mjs
+  // windowIsBusy): Claude Code's session record first, the title spinner only
+  // when there is no record. A renamed Claude Code seat shows no spinner while
+  // it works, so the title alone would let --now type mid-turn.
+  // Idle = the window exists and is not busy. Unreadable kitty or an unknown
+  // window is "not idle": callers then keep the cautious (busy) behaviour.
   const windowIsIdle = (winId) => {
     const rec = flattenWindows(kittyLs()).find((w) => w.id === Number(winId));
-    return rec != null && !titleShowsBusy(rec.title);
+    return rec != null && !recordIsBusy(rec);
   };
-  // The opposite is NOT "not idle": busy means the window was read and its title
-  // carries the busy marker. An unreadable window is neither, and a caller that
-  // must never type only acts on a positive busy reading.
-  const windowIsBusy = (winId) => {
-    if (!/^\d+$/.test(String(winId))) return false;
-    const rec = flattenWindows(kittyLs()).find((w) => w.id === Number(winId));
-    return rec != null && titleShowsBusy(rec.title);
+  // The opposite is NOT "not idle": busy means the window was read and it is
+  // busy. An unreadable window is neither, and a caller that must never type
+  // only acts on a positive busy reading. A target that is not a window id is a
+  // title substring, as kitty-send resolves it: any matching window that is busy
+  // counts.
+  const windowIsBusy = (target) => {
+    const wins = flattenWindows(kittyLs());
+    const hit = /^\d+$/.test(String(target))
+      ? wins.filter((w) => w.id === Number(target))
+      : wins.filter((w) => (w.title ?? '').toLowerCase().includes(String(target).toLowerCase()));
+    return hit.some(recordIsBusy);
   };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
@@ -778,13 +786,13 @@ const main = (argv) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
-    const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null) => {
+    const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null, when = 'at its next prompt') => {
       if (queueKey == null) return false;
       const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
       const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
       verdict(
-        `agent-send: queued for ${to}${detail ? ` (${detail})` : ''}, ${whenDelivered(kittyStatus, 'at its next prompt', proofWhy)} (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
-        `agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`,
+        `agent-send: queued for ${to}${detail ? ` (${detail})` : ''}, ${whenDelivered(kittyStatus, when, proofWhy)} (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
+        `agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it ${when} (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`,
       );
       if (rcDown(kittyStatus)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: qrow.id });
       process.exit(3);
@@ -794,7 +802,12 @@ const main = (argv) => {
     // tool result in flight. The busy marker is read from the window now, and a
     // busy seat gets the row in its mailbox, where its tool-boundary drain
     // picks it up (exit 3), whatever the send mode (--now and --stop included).
-    if (queueKey != null && windowIsBusy(t)) requeueForSeat(`recipient window ${t} is busy, not typed`);
+    // A --queue send with no mailbox is the detached waiter's, which types only
+    // once the seat is idle.
+    if ((queueKey != null || priority !== 'queue') && windowIsBusy(t)) {
+      if (queueKey != null) requeueForSeat(`recipient window ${t} is busy, not typed`, null, 'recipient busy, not typed', null, 'at its next tool call or when its turn ends');
+      noQueueDie(`window ${t} is busy, so nothing was typed`);
+    }
     if (priority === 'queue') {
       const v = /^\d+$/.test(String(t)) ? proofVerdict(t, { mode: 'idle', text }) : { kind: REFUSED, reason: 'the target is not a window id, so its screen cannot be proven' };
       if (v.kind !== PROVEN) {
@@ -908,8 +921,8 @@ const main = (argv) => {
   const mbox = mailboxPath(recipient.key);
   trace(`agent-send: queued ${row.id} for ${recipient.key} in ${mbox}; withdraw with --cancel --id ${row.id}\n`);
   // The one line a caller reads when the message is safely queued (exit 3).
-  const pendingLine = (id, full = undefined, note = '', status = null, proofWhy = null) => verdict(
-    `agent-send: queued for ${to}${note}, ${whenDelivered(status, undefined, proofWhy)} (id ${id}; exit 3: pending, do not resend; --cancel --id ${id} withdraws)\n`,
+  const pendingLine = (id, full = undefined, note = '', status = null, proofWhy = null, when = undefined) => verdict(
+    `agent-send: queued for ${to}${note}, ${whenDelivered(status, when, proofWhy)} (id ${id}; exit 3: pending, do not resend; --cancel --id ${id} withdraws)\n`,
     full,
   );
   if (noWait) {
@@ -1055,7 +1068,7 @@ const main = (argv) => {
   // the text would land in the middle of a turn and discard the tool result in
   // flight. The row stays queued for the tool-boundary drain.
   if (windowIsBusy(target)) {
-    process.stderr.write(`agent-send: queued, recipient busy for ${row.id} in ${mbox}; window ${target} shows the busy marker, so nothing is typed and the row stays queued for the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`);
+    pendingLine(row.id, `agent-send: queued, recipient busy for ${row.id} in ${mbox}; window ${target} is busy, so nothing is typed and the row stays queued for the recipient's next tool call or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`, ' (recipient busy, not typed)', null, null, 'at its next tool call or when its turn ends');
     if (rcDown()) peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
     process.exit(3);
   }
