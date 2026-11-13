@@ -323,7 +323,7 @@ tab_ledger_retire() {
 #   23  the seat is not idle (busy, or its state cannot be proven)
 #   24  no finished proof: no Claude Code session in the window, no marker since
 #       it started, it holds a seat role, or it shows activity after the marker
-#   25  the session holds a live resource lease (a device or a runner lane)
+#   25  the session holds a live resource lease, or waits in a resource queue
 # 1 is a usage or store error and 2 is no kitty remote control. A window that is
 # already gone is not a refusal: its claims are released and the exit is 0.
 tab_ledger_close_finished() {
@@ -348,7 +348,7 @@ tab_ledger_close_finished() {
     || die "could not read the switchboard store — nothing closed"
   if [ "$(printf '%s' "$verdict" | jq -r .finished)" != true ]; then
     case "$(printf '%s' "$verdict" | jq -r '.reason // "no-marker"')" in
-      holds-lease) die "window $id (session $sid) holds a resource lease (a device or a runner lane); it would stay held by a dead session until its TTL ran out. Release it first. Refusing." 25 ;;
+      holds-lease) die "window $id (session $sid) holds or waits for a resource lease (a device or a runner lane); it would stay held or queued by a dead session until its TTL ran out. Release it first. Refusing." 25 ;;
       holds-role) die "window $id (session $sid) holds a seat role; role mail would go to a dead window. Hand the role over first. Refusing." 24 ;;
       later-mail) die "window $id (session $sid) has mail to or from it newer than its LOKA-DONE marker, so it is working again. Refusing." 24 ;;
       later-turn) die "window $id (session $sid) has a prompt in its transcript newer than its LOKA-DONE marker, so it is working again. Refusing." 24 ;;

@@ -887,6 +887,33 @@ test('--close --after-loka refuses a seat that holds a live resource lease (25),
   assert.equal(r.code, 0, r.err);
 });
 
+test('--close --after-loka refuses a seat waiting in a resource queue (25)', async () => {
+  const { acquire } = await import('../lib/resource-leases.mjs');
+  await finishedSeat();
+  await withStore((db) => acquire(db, { resource: 'device:s23', sessionId: 'someone-else' }));
+  await withStore((db) => acquire(db, { resource: 'device:s23', sessionId: OLD_SESSION }));
+  assert.equal((await withStore((db) => db.all('SELECT * FROM resource_queue'))).length, 1, 'the seat is queued');
+  const r = await closeFinished();
+  assert.equal(r.code, 25, r.err);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka counts a mid-turn steer (a queued_command attachment) after the marker as activity', async () => {
+  await finishedSeat();
+  const steer = JSON.stringify({ type: 'attachment', timestamp: new Date(Date.now() - 4_000).toISOString(), attachment: { type: 'queued_command', prompt: 'also do this', commandMode: 'prompt' } });
+  await fs.appendFile(path.join(tdir, `${OLD_SESSION}.jsonl`), steer + '\n');
+  let r = await closeFinished();
+  assert.equal(r.code, 24, r.err);
+  assert.match(r.err, /prompt in its transcript/);
+  assert.equal(await exists('closed'), false);
+  // A steer before the marker does not count.
+  await seatTranscript();
+  const early = JSON.stringify({ type: 'attachment', timestamp: new Date(Date.now() - 20_000).toISOString(), attachment: { type: 'queued_command', prompt: 'earlier' } });
+  await fs.appendFile(path.join(tdir, `${OLD_SESSION}.jsonl`), early + '\n');
+  r = await closeFinished();
+  assert.equal(r.code, 0, r.err);
+});
+
 test('--close --after-loka refuses a seat with mail to or from it after the marker, or a prompt in its transcript after it', async () => {
   await finishedSeat();
   await lokaDone({ id: 'm-later-from', ts: new Date(Date.now() - 2_000).toISOString(), text: 'one more result' });

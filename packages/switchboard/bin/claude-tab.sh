@@ -94,7 +94,7 @@
 #   23  the seat is not idle (busy, or its state cannot be proven)
 #   24  no finished proof: no session, no LOKA-DONE marker, a seat role held, or
 #       activity after the marker
-#   25  the session holds a live resource lease (a device or a runner lane)
+#   25  the session holds a live resource lease, or waits in a resource queue
 # HELP-END
 #
 # The Claude Code sibling of opencode-tab.sh (2026-09-29). Like opencode, the
