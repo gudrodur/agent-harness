@@ -355,7 +355,7 @@ run_proof() {
     return 0
   fi
   if [ "$2" = idle ]; then
-    PROOF_REASON=$(printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$1" --mode idle --stdin 2>&1 >/dev/null) || PROOF_RC=$?
+    PROOF_REASON=$(printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$1" --mode idle --stdin --other-tabs 2>&1 >/dev/null) || PROOF_RC=$?
   else
     PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode dialog 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
   fi

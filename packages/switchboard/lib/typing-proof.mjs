@@ -51,13 +51,13 @@ const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
 
-export const proofVerdict = (winId, { mode = 'idle', text = null } = {}) => {
+export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
   // `/` would run as a slash command in the seat (`/compact` compacts it)
   // instead of arriving as a message. Only an idle-claiming send refuses it:
   // an explicit --now keeps its slash-command use.
-  if (idleMode && text != null && /^\s*\//.test(text)) return verdict(REFUSED, 'the text starts with "/", which would run as a command in the seat');
+  const slashRefusal = idleMode && text != null && /^\s*\//.test(text) ? verdict(REFUSED, 'the text starts with "/", which would run as a command in the seat') : null;
   const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
   let win;
   try {
@@ -66,6 +66,12 @@ export const proofVerdict = (winId, { mode = 'idle', text = null } = {}) => {
   } catch { return verdict(REFUSED, 'window list could not be read'); }
   if (win == null) return verdict(REFUSED, 'window not found');
   const proc = (win.foreground_processes ?? []).find((p) => /(^|\/)claude$/.test(p.cmdline?.[0] ?? ''));
+  // otherTabs (kitty-send, which also delivers to pi and opencode tabs): a tab
+  // with no Claude Code process has no composer this module can read, and the
+  // old path typed into it under the dialog check alone. Keep that: dialog
+  // verdict only. A Claude Code process with no record still gets the full proof.
+  const dialogOnly = !idleMode || (otherTabs && proc == null);
+  if (!dialogOnly && slashRefusal != null) return slashRefusal;
   let record = null;
   if (proc != null) {
     const sessionsDir = process.env.KITTY_SEND_CLAUDE_SESSIONS_DIR ?? process.env.CLAUDE_SESSIONS_DIR
@@ -77,7 +83,7 @@ export const proofVerdict = (winId, { mode = 'idle', text = null } = {}) => {
   try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return verdict(REFUSED, 'screen could not be read'); }
   const lines = screen.split('\n').map((l) => l.trimEnd());
   if (lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l))) return verdict(DIALOG, 'a dialog is open on the screen');
-  if (!idleMode) return verdict(PROVEN);
+  if (dialogOnly) return verdict(PROVEN);
 
   if (/[⠀-⣿◐-◓]/.test(win.title ?? '')) return verdict(REFUSED, 'title shows a turn in progress');
   if (proc == null) return verdict(REFUSED, 'not a Claude Code tab, whose composer cannot be read reliably');
@@ -108,7 +114,7 @@ export const typingVerdict = (winId, opts = {}) => {
 };
 
 // CLI, run by bin/kitty-send.sh: `typing-proof.mjs --window N --mode idle|dialog
-// [--stdin]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
+// [--stdin] [--other-tabs]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
 // 3 a dialog is open, 64 usage. The reason goes to stderr.
 const EXIT = { [PROVEN]: 0, [REFUSED]: 2, [DIALOG]: 3 };
 if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
@@ -117,11 +123,11 @@ if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathS
   const winId = opt('--window');
   const mode = opt('--mode') ?? 'idle';
   if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog'].includes(mode)) {
-    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog [--stdin]\n');
+    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog [--stdin] [--other-tabs]\n');
     process.exit(64);
   }
   const text = argv.includes('--stdin') ? fs.readFileSync(0, 'utf-8') : null;
-  const v = proofVerdict(winId, { mode, text });
+  const v = proofVerdict(winId, { mode, text, otherTabs: argv.includes('--other-tabs') });
   if (v.reason != null) process.stderr.write(`${v.reason}\n`);
   process.exit(EXIT[v.kind]);
 }

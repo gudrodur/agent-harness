@@ -64,7 +64,7 @@ before(async () => {
     `transcript=${JSON.stringify(transcript)}`,
     'row() { jq -cn --arg t "$1" \'{type:"user",message:{role:"user",content:$t}}\' >> "$transcript"; }',
     'case "$1/$2" in',
-    `  @/ls) if [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
+    `  @/ls) if [ -f "$state/nonclaude" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed 's/"cmdline":\\["claude"\\]/"cmdline":["pi"]/'; elif [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
     '  @/send-text)',
     '    text="${@: -1}"',
     '    : > "$state/sent"',
@@ -104,7 +104,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_late', 'late_at', 'reads', 'sent']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -300,4 +300,40 @@ test('a command failing after the send exits 3, never 1', async () => {
   const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4'], { KITTY_TEST_FAIL_DATE_AFTER: path.join(stateDir, 'sent') });
   assert.deepEqual(await calls(), ['text'], 'the keystrokes did go out');
   assert.equal(r.code, 3, `${r.out}${r.err}`);
+});
+
+// ---- kitty-send also delivers to pi and opencode tabs ----
+//
+// A tab with no Claude Code process has no composer the proof can read. The path
+// before the chokepoint typed into it under the dialog check alone, and that is
+// kept: --wait-idle and --queue must not refuse it as "not a Claude Code tab".
+// (A Claude Code tab keeps the full proof; the tests above pin that.)
+test('--wait-idle still types into a non-Claude-Code tab (the proof is dialog-only there)', async () => {
+  await reset('burst');
+  await put('nonclaude', '');
+  const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '4', '--timeout', '8']);
+  assert.doesNotMatch(r.err, /typing proof did not pass|not a Claude Code tab/, `${r.out}${r.err}`);
+  assert.notEqual(r.code, 11, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst'], 'the text must be typed in one burst, as before');
+});
+
+test('--queue still types into a non-Claude-Code tab once it is idle', async () => {
+  await reset('burst');
+  await put('nonclaude', '');
+  const r = await runScript(['--to', WID, '--text', MSG, '--queue', '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  const log = path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
+  for (let i = 0; i < 60 && !/queued waiter exit rc=/.test(await fs.readFile(log, 'utf8').catch(() => '')); i++) await new Promise((res) => setTimeout(res, 200));
+  const text = await fs.readFile(log, 'utf8');
+  assert.doesNotMatch(text, /typing proof did not pass|not a Claude Code tab/, text);
+  assert.deepEqual(await calls(), ['burst'], text);
+});
+
+test('a non-Claude-Code tab with a dialog on screen is still not typed into (exit 5)', async () => {
+  await reset('burst');
+  await put('nonclaude', '');
+  await put('screen', 'Which one?\n  Enter to select · ↑/↓ to navigate · Esc to cancel');
+  const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '2', '--timeout', '4']);
+  assert.equal(r.code, 5, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), []);
 });
