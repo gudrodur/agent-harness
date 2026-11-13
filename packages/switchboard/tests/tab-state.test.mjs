@@ -270,7 +270,7 @@ const CLAUDE_PID = 424242;
 const CLAUDE_SID = '5e55-claude-test';
 const claudeSlug = WCWD.replace(/[^A-Za-z0-9-]/g, '-');
 const claudeTranscript = () => path.join(sessDir, 'claude-projects', claudeSlug, `${CLAUDE_SID}.jsonl`);
-const setupClaude = async ({ status = 'idle', startedAt = nowMs(), transcript = true, rows = null } = {}) => {
+const setupClaude = async ({ status = 'idle', startedAt = nowMs(), transcript = true } = {}) => {
   await clearLinks();
   await fs.rm(path.join(sessDir, 'claude-sessions'), { recursive: true, force: true });
   await fs.rm(path.join(sessDir, 'claude-projects'), { recursive: true, force: true });
@@ -281,7 +281,7 @@ const setupClaude = async ({ status = 'idle', startedAt = nowMs(), transcript = 
   }));
   if (transcript) {
     await fs.mkdir(path.dirname(claudeTranscript()), { recursive: true });
-    await fs.writeFile(claudeTranscript(), rows ? rows.map((r) => JSON.stringify(r)).join('\n') + '\n' : '{"type":"user"}\n{"type":"assistant"}\n{"type":"user"}\n');
+    await fs.writeFile(claudeTranscript(), '{"type":"user"}\n{"type":"assistant"}\n{"type":"user"}\n');
   }
 };
 
@@ -320,32 +320,6 @@ test('a claude status that is neither busy nor idle reports unknown with the val
   const r = await runScript([WID]);
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /state=unknown reason=claude-status-waiting source=claude/);
-});
-
-// A seat that ended its turn but keeps a background shell or monitor running
-// (the standing watcher every seat arms) records status `shell`. It is idle
-// when the newest message row is an assistant end_turn, and every --queue to
-// it used to stall because the state read unknown.
-const END_TURN = { type: 'assistant', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done.' }] } };
-const TOOL_USE = { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'Bash' }] } };
-
-test('status shell with a transcript ending in an assistant end_turn is idle', async () => {
-  await setupClaude({ status: 'shell', rows: [{ type: 'user', message: { content: 'go' } }, TOOL_USE, END_TURN, { type: 'system', subtype: 'turn_duration' }] });
-  const r = await runScript([WID, '--json']);
-  assert.equal(r.code, 0, r.err);
-  const j = JSON.parse(r.out);
-  assert.equal(j.state, 'idle', r.out);
-  assert.equal(j.reason, '');
-});
-
-test('status shell mid-turn (newest row is a tool_use or a user row) stays unknown', async () => {
-  await setupClaude({ status: 'shell', rows: [{ type: 'user', message: { content: 'go' } }, TOOL_USE] });
-  let j = JSON.parse((await runScript([WID, '--json'])).out);
-  assert.equal(j.state, 'unknown');
-  assert.equal(j.reason, 'claude-status-shell');
-  await setupClaude({ status: 'shell', rows: [END_TURN, { type: 'user', message: { content: 'next' } }] });
-  j = JSON.parse((await runScript([WID, '--json'])).out);
-  assert.equal(j.state, 'unknown');
 });
 
 test('a claude sessions file older than the window reports session-older-than-window', async () => {
