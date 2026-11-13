@@ -141,6 +141,70 @@ test('a send to an idle seat says so, types to wake it, and keeps kitty-send exi
   assert.ok(argv.includes('410') && argv.includes('wake up'));
 });
 
+// --queue to a seat idle past the presence window goes through the same typing
+// proof as every other queued send: a half-typed draft is never appended to.
+const idleQueueSend = (screenText, status = 'idle', text = 'queued for an idle seat', extraEnv = {}) => {
+  const sessDir = path.join(tmp, 'idle-queue-sessions');
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.writeFileSync(path.join(sessDir, '4343.json'), JSON.stringify({ sessionId: 'idle-1', cwd: '/r/idle', status }));
+  const screen = path.join(tmp, 'idle-queue-screen');
+  fs.writeFileSync(screen, screenText);
+  const proofKitty = path.join(tmp, 'kitty-idle-proof');
+  fs.writeFileSync(proofKitty, [
+    '#!/usr/bin/env bash',
+    `if [ "$2" = "get-text" ]; then cat ${JSON.stringify(screen)}; exit 0; fi`,
+    `printf '%s' '[{"tabs":[{"windows":[{"id":410,"title":"idle seat","cwd":"/r/idle","foreground_processes":[{"pid":4343,"cmdline":["claude"]}]}]}]}]'`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.rmSync(argvFile, { force: true });
+  const r = send(['--to', '410', '--queue', '--text', text], { AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir, ...extraEnv });
+  return { r, typed: fs.existsSync(argvFile) ? fs.readFileSync(argvFile, 'utf-8').split('\n') : null };
+};
+const IDLE_KEY = recipientKey({ cwd: '/r/idle', sessionId: 'idle-1' });
+test('--queue to a seat idle past 20 minutes is never typed onto a half-typed draft', () => {
+  const before = readUnacked(IDLE_KEY, {}).length;
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ half a thought\n────────\n');
+  assert.equal(typed, null, `kitty-send must not run: ${r.stderr}`);
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /not typed.*composer holds text/);
+  assert.equal(readUnacked(IDLE_KEY, {}).length, before + 1, 'the row stays queued for the seat');
+});
+test('--queue to a seat idle past 20 minutes is never typed over a multi-line draft', () => {
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n  second line\n────────\n');
+  assert.equal(typed, null, r.stderr);
+  assert.match(r.stderr, /composer holds text/);
+});
+test('--queue "/compact now" to a seat idle past 20 minutes is queued for the seat, never typed as a command', () => {
+  const before = readUnacked(IDLE_KEY, {}).length;
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'idle', '/compact now');
+  assert.equal(typed, null, `kitty-send must not run: ${r.stderr}`);
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /not typed.*starts with "\//);
+  assert.equal(readUnacked(IDLE_KEY, {}).length, before + 1, 'the row stays queued for the seat');
+});
+test('--queue to a seat idle past 20 minutes is refused when its record is not idle', () => {
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'waiting');
+  assert.equal(typed, null, r.stderr);
+  assert.match(r.stderr, /status waiting/);
+});
+test('--queue to a seat idle past 20 minutes with a proven empty composer is typed', () => {
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n');
+  assert.ok(typed?.includes('--wait-idle') && !typed.includes('--queue') && typed.includes('410'), `argv: ${typed}`);
+});
+
+// The fallback runs kitty-send in the foreground, so a late refusal (exit 11) from
+// its own proof reaches the sender: the row is queued for the seat, never lost
+// behind a "do not resend" for a detached waiter that then refuses.
+test('--queue to a seat idle past 20 minutes: a late kitty-send refusal (exit 11) queues the text for the seat', () => {
+  const stub = path.join(tmp, 'kitty-send-refuses');
+  fs.writeFileSync(stub, '#!/usr/bin/env bash\nexit 11\n', { mode: 0o755 });
+  const before = readUnacked(IDLE_KEY, {}).length;
+  const { r } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'idle', 'late refusal text', { AGENT_SEND_KITTY_SEND: stub });
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /kitty-send exit 11 sent nothing.*queued/);
+  assert.equal(readUnacked(IDLE_KEY, {}).length, before + 1, 'the row is queued for the seat');
+});
+
 test('a send to a role whose holder is idle wakes the holder window instead of queueing', async () => {
   const { claimRole } = await roles();
   await withDb((db) => claimRole(db, { role: 'idle-role', sessionId: 'idle-1', cwd: '/r/idle', windowId: 410 }));
@@ -217,4 +281,38 @@ test("the nudge's command, run in a clean shell, claims the role in the store th
   const holder = await withDb((db) => roleHolder(db, 'seat-printed'));
   assert.equal(holder?.session_id, 'nudge-run', `claim went elsewhere: ${r.stderr}`);
   assert.ok(!fs.existsSync(path.join(elsewhere, 'agent-switchboard', 'state.db')), 'the default store was opened');
+});
+
+// --queue to a role whose holder is LIVE and idle (a fresh beacon with the
+// consumer flag, an idle window title): the holder drains only at its next tool
+// call, prompt or Stop, none of which an idle seat makes, so the row is typed
+// into the holder's window and acked as a typed delivery instead of waiting.
+test('--queue to a role whose live holder is idle is typed into the holder window at once', async () => {
+  const { claimRole } = await roles();
+  beacon('queue-holder', '/r/holder', { windowId: 420 });
+  await withDb((db) => claimRole(db, { role: 'queue-role', sessionId: 'queue-holder', cwd: '/r/holder', windowId: 420 }));
+  fs.rmSync(argvFile, { force: true });
+  // The holder's window must PROVE idle: a Claude process, a session record
+  // with status idle and a screen with an empty prompt line.
+  const sessDir = path.join(tmp, 'queue-sessions');
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.writeFileSync(path.join(sessDir, '4242.json'), JSON.stringify({ sessionId: 'queue-holder', cwd: '/r/holder', status: 'idle' }));
+  const screen = path.join(tmp, 'queue-screen');
+  fs.writeFileSync(screen, '● Done.\n\n────────\n❯ \n────────\n');
+  const proofKitty = path.join(tmp, 'kitty-proof');
+  fs.writeFileSync(proofKitty, [
+    '#!/usr/bin/env bash',
+    `if [ "$2" = "get-text" ]; then cat ${JSON.stringify(screen)}; exit 0; fi`,
+    `printf '%s' '[{"tabs":[{"windows":[{"id":420,"title":"holder","cwd":"/r/holder","foreground_processes":[{"pid":4242,"cmdline":["claude"]}]}]}]}]'`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const r = spawnSync('node', [SEND, '--to', 'role:queue-role', '--queue', '--text', 'queued for the role'], {
+    encoding: 'utf-8', env: childEnv({ AGENT_SEND_IDLE_WAIT_S: '0', AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir }), timeout: 15_000,
+  });
+  assert.equal(r.signal, null, `the sender waited forever on an idle holder: ${r.stderr}`);
+  assert.equal(r.status, 0, r.stderr);
+  const argv = fs.readFileSync(argvFile, 'utf-8').split('\n');
+  assert.ok(argv.includes('420') && argv.includes('--wait-idle'), `argv: ${argv}`);
+  const key = recipientKey({ cwd: '/r/holder', sessionId: 'queue-holder' });
+  assert.deepEqual(readUnacked(key, {}), [], 'the withdrawn mailbox copy is never drained on top of the typed one');
 });

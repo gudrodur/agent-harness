@@ -2,7 +2,7 @@
 # Sourced by bin/kitty-send.sh and bin/tab-state.sh; defines functions only.
 #
 # The `claude` process writes <config>/sessions/<pid>.json (sessionId, cwd,
-# startedAt and statusUpdatedAt in epoch ms, status busy|idle) and every turn
+# startedAt and statusUpdatedAt in epoch ms, status busy|idle|waiting|blocked) and every turn
 # to <config>/projects/<cwd with every character outside [A-Za-z0-9-] as
 # '-'>/<sessionId>.jsonl.
 #
@@ -29,7 +29,10 @@ claude_state_of() { # $1 = window id; busy|idle|unknown
   local j
   j=$(claude_session_json "$1") || { printf 'unknown'; return 0; }
   case "$(printf '%s' "$j" | jq -r '.status // ""' 2>/dev/null)" in
-    busy) printf 'busy' ;; idle) printf 'idle' ;; *) printf 'unknown' ;;
+    # waiting (a permission prompt, a question, a plan approval) and blocked
+    # are not at the prompt: a caller must not read them as idle. `shell` is a
+    # finished turn with a background shell still running: at the prompt.
+    busy|waiting|blocked) printf 'busy' ;; idle|shell) printf 'idle' ;; *) printf 'unknown' ;;
   esac
 }
 claude_transcript_of() { # $1 = session json

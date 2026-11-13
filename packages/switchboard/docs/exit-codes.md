@@ -20,14 +20,15 @@
 |---|---|
 | 0 | Sent and proven (a new user row in the tab's session record). Under `--queue` it means only that the background waiter started; the verdict lands in the queue log. |
 | 1 | Usage or precondition error (no kitty remote control, no such window). |
-| 3 | Could not prove it landed, or the screen could not be read: do not resend. |
-| 4 | The target shows a selection dialog: nothing sent. |
+| 3 | Sent, but could not prove it landed: do not resend. Any failure after the keystrokes went out (a screen read, say) also exits 3, never 1 or 11. |
+| 4 | The target shows a selection dialog, or its session record status is `waiting` or `blocked`: nothing sent, in every mode (`--now` included); under `--wait-idle`, `--deadline` or `--queue` the wait loop keeps waiting for it to clear and exits 5 if it does not. |
 | 5 | `--wait-idle` or `--deadline` ran out before the target went idle: nothing sent. |
 | 6 | `--queue`: a send is already queued for that window: nothing sent. |
 | 7 | The target is mid-turn and none of `--wait-idle`, `--queue`, `--now` was given: nothing sent. |
 | 8 | Sent with `--now` mid-turn and still mid-turn: pending in the steering queue until the tool boundary. Do not resend. |
 | 9 | The composer already holds an unsubmitted paste chip that is not kitty-send's own: nothing sent. |
 | 10 | Typed, not proven submitted (no session record to read): look at the window before resending. |
+| 11 | Nothing sent, safe to put the message back: the screen could not be read before the send, the composer was still not clear after the recovery Enter, or the typing proof (`lib/typing-proof.mjs`, run immediately before the first keystroke by `--queue`, `--wait-idle` and `--deadline`) did not pass (a Claude Code tab that is not idle, a draft in the composer, or node or the module missing). A tab with no Claude Code process (a shell, REPL, pi or OpenCode tab) is checked for a dialog only, so it never fails the proof for being that kind of tab. A `/` text is not refused here, so an explicit `/rename` goes through. `--now` and a bare send run only the dialog check, so they still type onto a draft. agent-send re-queues on it, or reports it as 1 on the direct fallback. |
 
 The comment block at the top of `bin/kitty-send.sh` is the authority.
 

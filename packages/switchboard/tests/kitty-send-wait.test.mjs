@@ -233,6 +233,34 @@ test('a dialog still wins over --idle-when: it is the human\'s to answer', async
   assert.match(err, /refusing to type into a dialog/);
 });
 
+// Footer strings the screen check keys on. ASSUMED, not captured from a live
+// dialog: composed from the strings in the Claude Code 2.1.323 binary
+// ("↑/↓ to navigate", "Enter to select", "←/→ to switch", "Esc to cancel"). A
+// permission prompt and a plan approval are refused through the session record
+// status `waiting` (kitty-send-claude.test.mjs), not through a screen string,
+// so no footer is invented for them here.
+for (const [name, screen] of [
+  ['a question dialog footer', 'Which one?\n  Enter to select · ↑/↓ to navigate · Esc to cancel'],
+  ['a tabbed question dialog footer', 'Which one?\n  ↑/↓ to navigate · Enter to select · ←/→ to switch · Esc to cancel'],
+]) {
+  test(`${name} is a dialog: refused with exit 4`, async () => {
+    const { code, err } = await runScript(['--to', WID, '--text', 'hi', '--idle-when', 'Bíð eftir næsta'], { KITTY_MOCK_SCREEN: `Bíð eftir næsta\n${screen}` });
+    assert.equal(code, 4);
+    assert.match(err, /refusing to type into a dialog/);
+  });
+}
+
+// Prose in a seat's own last reply is not a dialog. Only the footer strings
+// Claude Code renders for one count; an open permission prompt or question is
+// otherwise caught by the record status `waiting`.
+for (const prose of ['Do you want to merge it now?', 'Would you like to proceed with the rebase?', 'Use the arrow keys to navigate; Ready to code? Say so.']) {
+  test(`a reply that says "${prose}" is not a dialog`, async () => {
+    const { code, err } = await runScript(['--to', WID, '--text', 'hi', '--idle-when', 'Bíð eftir næsta', '--timeout', '2'], { KITTY_MOCK_SCREEN: `${prose}\nBíð eftir næsta` });
+    assert.notEqual(code, 4, err);
+    assert.doesNotMatch(err, /refusing to type into a dialog/);
+  });
+}
+
 test('--queue forwards --idle-when to its detached waiter', async () => {
   const { code } = await runScript(
     ['--to', WID, '--text', 'hi', '--queue', '--deadline', '4', '--idle-when', 'Bíð eftir næsta'],

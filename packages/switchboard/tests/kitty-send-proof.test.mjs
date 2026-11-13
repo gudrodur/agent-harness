@@ -59,6 +59,7 @@ before(async () => {
     '    for a in "$@"; do [ "$prev" = "--extent" ] && ext="$a"; prev="$a"; done',
     '    [ "$ext" = "screen" ] && exit 0   # no dialog on screen',
     '    if [ -f "$state/sent" ]; then',
+    '      [ -f "$state/fail_after" ] && exit 1   # a read that fails once the text is typed',
     '      if [ -f "$state/after" ]; then cat "$state/after"; else printf \'%s\\n\' \'Waiting for browser authentication ...\'; fi',
     '    else',
     "      printf '%s\\n' 'idle prompt before the send'",
@@ -77,7 +78,7 @@ after(async () => {
 });
 
 const reset = async (after = null, opts = {}) => {
-  for (const f of ['sent', 'after', 'busy_after', 'busy_before']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['sent', 'after', 'busy_after', 'busy_before', 'fail_after']) await fs.rm(path.join(stateDir, f), { force: true });
   if (after) await fs.writeFile(path.join(stateDir, 'after'), after);
   if (opts.busyAfter) await fs.writeFile(path.join(stateDir, 'busy_after'), '');
   if (opts.busyBefore) await fs.writeFile(path.join(stateDir, 'busy_before'), '');
@@ -128,6 +129,22 @@ test('a plain message whose fragment newly appears is typed, not proven submitte
   assert.equal(r.code, 10, `${r.out}${r.err}`);
   assert.match(r.err, /typed, not proven submitted/);
   assert.match(r.err, /echoed at the prompt|queued as steering/);
+});
+
+// After the keystrokes went out, a failed screen read must not exit 1: agent-send
+// reads 1 as "nothing was sent" and would send the message a second time.
+test('a screen read that fails after the send exits 3 (sent, unproven), never 1 or 11', async () => {
+  await reset();
+  await fs.writeFile(path.join(stateDir, 'fail_after'), '');
+  const r = await runScript(['--to', WID, '--text', 'plain note without a slash', '--timeout', '3']);
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
+});
+
+test('a slash send whose screen read fails after the send exits 3 too', async () => {
+  await reset();
+  await fs.writeFile(path.join(stateDir, 'fail_after'), '');
+  const r = await runScript(['--to', WID, '--text', '/mcp reauth Neon', '--timeout', '3']);
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
 });
 
 // ---- the usage block is printable, and a bare id is --to

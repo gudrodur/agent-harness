@@ -73,6 +73,7 @@ import { switchboardDir } from '../lib/presence.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
+import { typingVerdict, proofVerdict, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
 
 const die = (msg, code = 1) => {
   process.stderr.write(`agent-send: ${msg}\n`);
@@ -98,7 +99,17 @@ const usage = () => `Usage:
                 submits at once to an idle recipient, a busy one keeps kitty-send's mid-turn guard)
   --stop        priority stop: interrupts the consumer's current run
   --idle-when   priority idle (REGEX is the consumer's parked proof)
-  --queue       priority queue; the ack wait below is unbounded unless --deadline caps it
+  --queue       priority queue: deliver without interrupting the recipient's turn.
+                A recipient proven idle (Claude Code tab, session status idle or shell,
+                no dialog, empty prompt line) when you send, or later, gets
+                it typed in once it has been idle AGENT_SEND_IDLE_WAIT_S
+                (default 5 s); exit 0. Without that proof nothing is typed
+                and one line says why. A
+                recipient mid-turn keeps the row queued and takes it at its
+                next tool call or when the turn ends. So --queue is safe to
+                send to an idle seat. The wait is unbounded unless --deadline
+                caps it, and a recipient with no kitty window to read waits
+                for its own drain
   --deadline N  seconds to wait for the ack row (default 120; a busy recipient
                 is bounded by AGENT_SEND_BUDGET_S instead, see docs/configuration.md)
   --topic SLUG  one delivery per topic: an earlier unacked message to the same
@@ -166,7 +177,8 @@ const usage = () => `Usage:
         there is no mailbox to fall back to; a withdrawn row is re-queued and
         exits 3 instead): 1 usage or precondition, 4 selection dialog open,
         5 idle wait ran out, 6 a send is already queued, 7 mid-turn without
-        --now/--queue/--wait-idle, 9 composer holds unsubmitted text
+        --now/--queue/--wait-idle, 9 composer holds unsubmitted text; kitty-send's
+        own 11 (screen unreadable before the send) is reported as 1
     11  --claim-role refused: the role's holder is live (nothing changed)
     12  --release-role refused: another session holds the role (nothing changed)
     13  --cancel found the row already delivered or already withdrawn (nothing written)
@@ -183,8 +195,15 @@ const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_S
 // kitty-send.sh exit codes that mean NOTHING WAS SENT (its header's table):
 // 1 usage or precondition, 4 a dialog was open, 5 the idle wait ran out, 6 a
 // send is already queued, 7 mid-turn without --now/--queue/--wait-idle, 9
-// the composer already held a paste chip that is not kitty-send's own.
-const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9]);
+// the composer already held a paste chip that is not kitty-send's own, 11
+// the screen was unreadable (or the composer not clear) before anything was
+// typed. Exit 3 is the opposite: sent, delivery not proven.
+const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11]);
+// How often a --queue sender re-reads the recipient window's title while it
+// waits for the drain (one `kitty @ ls` per poll).
+const QUEUE_POLL_MS = 2000;
+// How long kitty-send may wait for idle after the typing proof passed (no --deadline).
+const TYPE_AFTER_PROOF_WAIT_S = 5;
 const KITTY_NOTHING_REASON = {
   1: 'usage or precondition error',
   4: 'selection dialog open',
@@ -192,6 +211,7 @@ const KITTY_NOTHING_REASON = {
   6: 'send already queued',
   7: 'mid-turn without --now/--queue/--wait-idle',
   9: 'composer holds unsubmitted text',
+  11: 'screen unreadable or composer not clear',
 };
 // Exit 10 is typed-but-unproven (row 57): the text reached the window but no
 // session row proves the target submitted it — NOT re-queued (the composer
@@ -469,7 +489,8 @@ const main = (argv) => {
   // resolveRecipient (below): a Claude Code recipient that is idle falls back
   // at once (AGENT_SEND_IDLE_WAIT_S, default 5 s, so one late-arriving
   // ack still lands), a busy one waits AGENT_SEND_BUSY_WAIT_S inside AGENT_SEND_BUDGET_S, and an explicit --deadline
-  // always wins. --queue stays unbounded unless --deadline caps it.
+  // always wins. --queue stays unbounded unless --deadline caps it, but its
+  // wait ends early once the recipient window shows idle (waitQueued below).
   const defaultWaitMs = priority === 'queue' ? null : 120_000;
   let deadlineMs = deadline != null ? Number(deadline) * 1000 : defaultWaitMs;
 
@@ -512,10 +533,13 @@ const main = (argv) => {
     } else args.push('--text', sendText);
     if (priority === 'idle') args.push('--idle-when', idleWhen);
     if (priority === 'queue') {
-      // The withdraw path runs under --queue only after --deadline bounded the
-      // ack wait (without it the wait is unbounded and never falls through),
-      // so the 120 s is a guard for a future caller, not a reachable default.
-      if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : '120');
+      // The withdraw path runs under --queue when --deadline ran out or the
+      // recipient window showed idle with the row undrained. kitty-send runs the
+      // typing proof (lib/typing-proof.mjs) immediately before its first
+      // keystroke in every --wait-idle run, so a window that went busy, grew a
+      // draft or opened a dialog since the early verdict gets nothing typed
+      // (exit 5 or 11, and the row goes back in the mailbox).
+      if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : String(TYPE_AFTER_PROOF_WAIT_S));
       else args.push('--queue');
     }
     // An explicit --now/--stop sends mid-turn, --stop becoming --now (the one
@@ -581,14 +605,55 @@ const main = (argv) => {
   };
   // A role is not a kitty target: fall back to the window its holder's
   // beacon recorded, and fail loudly when it recorded none.
-  const kittyFallback = (why) => {
+  //
+  // A --queue send types into the window, so it gets the same proof as the
+  // mailbox path (typingVerdict, one function): without proof nothing is typed.
+  // With a mailbox key (`queueKey`, an idle seat) the text is queued there for
+  // the seat's own drain and the exit is 3; without one nothing is queued and
+  // the exit is 1, so the sender knows the message did not go.
+  const kittyFallback = (why, queueKey = null) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
-    const st = runKittySend(why, t, text);
-    // A --queue waiter that was only started is not a delivery: the verdict
-    // lands later in the queue log (exit 3: pending, do not resend).
-    if (st === 0 && priority === 'queue') process.exit(3);
-    process.exit(st ?? 1);
+    // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
+    const requeueForSeat = (reason) => {
+      if (queueKey == null) return false;
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
+      process.stderr.write(`agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
+      process.exit(3);
+    };
+    const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
+    if (priority === 'queue') {
+      const v = /^\d+$/.test(String(t)) ? proofVerdict(t, { mode: 'idle', text }) : { kind: REFUSED, reason: 'the target is not a window id, so its screen cannot be proven' };
+      if (v.kind !== PROVEN) {
+        // A seat that is busy (a turn in progress, a record that is not idle) or
+        // a tab that is not Claude Code is the detached waiter's to wait out when
+        // there is no mailbox to park the row in: kitty-send --queue re-proves at
+        // typing time and delivers once the seat is idle (what --queue has always
+        // promised: safe to send whether the seat is idle or busy). Everything
+        // else (a dialog, a draft, a slash text, a gone window) is refused.
+        const waitable = v.kind === REFUSED && /^title shows a turn|^session record status|^not a Claude Code tab/.test(v.reason ?? '');
+        process.stderr.write(`agent-send: ${why}; not typed into ${t}: ${v.reason}\n`);
+        if (queueKey != null) requeueForSeat('not typed');
+        if (!waitable) noQueueDie(`nothing was sent to ${t}`);
+        const wst = runKittySend(why, t, text);
+        if (wst === 0) process.exit(3);
+        process.exit(wst === 11 ? 1 : (wst ?? 1));
+      }
+    }
+    // A --queue send runs kitty-send in the FOREGROUND under a short --wait-idle
+    // (the proof just passed, so the seat is idle now): its verdict is the
+    // sender's. A detached --queue waiter would answer exit 3 "do not resend"
+    // and then, if its own late proof refused, lose the message with nobody told.
+    const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
+    if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
+      const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
+      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`);
+      process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
+      process.exit(st === 11 ? 1 : st);
+    }
+    // kitty-send's 11 (nothing sent) is not agent-send's 11 (--claim-role refused).
+    process.exit(st === 11 ? 1 : (st ?? 1));
   };
   try {
     recipient = resolveRecipient(to, { senderSessionId, senderCwd: process.cwd(), senderWindowId: senderWindowId() });
@@ -596,7 +661,7 @@ const main = (argv) => {
     // Never just "no consumer": a stale beacon (parked past the presence
     // window) and no beacon at all need different next steps.
     dupCheck(e?.key ?? null);
-    if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`);
+    if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`, e.key ?? null);
     if (e?.code === 'mailbox-stale') kittyFallback(`stale mailbox beacon for ${to} (${e.message})`);
     if (e?.code === 'mailbox-self' || e?.code === 'mailbox-no-beacon') kittyFallback(`no mailbox consumer at ${to}`);
     die(e.message);
@@ -611,7 +676,7 @@ const main = (argv) => {
     process.exit(3);
   }
   if (!recipient.hasConsumer) {
-    if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`);
+    if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
   }
   const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
@@ -650,7 +715,57 @@ const main = (argv) => {
       }
     }
   }
-  const ok = waitForAck({ key: recipient.key, id: row.id, deadlineMs });
+  // --queue waits for the recipient's own drain, and a Claude Code seat drains
+  // only at its next tool call, its next prompt or its Stop, none of which an
+  // IDLE seat makes: the ack never came and the sender waited forever (a seat
+  // missed three messages for about 35 minutes, 2026-11-07). So the queue wait
+  // watches the recipient's window. Busy (spinner in the title, or a title
+  // that cannot be read) keeps the row queued for the drain. Idle for
+  // AGENT_SEND_IDLE_WAIT_S on end (default 5 s, so the Stop drain of a turn
+  // that just ended acks first) ends the wait, whether idle at send time or
+  // later, and the row goes the withdraw-and-type way below, under kitty-send
+  // --wait-idle, but only after typingVerdict proved the seat idle with an empty
+  // composer (anything less leaves the row queued). --deadline still caps the whole wait.
+  let heldWhy = null;
+  const waitQueued = () => {
+    const rwin = recipient.windowId ?? recipient.beaconWindowId ?? null;
+    const capS = Number(process.env.AGENT_SEND_IDLE_WAIT_S ?? 5);
+    const capMs = (Number.isFinite(capS) && capS >= 0 ? capS : 5) * 1000;
+    const endMs = deadlineMs == null ? null : Date.now() + deadlineMs;
+    let idleSince = null;
+    let lastWhy = null;
+    heldWhy = null;
+    for (;;) {
+      const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin, { text }) : 'recipient window not idle';
+      if (rwin != null && why == null) {
+        idleSince ??= Date.now();
+        if (Date.now() - idleSince >= capMs) {
+          process.stderr.write(`agent-send: idle recipient ${to}: queued row ${row.id} not drained after ${capMs / 1000}s idle, typing it into window ${rwin}\n`);
+          return false;
+        }
+      } else {
+        idleSince = null;
+        // Said once per distinct reason; a busy window needs no line.
+        if (why !== 'recipient window not idle' && why !== lastWhy) {
+          process.stderr.write(`agent-send: not typed into window ${rwin}: ${why}; row ${row.id} stays queued for the recipient's own drain\n`);
+        }
+        lastWhy = why;
+      }
+      const left = endMs == null ? QUEUE_POLL_MS : endMs - Date.now();
+      const untilIdleCap = idleSince == null ? QUEUE_POLL_MS : idleSince + capMs - Date.now();
+      if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(QUEUE_POLL_MS, left, untilIdleCap)) })) return true;
+      if (endMs != null && Date.now() >= endMs) {
+        // The deadline ran out. A window whose title says idle but whose proof
+        // is refused (a draft in the composer, a dialog) would be typed into by
+        // the withdraw path's kitty-send --wait-idle at once; that is the
+        // early verdict: hold the row instead. kitty-send re-proves at typing
+        // time either way, so this never decides to TYPE, only to NOT withdraw.
+        if (rwin != null && why !== 'recipient window not idle' && why != null) heldWhy = why;
+        return false;
+      }
+    }
+  };
+  const ok = priority === 'queue' ? waitQueued() : waitForAck({ key: recipient.key, id: row.id, deadlineMs });
   if (ok) {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox}\n`);
     process.exit(0);
@@ -662,6 +777,13 @@ const main = (argv) => {
   if (!readUnacked(recipient.key, {}).some((r) => r.id === row.id)) {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox} (after the wait limit)\n`);
     process.exit(0);
+  }
+  // --queue --deadline ran out against a seat that looks idle but is not
+  // provably safe to type into: the row stays queued, and nothing is withdrawn
+  // first in the hope that kitty-send refuses.
+  if (priority === 'queue' && heldWhy != null) {
+    process.stderr.write(`agent-send: --deadline ran out; not typed into ${to}: ${heldWhy}. Row ${row.id} stays queued in ${mbox} for the recipient's own drain (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`);
+    process.exit(3);
   }
   // Still pending. Find the window BEFORE withdrawing: a mailbox
   // key whose beacon recorded no window id (a tab before its consumer
@@ -687,7 +809,16 @@ const main = (argv) => {
   // (atomic against a concurrent drain), so a late drain cannot deliver the
   // mailbox copy on top of the kitty copy; the kitty text carries an act-once
   // note for the one race left, a drain that read the row just before.
-  cancelQueued({ key: recipient.key, id: row.id });
+  // The withdraw decides: a drain that acked the row since the re-read above
+  // has delivered it, so typing it too would deliver it twice.
+  const withdrawal = cancelQueued({ key: recipient.key, id: row.id });
+  if (!withdrawal.withdrawn) {
+    if (withdrawal.state === 'delivered') {
+      process.stderr.write(`agent-send: acked ${row.id} in ${mbox} (drained just before the fallback; nothing typed)\n`);
+      process.exit(0);
+    }
+    die(`row ${row.id} was ${withdrawal.state ?? 'not found'} before the fallback (withdrawn by --cancel?); nothing was typed and nothing is queued`);
+  }
   process.stderr.write(`agent-send: queued, recipient busy/parked for ${row.id} in ${mbox}; withdrew the mailbox row, next: kitty-send to ${target} (its exit 8 means pending in the steering queue until the tool boundary, not lost)\n`);
   const status = runKittySend(
     `queued, recipient busy/parked for ${row.id}`,
@@ -703,6 +834,9 @@ const main = (argv) => {
     const again = appendMessage({ to: recipient.key, from, priority, text, topic });
     process.stderr.write(`agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`);
     process.exit(3);
+  }
+  if (status === 3 || status === 10) {
+    process.stderr.write(`agent-send: kitty-send typed into window ${target} but delivery is unproven (exit ${status}) for ${row.id}; NOT re-queued (a duplicate is worse): look at the window before resending\n`);
   }
   if (status == null) {
     process.stderr.write(`agent-send: kitty-send died by a signal; delivery of ${row.id} is unknown and its mailbox row is withdrawn: check the tab before resending\n`);

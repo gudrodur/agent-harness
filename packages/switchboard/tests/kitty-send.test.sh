@@ -214,7 +214,7 @@ sleep 1
 launch_poisoned "$WIN6"
 rm -f "$WRAPDIR/calls.log"
 OUT=$(PATH="$WRAPDIR:$PATH" "$SEND" --to "$WIN6" --text "$MSG" --timeout 4 2>&1); RC=$?
-check "unreadable pre-send screen sends nothing and exits 3" 3 "nothing was sent" "$RC" "$OUT"
+check "unreadable pre-send screen sends nothing and exits 11" 11 "nothing was sent" "$RC" "$OUT"
 if grep -q "send-text" "$WRAPDIR/calls.log" 2>/dev/null; then
   echo "  FAIL  unreadable pre-send screen: a send-text was issued with no proof possible"
   fail=$((fail+1))
