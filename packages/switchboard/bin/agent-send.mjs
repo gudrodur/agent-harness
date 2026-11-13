@@ -75,6 +75,14 @@ import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
 import { typingVerdict, proofVerdict, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
 
+// A pipe takes stdout asynchronously, so process.exit() straight after a
+// large write drops what the pipe has not yet accepted (64 KiB cut). An empty
+// write's callback runs after every earlier write has been flushed.
+const exitAfterStdout = (code) => {
+  process.exitCode = code;
+  process.stdout.write('', () => process.exit(code));
+};
+
 const die = (msg, code = 1) => {
   process.stderr.write(`agent-send: ${msg}\n`);
   process.exit(code);
@@ -363,7 +371,7 @@ const main = (argv) => {
     else if (a === '--json') json = true;
     else if (a === '--help' || a === '-h') {
       process.stdout.write(usage());
-      process.exit(0);
+      return exitAfterStdout(0);
     } else die(`unknown argument: ${a} (try --help)`);
   }
   // Inbox read: print this session's unacked rows and ack them, the pull path
@@ -383,7 +391,7 @@ const main = (argv) => {
       }
     }
     process.stderr.write(`agent-send: inbox ${found.length} unacked row(s) for ${sessionId}\n`);
-    process.exit(0);
+    return exitAfterStdout(0);
   }
   if (json && !who) die('--json goes with --who');
   if (takeOver && claimRoleName == null) die('--take-over goes with --claim-role');
@@ -401,7 +409,7 @@ const main = (argv) => {
       for (const r of [head, ...rows]) process.stdout.write(`${r.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd()}\n`);
     }
     warnNoLiveSeats(seats);
-    process.exit(0);
+    return exitAfterStdout(0);
   }
   if (releaseRoleName != null) {
     if (to != null || text != null || file != null || mode != null || cancel || claimRoleName != null || takeOver) die('--release-role takes only --as');
