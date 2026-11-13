@@ -50,8 +50,10 @@
 #   --retire ID  close window ID, which this script did not launch, only for the
 #                session that took its role over: a handover row written by
 #                `agent-send --claim-role ... --take-over` must name ID and the
-#                caller (CLAUDE_CODE_SESSION_ID, or --as), the window's pid must
-#                be the recorded one, ID must not be the caller's own window, and
+#                caller (CLAUDE_CODE_SESSION_ID, or --as: the caller's identity is
+#                self-asserted, so --as can impersonate a taker; the row still
+#                has to exist), the window's pid must be the recorded one, the
+#                session in the window must be the displaced one, ID must not be the caller's own window, and
 #                the displaced seat must be idle. On success it also releases the
 #                window's kitty:ID claims and marks the handover retired.
 #
@@ -152,6 +154,12 @@ if [ -n "$RESEAT" ]; then
   case "$RESEAT" in *[!0-9]*) die "--reseat takes a numeric window id, got: $RESEAT" ;; esac
   [ -n "$ROLE" ] || die "--reseat needs --role: the new seat takes that role from the seat in window $RESEAT"
   [ -z "$RESUME" ] || die "--reseat and --resume do not combine"
+  # Taking the role from the wrong seat would leave the named window open.
+  HOLDER=$(node "$HERE/seat-handover.mjs" holder "$ROLE") || die "could not read the role store — nothing launched"
+  [ "$(printf '%s' "$HOLDER" | jq -r .held)" = true ] \
+    || die "nobody holds role $ROLE, so there is no seat in window $RESEAT to replace. Nothing launched."
+  [ "$(printf '%s' "$HOLDER" | jq -r .window)" = "$RESEAT" ] \
+    || die "role $ROLE is held by window $(printf '%s' "$HOLDER" | jq -r '.window // "(unknown)"'), not window $RESEAT. Nothing launched."
   # A replacement is a seat: no state row, no slot, no brief claim.
   SEAT=1
 fi

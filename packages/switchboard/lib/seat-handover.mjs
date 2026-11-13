@@ -8,7 +8,7 @@
 
 import fs from 'node:fs';
 import { defaultStorePath } from './store.mjs';
-import { withRolesDb } from './seat-roles.mjs';
+import { readRolesDb } from './seat-roles.mjs';
 
 export const recordHandover = (db, { role, displacedSession, displacedWindow, displacedPid = null, takerSession, now = Date.now() } = {}) => {
   if (!role || !displacedSession || displacedWindow == null || !takerSession) throw new Error('recordHandover needs role, displacedSession, displacedWindow and takerSession');
@@ -40,12 +40,11 @@ export const markRetired = (db, id, now = Date.now()) =>
 export const reseatState = (db, { role, window, takerSession }) => {
   const held = db.get('SELECT session_id FROM seat_roles WHERE role = ?', role);
   const row = db.get(
-    'SELECT retired_at FROM seat_handovers WHERE displaced_window = ? AND taker_session = ? ORDER BY id DESC LIMIT 1',
-    Number(window), String(takerSession),
+    'SELECT retired_at FROM seat_handovers WHERE role = ? AND displaced_window = ? AND taker_session = ? ORDER BY id DESC LIMIT 1',
+    String(role), Number(window), String(takerSession),
   );
   return { claimed: held?.session_id === String(takerSession), retired: row?.retired_at != null };
 };
 
 // A store that does not exist has no handovers, and a read must not create it.
-export const readHandoverDb = (fn, fallback, dbPath = defaultStorePath()) =>
-  fs.existsSync(dbPath) ? withRolesDb(fn, dbPath) : fallback;
+export const readHandoverDb = readRolesDb;

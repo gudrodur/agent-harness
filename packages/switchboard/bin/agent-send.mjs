@@ -257,8 +257,26 @@ const displacedSeat = (sessionId, liveBeacon) => {
   if (b?.windowId == null) return null;
   const windowId = Number(b.windowId);
   const win = kittyWindows().find((w) => w.id === windowId);
-  return { windowId, pid: win?.pid ?? b.pid ?? null };
+  if (win?.pid == null) return null;
+  // Kitty reuses window ids after a restart, so a beacon's window id alone
+  // proves nothing. Record the window only when it is shown to hold the
+  // displaced session: the session record of its foreground claude process
+  // names it, or the beacon's own pid is the window's pid.
+  const named = (win.foreground ?? []).some((p) => {
+    if (!/(^|\/)claude$/.test(String(p?.cmdline?.[0] ?? ''))) return false;
+    try {
+      return JSON.parse(fs.readFileSync(path.join(claudeSessionsDir(), `${p.pid}.json`), 'utf-8')).sessionId === sessionId;
+    } catch {
+      return false;
+    }
+  });
+  if (!named && !(b.pid != null && b.pid === win.pid)) return null;
+  return { windowId, pid: win.pid };
 };
+
+// Claude Code's per-process session records (the seam lib/claude-session.sh reads).
+const claudeSessionsDir = () =>
+  process.env.CLAUDE_SESSIONS_DIR || path.join(process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'), 'sessions');
 
 const senderWindowId = () => {
   const raw = process.env.KITTY_WINDOW_ID;
@@ -394,6 +412,7 @@ const main = (argv) => {
       // whose beacon aged out but whose window may still be open.
       if (takeOver && before && before.session_id !== sessionId) {
         const seat = displacedSeat(before.session_id, live?.beacon ?? null);
+        if (!seat) process.stderr.write(`agent-send: no handover recorded: the window of ${before.session_id} is not proven to still hold it, so it will not be retired\n`);
         if (seat) recordHandover(db, { role: claimRoleName, displacedSession: before.session_id, displacedWindow: seat.windowId, displacedPid: seat.pid, takerSession: sessionId });
       }
       return { prev: before?.session_id ?? null, displaced: live };

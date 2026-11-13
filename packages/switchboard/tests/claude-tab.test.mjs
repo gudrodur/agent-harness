@@ -47,6 +47,7 @@ before(async () => {
       `tdir=${JSON.stringify(tdir)}`,
       'case "$1/$2" in',
       '  @/ls) [ -f "$state/nokitty" ] && exit 1',
+      '        if [ -f "$state/ls-fail-after" ]; then n=$(cat "$state/ls-count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$state/ls-count"; [ "$n" -gt "$(cat "$state/ls-fail-after")" ] && exit 1; fi',
       '        [ -f "$state/ls.json" ] && { cat "$state/ls.json"; exit 0; }',
       '        if [ -f "$state/gone" ]; then echo "[]"; else printf \'%s\\n\' ' + JSON.stringify(lsJson) + '; fi ;;',
       '  @/launch) printf \'%s\\n\' "$@" > "$state/launch-args"',
@@ -70,7 +71,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  for (const f of ['launch-args', 'closed', 'ls.json', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'closed', 'ls.json', 'ls-fail-after', 'ls-count', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { recursive: true, force: true });
   }
   await fs.rm(projects, { recursive: true, force: true });
@@ -520,11 +521,11 @@ const handover = async (over = {}) => {
   }));
 };
 // The window table: the caller's window plus the displaced one running `claude`.
-const windows = async ({ status = 'idle', pid = other.pid } = {}) => {
+const windows = async ({ status = 'idle', pid = other.pid, sessionId = OLD_SESSION } = {}) => {
   await fs.mkdir(sessionsDir(), { recursive: true });
   if (status) {
     await fs.writeFile(path.join(sessionsDir(), `${pid}.json`), JSON.stringify({
-      pid, sessionId: OLD_SESSION, cwd, startedAt: Date.now() - 60_000, statusUpdatedAt: Date.now() - 30_000, status,
+      pid, sessionId, cwd, startedAt: Date.now() - 60_000, statusUpdatedAt: Date.now() - 30_000, status,
     }));
   }
   const fg = JSON.stringify([{ pid, cmdline: ['/usr/bin/claude'] }]);
@@ -702,4 +703,63 @@ test('--reseat exits 3 when the role is claimed but the old window is not retire
   assert.equal(r.code, 3);
   assert.match(r.err, /reseat not proven.*not retired/);
   assert.equal(await exists('closed'), false);
+});
+
+test('--retire refuses a handover row with no recorded pid (exit 21): a missing pid must not skip the id-reuse guard', async () => {
+  await windows();
+  await handover({ displacedPid: null });
+  const r = await retire();
+  assert.equal(r.code, 21);
+  assert.match(r.err, /no pid/);
+  assert.equal(await exists('closed'), false);
+  assert.equal((await handoverRows())[0].retired_at, null);
+});
+
+test('--retire refuses a window whose session is not the displaced one, even with the right pid (exit 21)', async () => {
+  await windows({ sessionId: 'a-stranger' });
+  await handover();
+  const r = await retire();
+  assert.equal(r.code, 21);
+  assert.match(r.err, /a-stranger/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--retire when kitty ls fails after the first check refuses, and does not read it as "window gone"', async () => {
+  await windows();
+  await handover();
+  await fs.writeFile(path.join(stateDir, 'ls-fail-after'), '1');
+  const claims = path.join(stateDir, 'claim-calls-ls');
+  await fs.writeFile(path.join(stateDir, 'fake-claim-ls.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(claims)}, 'x\\n');\n`);
+  const r = await retire(OTHER_WID, { SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'fake-claim-ls.mjs') });
+  assert.notEqual(r.code, 0, r.err);
+  assert.equal(await exists('claim-calls-ls'), false, 'the live seat\'s claims are not released');
+  assert.equal((await handoverRows())[0].retired_at, null);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--reseat refuses before launch when the role is not held by the seat in the named window', async () => {
+  await windows();
+  await oldHolder();
+  await newSeatTranscript();
+  const wrong = reseatArgs().slice(0, -1).concat([String(WID)]);
+  const r = await tab(wrong);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /is held by window/);
+  assert.equal(await exists('launch-args'), false);
+  // And a role nobody holds.
+  const none = reseatArgs().map((a) => (a === 'lead' ? 'nobody-holds-this' : a));
+  const r2 = await tab(none);
+  assert.equal(r2.code, 1);
+  assert.match(r2.err, /nobody holds/);
+  assert.equal(await exists('launch-args'), false);
+});
+
+test('seat-handover verify counts only the handover for the asked role', async () => {
+  const { claimRole } = await import('../lib/seat-roles.mjs');
+  await withStore((db) => claimRole(db, { role: 'lead', sessionId: NEW_SESSION, cwd, windowId: WID }));
+  await handover({ role: 'other-role' });
+  await withStore((db) => db.run('UPDATE seat_handovers SET retired_at = 5'));
+  const HANDOVER = fileURLToPath(new URL('../bin/seat-handover.mjs', import.meta.url));
+  const out = await run('node', [HANDOVER, 'verify', 'lead', String(OTHER_WID), NEW_SESSION], { env: isolatedEnv({ AGENT_SWITCHBOARD_DB: dbFile() }) });
+  assert.deepEqual(JSON.parse(out.stdout), { claimed: true, retired: false });
 });

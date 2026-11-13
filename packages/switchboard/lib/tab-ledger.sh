@@ -216,7 +216,7 @@ tab_ledger_close() {
 # window that is already gone is not a refusal: its row is marked retired, its
 # claims are released, and the exit is 0.
 tab_ledger_retire() {
-  local id="${1:-}" taker="${2:-}" bin verdict reason hid want_pid now_pid st
+  local id="${1:-}" taker="${2:-}" bin verdict reason hid want_pid want_sid have_sid now_pid st ls
   bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
   [ -n "$id" ] || die "--retire needs a window id"
   case "$id" in *[!0-9]*|"") die "--retire takes a numeric window id, got: $id" ;; esac
@@ -239,20 +239,33 @@ tab_ledger_retire() {
   fi
   hid=$(printf '%s' "$verdict" | jq -r .id)
   want_pid=$(printf '%s' "$verdict" | jq -r '.pid // empty')
-  now_pid=$(win_pid "$id")
+  want_sid=$(printf '%s' "$verdict" | jq -r '.displacedSession // empty')
+  # One listing serves the pid, the session and the gone checks. A failed
+  # listing is a refusal, never "the window is gone".
+  ls=$(kitty @ ls 2>/dev/null) && [ -n "$ls" ] || die "kitty @ ls failed — cannot tell whether window $id is still there; nothing closed"
+  now_pid=$(printf '%s' "$ls" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
 
   if [ -z "$now_pid" ]; then
-    node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1
+    node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1 \
+      || die "window $id is gone but handover $hid could not be marked retired"
     sed -i "/^$id /d" "$STATE" 2>/dev/null
     claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
     note "window $id was already gone — nothing to close (handover retired, claims released)"
     return 0
   fi
-  # The same id-reuse guard as --close: the pid recorded when the role was taken.
-  if [ -n "$want_pid" ] && [ "$want_pid" != "$now_pid" ]; then
+  # The same id-reuse guard as --close: the pid recorded when the role was
+  # taken. A row with no pid cannot prove anything, so it refuses too.
+  [ -n "$want_pid" ] \
+    || die "the handover for window $id recorded no pid, so the window cannot be shown to be the displaced seat. Refusing." 21
+  if [ "$want_pid" != "$now_pid" ]; then
     die "window $id is NOT the seat that was displaced — id reused.
         handover recorded pid $want_pid, that id now belongs to pid $now_pid. Refusing." 21
   fi
+  # The session in the window must be the displaced one.
+  . "$bin/../lib/claude-session.sh"
+  have_sid=$(claude_session_json "$id" "$ls" | jq -r '.sessionId // empty' 2>/dev/null)
+  [ "$have_sid" = "$want_sid" ] \
+    || die "window $id holds session '${have_sid:-<none>}', not the displaced session '$want_sid'. Refusing." 21
   st=$("$bin/tab-state.sh" "$id" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
   [ "$st" = "state=idle" ] \
     || die "window $id is not idle (${st:-state=unknown}) — the displaced seat may be mid-turn; retry when it is idle." 23
