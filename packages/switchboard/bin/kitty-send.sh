@@ -47,8 +47,9 @@
 #      composer still held a chip after the recovery Enter, or the typing proof
 #      (lib/typing-proof.mjs, run immediately before the first keystroke by
 #      --queue, --wait-idle, --deadline and the detached waiter) did not pass:
-#      not a Claude Code tab, not idle, a draft in the composer, a text starting
-#      with "/", or node / the module missing. The window was not
+#      a Claude Code tab that is not idle, a draft in the composer, or node / the
+#      module missing (a tab with no Claude Code process gets the dialog check
+#      only; a "/" text is not refused here). The window was not
 #      typed into, so a caller may put the message back safely. (Until
 #      2026-11-13 these two shared exit 3 with "sent, unproven".)
 #   10 typed, not proven submitted: the window has no session record to read,
@@ -343,7 +344,7 @@ title_busy() {
 TYPING_PROOF="${KITTY_SEND_TYPING_PROOF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/typing-proof.mjs}"
 # run_proof <window id> <idle|dialog>: sets PROOF_RC (0 proven/clear, 2 refused,
 # 3 a dialog is open, anything else = the proof could not run) and PROOF_REASON.
-# `idle` also gets the message text on stdin. Node or the module missing is
+# Neither mode reads stdin (the slash-text refusal is agent-send's). Node or the module missing is
 # PROOF_RC=127: callers refuse, they never fall back to typing unproven.
 # KITTY_SEND_TYPING_PROOF is a test seam (a path to a stand-in or a missing
 # file); production never sets it.
@@ -636,6 +637,17 @@ fi
 # so the heartbeat can be tested without waiting five minutes).
 WAIT_UNBOUNDED=0
 [ "${KITTY_SEND_WAIT_UNBOUNDED:-0}" = 1 ] && WAIT_UNBOUNDED=1
+# An unbounded waiter has no deadline, so a proof refusal (placeholder hint,
+# a draft in the composer, a not-yet-idle record) means "not idle yet", never
+# "give up": a refusal at the chokepoint would exit 11 and drop a send whose
+# caller already got exit 0. Only a refusal (PROOF_RC 2) keeps it polling; a
+# proof that cannot run (127, a dialog) falls through to proof_gate, which
+# fails loudly.
+unbounded_proof_refuses() {
+  [ "$WAIT_UNBOUNDED" = 1 ] && [ -z "$IDLE_WHEN" ] || return 1
+  run_proof "$WID" idle
+  [ "$PROOF_RC" = 2 ]
+}
 if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   idle_deadline=$(( $(date +%s) + WAIT_IDLE ))
   waited=0
@@ -644,7 +656,7 @@ if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   while :; do
     title=$(win_title "$WID")
     [ -n "$(win_pid "$WID")" ] || die "window $WID died while waiting for it to go idle (nothing was sent)" 1
-    if ! target_busy "$title" "$WID" && ! dialog_or_die "$WID"; then
+    if ! target_busy "$title" "$WID" && ! dialog_or_die "$WID" && ! unbounded_proof_refuses; then
       [ "$waited" -eq 0 ] || note "target went idle after ${waited}s: $title"
       break
     fi

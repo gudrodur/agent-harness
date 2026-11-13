@@ -1397,7 +1397,7 @@ test('an idle recipient is unchanged by the budget: no --timeout forwarded', asy
 // unreadable screen.
 const EMPTY_COMPOSER = ['● Done.', '', '─'.repeat(40), '❯ ', '─'.repeat(40), '  ? for shortcuts'].join('\n');
 const QUEUE_WIN_PID = 424242;
-const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null, text = 'queued for an idle seat' } = {}) => {
+const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null, text = 'queued for an idle seat', cmdline = 'claude' } = {}) => {
   const titleFile = path.join(binDir, 'queue-title');
   const screenFile = path.join(binDir, 'queue-screen');
   const sessDir = path.join(binDir, 'queue-claude-sessions');
@@ -1414,7 +1414,7 @@ const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envE
     `  cat ${JSON.stringify(screenFile)} 2>/dev/null || exit 1`,
     '  exit 0',
     'fi',
-    `node -e 'process.stdout.write(JSON.stringify([{tabs:[{windows:[{id:991001,title:require("fs").readFileSync(process.argv[1],"utf-8"),cwd:"/repo/a",foreground_processes:[{pid:${QUEUE_WIN_PID},cmdline:["claude"]}]}]}]}]))' ${JSON.stringify(titleFile)}`,
+    `node -e 'process.stdout.write(JSON.stringify([{tabs:[{windows:[{id:991001,title:require("fs").readFileSync(process.argv[1],"utf-8"),cwd:"/repo/a",foreground_processes:[{pid:${QUEUE_WIN_PID},cmdline:["${cmdline}"]}]}]}]}]))' ${JSON.stringify(titleFile)}`,
     '',
   ].join('\n'), { mode: 0o755 });
   fs.rmSync(fallbackArgv, { force: true });
@@ -1634,6 +1634,35 @@ test('--queue --deadline against an idle seat with a draft: the row stays queued
   assert.match(stderr, /--deadline ran out; not typed into 991001: composer holds text/);
   assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row was not withdrawn');
   assert.equal(typedRows().length, 0);
+});
+
+// --queue promises to be safe whether the seat is idle or busy. A seat with no
+// mailbox consumer has nowhere to park the row, so a busy one (or a tab that is
+// not Claude Code) is handed to kitty-send's detached --queue waiter, which
+// re-proves at typing time: exit 3, pending. Exit 1 here dropped the message.
+test('--queue to a busy seat with no mailbox consumer starts the waiter (exit 3), not exit 1', async () => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]); // beacon without the consumer flag
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: '⠇ claude: working', status: 'busy' });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    assert.ok(argv?.includes('--queue') && !argv.includes('--now'), `the waiter must be started: ${argv}`);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+  }
+});
+test('--queue to a non-Claude-Code tab with no mailbox consumer starts the waiter (exit 3), not exit 1', async () => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]);
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: 'pi: waiting', cmdline: 'pi' });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    assert.ok(argv?.includes('--queue'), `the waiter must be started: ${argv}`);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+  }
 });
 
 // The fallback (a seat with no mailbox consumer) passes the text to the proof

@@ -4,7 +4,7 @@
 // One module, two callers, one marker list:
 //   - bin/kitty-send.sh runs the CLI below immediately before its first
 //     `send-text` (the chokepoint, so no path to a keystroke skips it);
-//   - bin/agent-send.mjs imports `proofVerdict` for an early verdict only
+//   - bin/agent-send.mjs imports `typingVerdict` / `proofVerdict` for an early verdict only
 //     (it decides whether to withdraw a queued row, never whether to type).
 import fs from 'node:fs';
 import os from 'node:os';

@@ -73,7 +73,7 @@ import { switchboardDir } from '../lib/presence.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
-import { typingVerdict } from '../lib/typing-proof.mjs';
+import { typingVerdict, proofVerdict, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
 
 const die = (msg, code = 1) => {
   process.stderr.write(`agent-send: ${msg}\n`);
@@ -614,15 +614,31 @@ const main = (argv) => {
   const kittyFallback = (why, queueKey = null) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
+    // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
+    const requeueForSeat = (reason) => {
+      if (queueKey == null) return false;
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
+      process.stderr.write(`agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
+      process.exit(3);
+    };
+    const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
     if (priority === 'queue') {
-      const refusal = /^\d+$/.test(String(t)) ? typingVerdict(t, { text }) : 'the target is not a window id, so its screen cannot be proven';
-      if (refusal != null) {
-        process.stderr.write(`agent-send: ${why}; not typed into ${t}: ${refusal}\n`);
-        if (queueKey == null) die(`nothing was sent and nothing is queued for ${t}: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
-        const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
-        const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
-        process.stderr.write(`agent-send: queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
-        process.exit(3);
+      const v = /^\d+$/.test(String(t)) ? proofVerdict(t, { mode: 'idle', text }) : { kind: REFUSED, reason: 'the target is not a window id, so its screen cannot be proven' };
+      if (v.kind !== PROVEN) {
+        // A seat that is busy (a turn in progress, a record that is not idle) or
+        // a tab that is not Claude Code is the detached waiter's to wait out when
+        // there is no mailbox to park the row in: kitty-send --queue re-proves at
+        // typing time and delivers once the seat is idle (what --queue has always
+        // promised: safe to send whether the seat is idle or busy). Everything
+        // else (a dialog, a draft, a slash text, a gone window) is refused.
+        const waitable = v.kind === REFUSED && /^title shows a turn|^session record status|^not a Claude Code tab/.test(v.reason ?? '');
+        process.stderr.write(`agent-send: ${why}; not typed into ${t}: ${v.reason}\n`);
+        if (queueKey != null) requeueForSeat('not typed');
+        if (!waitable) noQueueDie(`nothing was sent to ${t}`);
+        const wst = runKittySend(why, t, text);
+        if (wst === 0) process.exit(3);
+        process.exit(wst === 11 ? 1 : (wst ?? 1));
       }
     }
     // A --queue send runs kitty-send in the FOREGROUND under a short --wait-idle
@@ -632,14 +648,9 @@ const main = (argv) => {
     const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
     if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
-      if (queueKey == null) {
-        process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
-        process.exit(st === 11 ? 1 : st);
-      }
-      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
-      const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
-      process.stderr.write(`agent-send: kitty-send exit ${st} sent nothing (${reason}); queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
-      process.exit(3);
+      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`);
+      process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
+      process.exit(st === 11 ? 1 : st);
     }
     // kitty-send's 11 (nothing sent) is not agent-send's 11 (--claim-role refused).
     process.exit(st === 11 ? 1 : (st ?? 1));

@@ -272,7 +272,7 @@ test('the stranded-chip Enter is not pressed when the idle proof refuses (no ses
 test('--queue: the detached waiter proves at typing time too (exit 11 in its log, nothing sent)', async () => {
   await reset('burst');
   await put('screen', DRAFT);
-  const r = await runScript(['--to', WID, '--text', MSG, '--queue', '--timeout', '4']);
+  const r = await runScript(['--to', WID, '--text', MSG, '--queue', '--deadline', '3', '--timeout', '4']);
   assert.equal(r.code, 0, `${r.out}${r.err}`);
   const log = path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
   for (let i = 0; i < 60 && !/queued waiter exit rc=/.test(await fs.readFile(log, 'utf8').catch(() => '')); i++) await new Promise((res) => setTimeout(res, 200));
@@ -280,6 +280,24 @@ test('--queue: the detached waiter proves at typing time too (exit 11 in its log
   assert.match(text, /queued waiter exit rc=11/, text);
   assert.match(text, /composer holds text/);
   assert.deepEqual(await calls(), []);
+});
+
+test('--queue with no bound: a proof refusal is "not idle yet", the waiter keeps polling and delivers', async () => {
+  // No --timeout/--deadline: the waiter is unbounded. The first proof reads show
+  // a draft; from the 5th read on the composer is empty. The text must arrive,
+  // not be dropped with exit 11 after the caller already got exit 0.
+  await reset('burst');
+  await put('screen', DRAFT);
+  await put('screen_late', EMPTY);
+  await put('late_at', '5');
+  const r = await runScript(['--to', WID, '--text', MSG, '--queue']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  const log = path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
+  for (let i = 0; i < 120 && !/queued waiter exit rc=/.test(await fs.readFile(log, 'utf8').catch(() => '')); i++) await new Promise((res) => setTimeout(res, 200));
+  const text = await fs.readFile(log, 'utf8');
+  assert.doesNotMatch(text, /queued waiter exit rc=11/, text);
+  assert.match(text, /queued waiter exit rc=0/, text);
+  assert.ok((await calls()).includes('text') || (await calls()).includes('burst'), `typed: ${await calls()}`);
 });
 
 test('the proof is read at typing time: a draft that appears after the idle poll is not typed over', async () => {
