@@ -47,6 +47,7 @@ before(async () => {
       `tdir=${JSON.stringify(tdir)}`,
       'case "$1/$2" in',
       '  @/ls) [ -f "$state/nokitty" ] && exit 1',
+      '        [ -f "$state/ls.json" ] && { cat "$state/ls.json"; exit 0; }',
       '        if [ -f "$state/gone" ]; then echo "[]"; else printf \'%s\\n\' ' + JSON.stringify(lsJson) + '; fi ;;',
       '  @/launch) printf \'%s\\n\' "$@" > "$state/launch-args"',
       '            [ -f "$state/session.jsonl" ] && mkdir -p "$tdir" && cp "$state/session.jsonl" "$tdir/new-session.jsonl"',
@@ -69,7 +70,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  for (const f of ['launch-args', 'closed', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'closed', 'ls.json', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { recursive: true, force: true });
   }
   await fs.rm(projects, { recursive: true, force: true });
@@ -104,6 +105,9 @@ const tab = async (args, extraEnv = {}) => {
         CLAUDE_TAB_CONFIG: config,
         CLAUDE_SESSIONS_DIR: path.join(stateDir, 'sessions'),
         SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'no-claim-cli.mjs'),
+        OPENCODE_TAB_DB: path.join(stateDir, 'no-opencode.db'),
+        AGENT_SWITCHBOARD_DB: path.join(stateDir, 'switchboard.db'),
+        AGENT_MAILBOX_KITTY: path.join(binDir, 'kitty'),
         ...extraEnv,
       }),
     });
@@ -491,4 +495,211 @@ test('a role name outside [a-z0-9][a-z0-9-]{0,63} is refused and nothing is laun
   assert.equal(r.code, 1);
   assert.match(r.err, /--role must match/);
   assert.equal(await exists('launch-args'), false);
+});
+
+// --retire and --reseat: closing the window a takeover displaced.
+//
+// The displaced seat is OTHER_WID (pid: the `other` sleep). `ls.json` replaces
+// the stub's window table so that window can look like a Claude Code tab
+// (foreground `claude`, a session record whose status is the test's choice).
+const SEND = fileURLToPath(new URL('../bin/agent-send.mjs', import.meta.url));
+const OLD_SESSION = 'old-seat-session';
+const NEW_SESSION = 'new-session';
+const dbFile = () => path.join(stateDir, 'switchboard.db');
+const withStore = async (fn) => {
+  const { openStore } = await import('../lib/store.mjs');
+  const db = openStore(dbFile());
+  try { return await fn(db); } finally { db.close(); }
+};
+const handoverRows = () => withStore((db) => db.all('SELECT * FROM seat_handovers ORDER BY id'));
+// A handover row as agent-send --take-over writes it.
+const handover = async (over = {}) => {
+  const { recordHandover } = await import('../lib/seat-handover.mjs');
+  return withStore((db) => recordHandover(db, {
+    role: 'lead', displacedSession: OLD_SESSION, displacedWindow: OTHER_WID, displacedPid: other.pid, takerSession: NEW_SESSION, ...over,
+  }));
+};
+// The window table: the caller's window plus the displaced one running `claude`.
+const windows = async ({ status = 'idle', pid = other.pid } = {}) => {
+  await fs.mkdir(sessionsDir(), { recursive: true });
+  if (status) {
+    await fs.writeFile(path.join(sessionsDir(), `${pid}.json`), JSON.stringify({
+      pid, sessionId: OLD_SESSION, cwd, startedAt: Date.now() - 60_000, statusUpdatedAt: Date.now() - 30_000, status,
+    }));
+  }
+  const fg = JSON.stringify([{ pid, cmdline: ['/usr/bin/claude'] }]);
+  await fs.writeFile(path.join(stateDir, 'ls.json'), `[{"tabs":[{"windows":[{"id":${WID},"pid":${process.pid}},{"id":${OTHER_WID},"pid":${pid},"foreground_processes":${fg}}]}]}]`);
+};
+const retire = (id = OTHER_WID, env = {}) => tab(['--retire', String(id)], { CLAUDE_CODE_SESSION_ID: NEW_SESSION, KITTY_WINDOW_ID: String(WID), ...env });
+
+test('--help documents --retire, --reseat and the retire exit codes', async () => {
+  const r = await tab(['--help']);
+  assert.match(r.out, /--retire <window-id>/);
+  assert.match(r.out, /--reseat <window-id>/);
+  for (const code of ['20', '21', '22', '23']) assert.match(r.out, new RegExp(`^#?\\s*${code}  `, 'm'));
+});
+
+test('--retire closes a displaced idle seat, marks the row retired and releases its claims', async () => {
+  await windows();
+  const claims = path.join(stateDir, 'claim-calls');
+  await fs.writeFile(path.join(stateDir, 'fake-claim.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(claims)}, process.argv.slice(2).join(' ') + '\\n');\n`);
+  await handover();
+  const r = await retire(OTHER_WID, { SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'fake-claim.mjs') });
+  assert.equal(r.code, 0, r.err);
+  assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
+  assert.match(await fs.readFile(claims, 'utf8'), new RegExp(`--release-owner kitty:${OTHER_WID}`));
+  const [row] = await handoverRows();
+  assert.ok(Number(row.retired_at) > 0, 'retired_at is set');
+  // A second retire has nothing left to retire.
+  await fs.rm(path.join(stateDir, 'closed'));
+  const again = await retire();
+  assert.equal(again.code, 20, again.err);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--retire with no handover row refuses with exit 20 and closes nothing', async () => {
+  await windows();
+  const r = await retire();
+  assert.equal(r.code, 20);
+  assert.match(r.err, /no handover/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--retire refuses when the handover names a different taker', async () => {
+  await windows();
+  await handover({ takerSession: 'someone-else' });
+  const r = await retire();
+  assert.equal(r.code, 20);
+  assert.match(r.err, /different session/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--retire refuses a window whose pid is not the one recorded (id reuse) with exit 21', async () => {
+  await windows();
+  await handover({ displacedPid: process.pid });
+  const r = await retire();
+  assert.equal(r.code, 21);
+  assert.match(r.err, /id reused|recycled/i);
+  assert.equal(await exists('closed'), false);
+  assert.equal((await handoverRows())[0].retired_at, null);
+});
+
+test('--retire refuses the caller\'s own window with exit 22, even with a valid row', async () => {
+  await windows();
+  await handover({ displacedWindow: WID, displacedPid: process.pid });
+  const r = await retire(WID);
+  assert.equal(r.code, 22);
+  assert.match(r.err, /own window/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--retire refuses a busy seat with exit 23, and a seat whose state is unknown', async () => {
+  await handover();
+  await windows({ status: 'busy' });
+  let r = await retire();
+  assert.equal(r.code, 23);
+  assert.match(r.err, /state=busy/);
+  await windows({ status: '' });
+  r = await retire();
+  assert.equal(r.code, 23);
+  assert.equal(await exists('closed'), false);
+  assert.equal((await handoverRows())[0].retired_at, null);
+});
+
+test('--retire needs a numeric window id and a calling session', async () => {
+  await windows();
+  await handover();
+  let r = await tab(['--retire', 'abc'], { CLAUDE_CODE_SESSION_ID: NEW_SESSION });
+  assert.equal(r.code, 1);
+  r = await tab(['--retire', String(OTHER_WID)], { CLAUDE_CODE_SESSION_ID: '' });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /session id/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--retire of a displaced window that is already gone marks the row retired and exits 0', async () => {
+  await handover({ displacedWindow: 999999 });
+  await windows();
+  const r = await retire(999999);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.err, /already gone/);
+  assert.equal(await exists('closed'), false);
+  assert.ok(Number((await handoverRows())[0].retired_at) > 0);
+});
+
+test('--reseat needs --role and a numeric window id, and nothing is launched without them', async () => {
+  let r = await tab(['--seat', '--title', 't', '--model', 'opus', '--cwd', cwd, '--reseat', String(OTHER_WID)]);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--reseat needs --role/);
+  r = await tab(['--seat', '--title', 't', '--model', 'opus', '--cwd', cwd, '--role', 'lead', '--reseat', 'x1']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--reseat takes a numeric window id/);
+  assert.equal(await exists('launch-args'), false);
+});
+
+// What the new seat's first prompt makes it do: claim the role with --take-over, then --retire the old window.
+const seatActs = async ({ claim = true, retireIt = true } = {}) => {
+  const lines = [
+    '#!/usr/bin/env bash',
+    `export CLAUDE_CODE_SESSION_ID=${NEW_SESSION} KITTY_WINDOW_ID=${WID}`,
+    claim ? `node ${JSON.stringify(SEND)} --claim-role lead --take-over >/dev/null 2>&1` : ':',
+    retireIt ? `bash ${JSON.stringify(SCRIPT)} --retire ${OTHER_WID} >/dev/null 2>&1` : ':',
+  ];
+  await fs.writeFile(path.join(stateDir, 'on-launch'), lines.join('\n') + '\n', { mode: 0o755 });
+};
+const oldHolder = async () => {
+  const { recordPresence } = await import('../lib/presence.mjs');
+  const { claimRole } = await import('../lib/seat-roles.mjs');
+  process.env.AGENT_SWITCHBOARD_DB = dbFile();
+  try {
+    recordPresence({ sessionId: OLD_SESSION, cwd, windowId: OTHER_WID, mailbox: true });
+    await withStore((db) => claimRole(db, { role: 'lead', sessionId: OLD_SESSION, cwd, windowId: OTHER_WID }));
+  } finally {
+    delete process.env.AGENT_SWITCHBOARD_DB;
+  }
+};
+const reseatArgs = () => ['--seat', '--title', 'claude: new lead', '--model', 'opus', '--cwd', cwd, '--role', 'lead', '--reseat', String(OTHER_WID)];
+// The transcript file name is the new seat's session id.
+const newSeatTranscript = async () => {
+  await session('claude-opus-5-5');
+  await fs.mkdir(tdir, { recursive: true });
+};
+
+test('--reseat end to end: the prompt claims then retires, the launcher verifies both', async () => {
+  await windows();
+  await oldHolder();
+  await newSeatTranscript();
+  await seatActs();
+  const r = await tab(reseatArgs());
+  assert.equal(r.code, 0, r.err);
+  const args = await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8');
+  assert.match(args, /--claim-role lead --take-over/);
+  assert.match(args, new RegExp(`--retire ${OTHER_WID}`));
+  assert.doesNotMatch(args, /AGENT_SEAT_ROLE/, 'the explicit takeover replaces the env claim');
+  assert.match(r.err, /reseat verified: role lead claimed, window \d+ retired/);
+  assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
+  const [row] = await handoverRows();
+  assert.equal(row.taker_session, NEW_SESSION);
+});
+
+test('--reseat exits 3 when the new seat never claims the role', async () => {
+  await windows();
+  await oldHolder();
+  await newSeatTranscript();
+  await seatActs({ claim: false, retireIt: false });
+  const r = await tab(reseatArgs());
+  assert.equal(r.code, 3);
+  assert.match(r.err, /reseat not proven.*not claimed/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--reseat exits 3 when the role is claimed but the old window is not retired', async () => {
+  await windows({ status: 'busy' });
+  await oldHolder();
+  await newSeatTranscript();
+  await seatActs();
+  const r = await tab(reseatArgs());
+  assert.equal(r.code, 3);
+  assert.match(r.err, /reseat not proven.*not retired/);
+  assert.equal(await exists('closed'), false);
 });

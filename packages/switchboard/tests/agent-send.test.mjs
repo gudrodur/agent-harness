@@ -1333,3 +1333,80 @@ test('an idle recipient is unchanged by the budget: no --timeout forwarded', asy
   const { argv } = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_IDLE_WAIT_S: '0.5' }, 'claude: idle seat');
   assert.ok(argv && !argv.includes('--timeout'), `argv: ${argv}`);
 });
+
+// Handover rows: --claim-role --take-over leaves the evidence that lets the
+// taker retire the window it displaced (claude-tab.sh --retire).
+//
+// A store of its own, and presence in that store: AGENT_SWITCHBOARD_DB wins
+// over the file pins above, in this process and in the child.
+const handoverEnv = (db, extra = {}) => childEnv({ AGENT_SWITCHBOARD_DB: db, ...extra });
+const withHandoverStore = async (db, fn) => {
+  const { openStore } = await import('../lib/store.mjs');
+  const store = openStore(db);
+  try { return await fn(store); } finally { store.close(); }
+};
+const handoverFixture = async (name) => {
+  const db = path.join(binDir, `handover-${name}.db`);
+  const prev = process.env.AGENT_SWITCHBOARD_DB;
+  process.env.AGENT_SWITCHBOARD_DB = db;
+  try {
+    const { recordPresence } = await import('../lib/presence.mjs');
+    const { claimRole } = await import('../lib/seat-roles.mjs');
+    return { db, recordPresence, claimRole };
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_SWITCHBOARD_DB; else process.env.AGENT_SWITCHBOARD_DB = prev;
+  }
+};
+const seatHolder = async (fx, { minutesAgo = 0, windowId = 991002, pid = undefined } = {}) => {
+  const prev = process.env.AGENT_SWITCHBOARD_DB;
+  process.env.AGENT_SWITCHBOARD_DB = fx.db;
+  try {
+    fx.recordPresence({ sessionId: 'old-seat', cwd: '/repo/b', windowId, mailbox: true, pid: pid ?? (minutesAgo ? process.pid : null), now: Date.now() - minutesAgo * 60_000 });
+    await withHandoverStore(fx.db, (s) => fx.claimRole(s, { role: 'lead', sessionId: 'old-seat', cwd: '/repo/b', windowId }));
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_SWITCHBOARD_DB; else process.env.AGENT_SWITCHBOARD_DB = prev;
+  }
+};
+const handovers = (db) => withHandoverStore(db, (s) => s.all('SELECT * FROM seat_handovers ORDER BY id'));
+const takeOverAs = (db, args, session = 'new-seat') =>
+  runSend(['--claim-role', 'lead', ...args], handoverEnv(db, { CLAUDE_CODE_SESSION_ID: session, KITTY_WINDOW_ID: '991001' }));
+
+test('--take-over of a live holder records a handover row naming window and pid', async () => {
+  const fx = await handoverFixture('live');
+  await seatHolder(fx);
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  const rows = await handovers(fx.db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].role, 'lead');
+  assert.equal(rows[0].displaced_session, 'old-seat');
+  assert.equal(rows[0].displaced_window, 991002);
+  assert.equal(rows[0].displaced_pid, 112, 'the pid kitty reports for that window');
+  assert.equal(rows[0].taker_session, 'new-seat');
+  assert.ok(Number(rows[0].ts) > 0);
+  assert.equal(rows[0].retired_at, null);
+});
+
+test('--take-over of a parked (idle) holder records a handover row too', async () => {
+  const fx = await handoverFixture('idle');
+  await seatHolder(fx, { minutesAgo: 60 });
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  const rows = await handovers(fx.db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].displaced_window, 991002);
+});
+
+test('a claim that takes nothing records no handover: refused, free role, re-claim, plain claim of a dead holder', async () => {
+  const fx = await handoverFixture('none');
+  await seatHolder(fx);
+  const refused = await takeOverAs(fx.db, []);
+  assert.equal(refused.code, 11);
+  assert.equal((await handovers(fx.db)).length, 0, 'a refused claim displaces nobody');
+  const free = await runSend(['--claim-role', 'other-role', '--take-over'], handoverEnv(fx.db, { CLAUDE_CODE_SESSION_ID: 'new-seat' }));
+  assert.equal(free.code, 0, free.stderr);
+  await takeOverAs(fx.db, ['--take-over']);
+  const again = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal((await handovers(fx.db)).length, 1, 'only the first takeover displaced anyone');
+});

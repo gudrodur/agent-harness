@@ -90,6 +90,21 @@ CREATE TABLE IF NOT EXISTS seat_nudges (
   session_id TEXT PRIMARY KEY,
   nudged_at INTEGER NOT NULL
 );
+-- One row per takeover that displaced another session: the evidence that lets
+-- the taker retire (close) the displaced seat's window and nothing else.
+-- displaced_pid is the window's process id when the role was taken, the guard
+-- against a window id that was reused later. retired_at is null until retired.
+CREATE TABLE IF NOT EXISTS seat_handovers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  role TEXT NOT NULL,
+  displaced_session TEXT NOT NULL,
+  displaced_window INTEGER NOT NULL,
+  displaced_pid INTEGER,
+  taker_session TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  retired_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_handover_window ON seat_handovers (displaced_window, taker_session);
 -- An exclusive lease on a shared resource (a device, a port): one holder at a
 -- time, no takeover, released explicitly or by missing heartbeats. mode
 -- 'human' means the person at the device holds it and no session may act.

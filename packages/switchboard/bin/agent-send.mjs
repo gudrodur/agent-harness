@@ -59,6 +59,8 @@ import {
   pruneStale,
   readUnacked,
   readInbox,
+  readPresenceBeacons,
+  kittyWindows,
   recipientKey,
   findRecentTopicDelivery,
   recordTypedDelivery,
@@ -69,6 +71,7 @@ import {
 } from '../lib/agent-mailbox.mjs';
 import { switchboardDir } from '../lib/presence.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
+import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
 
 const die = (msg, code = 1) => {
@@ -235,6 +238,28 @@ const writeNote = (text, id) => {
   return note;
 };
 
+// Where a displaced holder lives: its beacon's window id (the live beacon, else
+// the newest one of that session that names a window) and the pid kitty reports
+// for that window now, so a later close can tell a recycled id from the seat.
+// The beacon's own pid is the fallback when kitty cannot answer. Null when no
+// window is known.
+const displacedSeat = (sessionId, liveBeacon) => {
+  let b = liveBeacon;
+  if (b?.windowId == null) {
+    try {
+      b = readPresenceBeacons({ includeStale: true })
+        .filter((x) => x.sessionId === sessionId && x.windowId != null)
+        .sort((x, y) => String(y.lastTick).localeCompare(String(x.lastTick)))[0] ?? null;
+    } catch {
+      b = null;
+    }
+  }
+  if (b?.windowId == null) return null;
+  const windowId = Number(b.windowId);
+  const win = kittyWindows().find((w) => w.id === windowId);
+  return { windowId, pid: win?.pid ?? b.pid ?? null };
+};
+
 const senderWindowId = () => {
   const raw = process.env.KITTY_WINDOW_ID;
   if (raw == null || raw === '') return null;
@@ -364,6 +389,13 @@ const main = (argv) => {
       if (live && !takeOver) return { refused: live };
       const before = db.get('SELECT session_id FROM seat_roles WHERE role = ?', claimRoleName);
       claimRole(db, { role: claimRoleName, sessionId, cwd: process.cwd(), windowId: wid });
+      // A takeover leaves the evidence that lets the taker close the window it
+      // displaced (claude-tab.sh --retire): the live holder, or a parked one
+      // whose beacon aged out but whose window may still be open.
+      if (takeOver && before && before.session_id !== sessionId) {
+        const seat = displacedSeat(before.session_id, live?.beacon ?? null);
+        if (seat) recordHandover(db, { role: claimRoleName, displacedSession: before.session_id, displacedWindow: seat.windowId, displacedPid: seat.pid, takerSession: sessionId });
+      }
       return { prev: before?.session_id ?? null, displaced: live };
     });
     if (outcome.refused) {

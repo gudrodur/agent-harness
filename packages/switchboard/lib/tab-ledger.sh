@@ -15,6 +15,8 @@
 #                                                release a gone window's brief claims
 #   tab_ledger_close <id>                        --close: close only a window this ledger
 #                                                recorded, refusing a stranger or a reused id
+#   tab_ledger_retire <id> <taker-session>       --retire: close the window a takeover displaced,
+#                                                on the strength of a handover row (below)
 #
 # Brief claims (the companion repo task-claim CLI). Two seats on ONE brief is the
 # race task claims exist for: once two overseer windows ran the
@@ -195,6 +197,72 @@ tab_ledger_close() {
     # old code discarded both the status and the message, then said "closed".
     note "close-window FAILED for $id — the window may still be open; go look"
   fi
+  sed -i "/^$id /d" "$STATE" 2>/dev/null
+  claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+  return 0
+}
+
+# --retire <id>. Closes a window THIS ledger never launched, which --close
+# refuses, on different evidence: the shared store holds a handover row that
+# `agent-send --claim-role R --take-over` wrote when the caller took a role from
+# the seat in that window (lib/seat-handover.mjs). Every guard must hold, and
+# each refusal has its own exit code (docs/exit-codes.md):
+#   20  no usable handover row: none names this window, it names another taker,
+#       or it was already retired
+#   21  the window's pid is not the one recorded: the id was reused
+#   22  the id is the caller's own window (KITTY_WINDOW_ID)
+#   23  the displaced seat is not idle (busy, or its state cannot be proven)
+# 1 is a usage or store error and 2 is no kitty remote control. A displaced
+# window that is already gone is not a refusal: its row is marked retired, its
+# claims are released, and the exit is 0.
+tab_ledger_retire() {
+  local id="${1:-}" taker="${2:-}" bin verdict reason hid want_pid now_pid st
+  bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+  [ -n "$id" ] || die "--retire needs a window id"
+  case "$id" in *[!0-9]*|"") die "--retire takes a numeric window id, got: $id" ;; esac
+  [ -n "$taker" ] || die "--retire needs the calling session id: run it from the session that took the role, or pass --as <session-id>"
+  [ "$id" != "${KITTY_WINDOW_ID:-}" ] \
+    || die "window $id is this session's own window — refusing to close it." 22
+  kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
+
+  verdict=$(node "$bin/seat-handover.mjs" check "$id" "$taker") \
+    || die "could not read the handover store — nothing closed"
+  if [ "$(printf '%s' "$verdict" | jq -r .ok)" != true ]; then
+    reason=$(printf '%s' "$verdict" | jq -r .reason)
+    case "$reason" in
+      other-taker) die "the handover for window $id belongs to a different session than $taker — refusing to close it." 20 ;;
+      already-retired) die "the handover for window $id was already retired — nothing to close." 20 ;;
+      *) die "no handover row for window $id and session $taker — refusing to close it.
+        A window is retired only by the session that took its role with
+        agent-send --claim-role <role> --take-over." 20 ;;
+    esac
+  fi
+  hid=$(printf '%s' "$verdict" | jq -r .id)
+  want_pid=$(printf '%s' "$verdict" | jq -r '.pid // empty')
+  now_pid=$(win_pid "$id")
+
+  if [ -z "$now_pid" ]; then
+    node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1
+    sed -i "/^$id /d" "$STATE" 2>/dev/null
+    claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+    note "window $id was already gone — nothing to close (handover retired, claims released)"
+    return 0
+  fi
+  # The same id-reuse guard as --close: the pid recorded when the role was taken.
+  if [ -n "$want_pid" ] && [ "$want_pid" != "$now_pid" ]; then
+    die "window $id is NOT the seat that was displaced — id reused.
+        handover recorded pid $want_pid, that id now belongs to pid $now_pid. Refusing." 21
+  fi
+  st=$("$bin/tab-state.sh" "$id" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
+  [ "$st" = "state=idle" ] \
+    || die "window $id is not idle (${st:-state=unknown}) — the displaced seat may be mid-turn; retry when it is idle." 23
+
+  if kitty @ close-window --match "id:$id" 2>/dev/null; then
+    note "retired window $id (role handed over to $taker)"
+  else
+    die "close-window FAILED for $id — the window may still be open; go look"
+  fi
+  node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1 || note "could not mark handover $hid retired"
   sed -i "/^$id /d" "$STATE" 2>/dev/null
   claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
   return 0
