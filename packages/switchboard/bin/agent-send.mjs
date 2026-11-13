@@ -71,6 +71,7 @@ import {
 import { switchboardDir } from '../lib/presence.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
+import { typingVerdict } from '../lib/typing-proof.mjs';
 
 const die = (msg, code = 1) => {
   process.stderr.write(`agent-send: ${msg}\n`);
@@ -191,8 +192,10 @@ const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_S
 // kitty-send.sh exit codes that mean NOTHING WAS SENT (its header's table):
 // 1 usage or precondition, 4 a dialog was open, 5 the idle wait ran out, 6 a
 // send is already queued, 7 mid-turn without --now/--queue/--wait-idle, 9
-// the composer already held a paste chip that is not kitty-send's own.
-const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9]);
+// the composer already held a paste chip that is not kitty-send's own, 11
+// the screen was unreadable (or the composer not clear) before anything was
+// typed. Exit 3 is the opposite: sent, delivery not proven.
+const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11]);
 // How often a --queue sender re-reads the recipient window's title while it
 // waits for the drain (one `kitty @ ls` per poll).
 const QUEUE_POLL_MS = 2000;
@@ -203,6 +206,7 @@ const KITTY_NOTHING_REASON = {
   6: 'send already queued',
   7: 'mid-turn without --now/--queue/--wait-idle',
   9: 'composer holds unsubmitted text',
+  11: 'screen unreadable or composer not clear',
 };
 // Exit 10 is typed-but-unproven (row 57): the text reached the window but no
 // session row proves the target submitted it — NOT re-queued (the composer
@@ -459,46 +463,6 @@ const main = (argv) => {
       const rec = wins.find((w) => w.id === Number(winId));
       return rec != null && !/[\u2800-\u28FF\u25D0-\u25D3]/.test(rec.title ?? '');
     } catch { return false; }
-  };
-  // Fail-closed proof for typing a queued row into a window: null when the
-  // seat is PROVEN idle with an empty composer, else a short reason. Anything
-  // short of proof, including "could not tell", is a reason, so the row stays
-  // queued for the seat's own drain.
-  //   - a Claude Code tab only: the composer of any other kind of tab cannot be
-  //     read reliably from its screen, so those are never typed into;
-  //   - the session record status must be on the idle whitelist (`waiting` is a
-  //     permission prompt or question, `blocked` a stuck turn, and an unknown
-  //     or missing status proves nothing);
-  //   - the screen must be readable and carry no dialog;
-  //   - the prompt line (the last line starting with the prompt mark) must be
-  //     empty. A fresh session's placeholder hint reads as text: not typed.
-  const QUEUE_IDLE_STATUSES = new Set(['idle']);
-  const DIALOG_RE = /Enter to select|Esc to cancel|to navigate|Do you want to|Would you like to proceed|Ready to code\?|Enter select|↑\/↓ move|✎ note/;
-  const typingVerdict = (winId) => {
-    const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
-    let win;
-    try {
-      const ls = execFileSync(kitty, ['@', 'ls'], { encoding: 'utf-8', timeout: 5000 });
-      win = JSON.parse(ls).flatMap((t) => (t.tabs ?? []).flatMap((tab) => tab.windows ?? [])).find((w) => w.id === Number(winId));
-    } catch { return 'window list could not be read'; }
-    if (win == null) return 'window not found';
-    if (/[\u2800-\u28FF\u25D0-\u25D3]/.test(win.title ?? '')) return 'title shows a turn in progress';
-    const proc = (win.foreground_processes ?? []).find((p) => /(^|\/)claude$/.test(p.cmdline?.[0] ?? ''));
-    if (proc == null) return 'not a Claude Code tab, whose composer cannot be read reliably';
-    const sessionsDir = process.env.KITTY_SEND_CLAUDE_SESSIONS_DIR ?? process.env.CLAUDE_SESSIONS_DIR
-      ?? path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'sessions');
-    let record;
-    try { record = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${proc.pid}.json`), 'utf-8')); } catch { return 'no session record'; }
-    if (!QUEUE_IDLE_STATUSES.has(record?.status)) return `session record status ${record?.status ?? 'missing'}, not idle`;
-    let screen;
-    try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return 'screen could not be read'; }
-    const lines = screen.split('\n').map((l) => l.trimEnd());
-    // Bottom rows only: an answered dialog stays in the scrollback in full.
-    if (lines.slice(-15).some((l) => DIALOG_RE.test(l))) return 'a dialog is open on the screen';
-    const at = lines.findLastIndex((l) => /^\s*[❯>](\s|$)/.test(l));
-    if (at < 0) return 'no prompt line on the screen';
-    if (lines[at].replace(/^\s*[❯>]/, '').trim() !== '') return 'composer holds text';
-    return null;
   };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
@@ -758,6 +722,9 @@ const main = (argv) => {
     const again = appendMessage({ to: recipient.key, from, priority, text, topic });
     process.stderr.write(`agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`);
     process.exit(3);
+  }
+  if (status === 3 || status === 10) {
+    process.stderr.write(`agent-send: kitty-send typed into window ${target} but delivery is unproven (exit ${status}) for ${row.id}; NOT re-queued (a duplicate is worse): look at the window before resending\n`);
   }
   if (status == null) {
     process.stderr.write(`agent-send: kitty-send died by a signal; delivery of ${row.id} is unknown and its mailbox row is withdrawn: check the tab before resending\n`);

@@ -397,6 +397,39 @@ test('a fallback that sent but could not prove it (exit 3) is not re-queued', as
   assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a sent message must not be queued a second time');
 });
 
+// Exit 11 is "nothing sent, screen unreadable or composer not clear". Exit 3 is
+// reserved for "sent, delivery not proven", so the two never share a code: the
+// first goes back to the queue (exactly one row), the second never does.
+const fallbackWith = async (stubExit, text) => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const r = await runSend(
+    ['--to', '991001', '--text', text, '--deadline', '1'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: String(stubExit) }),
+  );
+  return { ...r, left: readUnacked(KEY_S1, { dir: mboxDir }) };
+};
+
+test('kitty-send "nothing sent" (exit 11) leaves exactly one queued row, no duplicate', async () => {
+  const { code, stderr, left } = await fallbackWith(11, 'unreadable screen steer');
+  assert.equal(code, 3, stderr);
+  assert.equal(left.length, 1, `exactly one queued row: ${JSON.stringify(left)}`);
+  assert.equal(left[0].text, 'unreadable screen steer');
+  assert.match(stderr, /kitty-send exit 11 sent nothing \([^)]*\) for \S+; re-queued as \S+/);
+});
+
+test('kitty-send "sent, not proven" (exit 3) leaves no queued row and exits non-zero with an unproven line', async () => {
+  const { code, stderr, left } = await fallbackWith(3, 'sent unproven steer');
+  assert.notEqual(code, 0);
+  assert.deepEqual(left, [], 'a sent message is never queued a second time');
+  assert.match(stderr, /delivery is unproven/);
+});
+
+test('kitty-send success (exit 0) leaves no queued row and exits 0', async () => {
+  const { code, stderr, left } = await fallbackWith(0, 'delivered steer');
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(left, []);
+});
+
 test('no consumer falls through to the stub kitty-send with the argv', async () => {
   fs.rmSync(fallbackArgv, { force: true });
   const { code, stderr } = await runSend(['--to', '991002', '--text', 'hello fallback']);
@@ -1407,6 +1440,22 @@ test('--queue to an idle recipient is typed in at once and exits 0, not left wai
   // it, and the typed copy is recorded as an acked row.
   assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
   assert.equal(typedRows().length, 1);
+});
+
+// Real shape (read from live screens, text removed): a seat whose turn ended
+// while background tasks still run records status `shell` and shows an empty
+// composer above a footer that lists them. That is idle at the prompt.
+const BACKGROUND_FOOTER_SCREEN = ['● Done.', '', '─'.repeat(40), '❯ ', '─'.repeat(40), '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← 2 agents · ↓ to manage'].join('\n');
+test('--queue types into an idle seat whose record status is shell (background tasks running)', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: '✳ claude: idle seat',
+    status: 'shell',
+    screen: BACKGROUND_FOOTER_SCREEN,
+    envExtra: { AGENT_SEND_IDLE_WAIT_S: '1' },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
 });
 
 test('--queue to a busy recipient stays queued and is acked by its drain, never typed', async () => {

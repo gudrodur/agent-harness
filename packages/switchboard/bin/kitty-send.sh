@@ -23,8 +23,8 @@
 #      for an OpenCode tab a new type:user row in its opencode.db session
 #      (the only proofs that name the tab receiving the text)
 #   1  usage / precondition error (no kitty remote control, no such window)
-#   3  could not prove it landed — sent but unconfirmed, or the screen could
-#      not be read to attempt the proof (nothing is retried for you)
+#   3  sent, but could not prove it landed (nothing is retried for you).
+#      The window WAS typed into: never re-queue or resend blind.
 #   4  the target is showing a selection dialog — NOTHING WAS SENT (see below)
 #   5  --wait-idle/--deadline ran out before the target went idle — NOTHING WAS SENT
 #   6  --queue: a send is already queued for that window — NOTHING WAS SENT
@@ -41,6 +41,10 @@
 #   delivery verdict (any code above) lands later in the queue log. A caller
 #   that needs the verdict must use --wait-idle N, which runs in the
 #   foreground (agent-send does, on its withdraw path).
+#   11 NOTHING WAS SENT: the screen could not be read before the send, or the
+#      composer still held a chip after the recovery Enter. The window was not
+#      typed into, so a caller may put the message back safely. (Until
+#      2026-11-13 these two shared exit 3 with "sent, unproven".)
 #   10 typed, not proven submitted: the window has no session record to read,
 #      so the only proof is the screen. The text reached the window (it
 #      echoed, or the screen changed on it) but nothing proves the target
@@ -369,13 +373,13 @@ target_busy() {  # $1 = title, $2 = window id
   return 0
 }
 # dialog_open with the read failure turned into the exit this script promises:
-# nothing sent, exit 3, go look.
+# nothing sent, exit 11 (distinct from exit 3, which means sent but unproven).
 dialog_or_die() {
   local rc=0
   dialog_open "$1" || rc=$?
   case "$rc" in
     0|1) return "$rc" ;;
-    *) die "could not read window $1's screen (nothing was sent) — look at the window first" 3 ;;
+    *) die "could not read window $1's screen (nothing was sent) — look at the window first" 11 ;;
   esac
 }
 
@@ -792,7 +796,7 @@ EXPECT_HEAD_SQUASHED=$(printf '%s' "$EXPECT_HEAD" | tr -d '[:space:]')
 # row, so the screen changing is its only proof.
 if [ "$STATE_KNOWN" = 0 ] || [ "$SLASH_SEND" = 1 ]; then
   if ! before_screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]'); then
-    die "could not read window $WID's screen before the send (nothing was sent) — look at the window first" 3
+    die "could not read window $WID's screen before the send (nothing was sent) — look at the window first" 11
   fi
 else
   before_screen=""
@@ -836,7 +840,7 @@ if [ "$STATE_KNOWN" = 0 ] && printf '%s' "$before_screen" | grep -qF -- '[Pasted
       rm -f "$_rec"
       note "a stranded earlier message was recovered in window $WID: the composer is clear, sending now"
     else
-      die "window $WID's composer still holds unsubmitted pasted text (chips ${_chips_before}) after Enter — nothing was sent. Do NOT send it again blind: a second send is what enqueues an empty steering message and wedges an agent. Look at the window first." 3
+      die "window $WID's composer still holds unsubmitted pasted text (chips ${_chips_before}) after Enter — nothing was sent. Do NOT send it again blind: a second send is what enqueues an empty steering message and wedges an agent. Look at the window first." 11
     fi
   else
     die "window $WID's composer already holds unsubmitted pasted text (chips ${_chips_before}; owned by kitty-send: ${_owned_chips:-none}) — nothing was sent (exit 9): it may be a human's draft, and pressing Enter blindly could submit it early. To clear it by hand: $(enter_cmd_text "$WID")" 9
