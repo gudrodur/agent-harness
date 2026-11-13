@@ -6,6 +6,10 @@
 // HELP-BEGIN
 // Usage: fleet-drill.mjs --states <idle,busy,permission,slash,closed[,merge]|all> [--help]
 //
+// Needs FLEET_DRILL_STORE_DIR (a folder for this drill's own store): a
+// headless kitty numbers its windows from 1, so a shared store could hold a
+// live seat's beacon under the same window id. Refused without it (exit 2).
+//
 // Starts ONE Claude Code seat on the cheapest model (haiku) through
 // claude-tab.sh, in a throwaway folder, then for each state sends a unique
 // message with agent-send.mjs and asserts the store holds an `ack` row with a
@@ -26,8 +30,13 @@
 //   merge       <LIMIT_MERGE> s  OFF unless FLEET_DRILL_SANDBOX=owner/name is set: the seat
 //                          opens a PR there, FLEET_DRILL_MERGE_CMD <owner/name> <number>
 //                          merges it, and `gh pr view` must say MERGED
-//   closed      <LIMIT_CLOSED> s   seat closed with claude-tab.sh --close; the send must fail
-//                          with exit 1 and leave no ack row
+//   closed      <LIMIT_CLOSED> s   seat window closed with `kitty @ close-window`; the send must
+//                          fail with exit 1 and "no kitty window with id", and leave no
+//                          ack row
+//
+// A state passes only on an ack row with a `deliveredAs` value, and a send that
+// exits non-zero passes only when a consumer (a hook, not the typed fallback)
+// wrote it.
 //
 // Output: one JSON line per state {state, ok, ms, deliveredAs, reason}, then
 // {summary: true, ok, passed, failed}. Exit 0 all passed; 1 a state failed
@@ -37,7 +46,7 @@
 // FLEET_DRILL_READY_S (seat start to idle, 180), FLEET_DRILL_SETUP_S (reach the
 // busy or permission state, 90), FLEET_DRILL_SETTLE_S (busy turn to end, 180),
 // FLEET_DRILL_POLL_MS (1000), FLEET_DRILL_MODEL (haiku), FLEET_DRILL_CWD_ROOT,
-// FLEET_DRILL_STORE_DIR (AGENT_SWITCHBOARD_DIR for every child).
+// FLEET_DRILL_STORE_DIR (required: AGENT_SWITCHBOARD_DIR for every child).
 // Binaries: FLEET_DRILL_CLAUDE_TAB, _AGENT_SEND, _KITTY_SEND, _TAB_STATE,
 // _TYPING_PROOF, _EXPORT, _KITTY, _GH. Merge stage: FLEET_DRILL_SANDBOX,
 // FLEET_DRILL_MERGE_CMD.
@@ -66,6 +75,17 @@ const SETTLE_S = () => num('FLEET_DRILL_SETTLE_S', 180);
 const POLL_MS = () => num('FLEET_DRILL_POLL_MS', 1000);
 const SLEEP_SECONDS = 45;
 const SLASH_TEXT = '/context';
+// Labels the mailbox hooks write; `typed` is the sender's own terminal fallback.
+const CONSUMER_LABELS = ['prompt', 'tool', 'stop', 'mcp'];
+// What agent-send prints for a window that is gone.
+const CLOSED_TEXT = /no kitty window with id/;
+// The standing orders of the drill seat: it never approves anything itself.
+const SEAT_BRIEF = `You are a throwaway test seat for a delivery drill. Rules:
+- Do only the single action a message asks for, and nothing else.
+- Reply with one short word or sentence.
+- Never grant, request or work around a permission: if a tool call needs approval, wait for the human or the harness to decide.
+- Never edit files outside the current folder, never touch the network except where a message names a repository.
+`;
 // agent-send exit code for a window that no longer exists.
 const CLOSED_EXIT = 1;
 
@@ -102,15 +122,15 @@ const wanted = process.argv[argAt + 1] === 'all'
   ? STATES.filter((s) => s !== 'merge' || SANDBOX)
   : process.argv[argAt + 1].split(',').map((s) => s.trim()).filter(Boolean);
 for (const s of wanted) if (!STATES.includes(s)) usage(`unknown state '${s}' (known: ${STATES.join(', ')})`);
+if (wanted.length === 0) usage('--states names no state');
+if (!process.env.FLEET_DRILL_STORE_DIR) usage('FLEET_DRILL_STORE_DIR is required: a folder for the drill\'s own store, so a headless kitty\'s window ids cannot collide with a live seat\'s');
 if (wanted.includes('merge') && !(SANDBOX && MERGE_CMD)) usage('the merge state needs FLEET_DRILL_SANDBOX and FLEET_DRILL_MERGE_CMD');
 const states = STATES.filter((s) => wanted.includes(s));
 
 // Children see the injected store dir; the ambient store pin would win over it.
-const childEnv = { ...process.env };
-if (process.env.FLEET_DRILL_STORE_DIR) {
-  childEnv.AGENT_SWITCHBOARD_DIR = process.env.FLEET_DRILL_STORE_DIR;
-  delete childEnv.AGENT_SWITCHBOARD_DB;
-}
+const childEnv = { ...process.env, AGENT_SWITCHBOARD_DIR: process.env.FLEET_DRILL_STORE_DIR };
+delete childEnv.AGENT_SWITCHBOARD_DB;
+fs.mkdirSync(childEnv.AGENT_SWITCHBOARD_DIR, { recursive: true });
 const run = (cmd, args, { timeoutS = 120, input } = {}) =>
   spawnSync(cmd, args, { env: childEnv, encoding: 'utf8', timeout: timeoutS * 1000, input });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -155,13 +175,20 @@ const composerEmptyAndIdle = () => {
 };
 const sendKeys = (keys) => run(B.kitty, ['@', 'send-text', '--match', `id:${wid}`, keys], { timeoutS: 10 });
 // Types a setup prompt into an idle seat (not part of what is measured).
-const prompt = (text) => run(B.kittySend, ['--to', String(wid), '--text', text, '--wait-idle'], { timeoutS: 120 });
+const prompt = (text) => run(B.kittySend, ['--to', String(wid), '--text', text, '--wait-idle', String(SETUP_S())], { timeoutS: SETUP_S() + 60 });
+const screenText = () => run(B.kitty, ['@', 'get-text', '--match', `id:${wid}`], { timeoutS: 10 }).stdout ?? '';
+// Approves the prompt on screen only when it shows `marker`, this drill's own command.
+const approveIfShowing = (marker) => {
+  if (screenText().includes(marker)) sendKeys('\\r');
+};
 const token = () => randomBytes(4).toString('hex');
 
 const startSeat = async () => {
   if (!(await ensureKitty())) return 'no kitty remote control and a headless kitty did not come up';
   cwd = fs.mkdtempSync(path.join(process.env.FLEET_DRILL_CWD_ROOT || os.tmpdir(), 'fleet-drill-'));
-  const r = run(B.claudeTab, ['--seat', '--title', 'fleet-drill', '--model', process.env.FLEET_DRILL_MODEL || 'haiku', '--cwd', cwd], { timeoutS: 200 });
+  const brief = path.join(cwd, '.fleet-drill-brief.md');
+  fs.writeFileSync(brief, SEAT_BRIEF);
+  const r = run(B.claudeTab, ['--seat', '--title', 'fleet-drill', '--model', process.env.FLEET_DRILL_MODEL || 'haiku', '--cwd', cwd, '--brief', brief], { timeoutS: 200 });
   const m = /^WINDOW_ID=(\d+)/m.exec(r.stdout ?? '');
   if (m) wid = Number(m[1]);
   if (r.status !== 0) return `claude-tab exit ${r.status}: ${(r.stderr ?? '').trim().split('\n').pop()}`;
@@ -170,8 +197,10 @@ const startSeat = async () => {
   return null;
 };
 
+// claude-tab --close refuses a --seat window (no launcher state row), so the
+// window is closed through kitty itself.
 const closeSeat = () => {
-  if (wid != null) run(B.claudeTab, ['--close', String(wid)], { timeoutS: 30 });
+  if (wid != null) run(B.kitty, ['@', 'close-window', '--match', `id:${wid}`], { timeoutS: 30 });
   wid = null;
 };
 
@@ -191,6 +220,13 @@ const findAck = (text, sinceMs) => {
   return null;
 };
 
+// Pass: an ack row with deliveredAs, and either a clean send or a consumer's label.
+const accepted = (sent, ack) => Boolean(ack?.deliveredAs) && (sent.status === 0 || CONSUMER_LABELS.includes(ack.deliveredAs));
+const rejectReason = (state, sent, ack) =>
+  ack?.deliveredAs
+    ? fail(`ack deliveredAs=${ack.deliveredAs} but agent-send exited ${sent.status}: only a consumer label (${CONSUMER_LABELS.join(', ')}) counts then`, ack.deliveredAs)
+    : noAck(state, sent);
+
 // Sends `text` and waits for its ack within the state's limit.
 const sendAndAck = async (state, text) => {
   const since = Date.now();
@@ -209,14 +245,14 @@ const checks = {
   async idle() {
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the send');
     const { sent, ack } = await sendAndAck('idle', `fleet-drill idle ${token()}: reply with the single word ok.`);
-    return ack?.deliveredAs ? pass(ack.deliveredAs) : noAck('idle', sent);
+    return accepted(sent, ack) ? pass(ack.deliveredAs) : rejectReason('idle', sent, ack);
   },
 
   async slash() {
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the send');
     const t0 = Date.now();
     const { sent, ack } = await sendAndAck('slash', SLASH_TEXT);
-    if (!ack?.deliveredAs) return noAck('slash', sent);
+    if (!accepted(sent, ack)) return rejectReason('slash', sent, ack);
     const left = Math.max(1, limitS('slash') - (Date.now() - t0) / 1000);
     if (!(await waitFor(composerEmptyAndIdle, left))) {
       return fail(`acked as ${ack.deliveredAs} but the composer did not empty: the slash command was typed and never submitted`, ack.deliveredAs);
@@ -229,13 +265,13 @@ const checks = {
     const tok = token();
     prompt(`Use the Bash tool to run exactly this command, then reply done: sleep ${SLEEP_SECONDS} && echo DRILL-$((6*7))-${tok}`);
     const reached = await waitFor(() => {
-      if (isWaiting()) sendKeys('\\r'); // approve the tool call once
+      if (isWaiting()) approveIfShowing(`DRILL-$((6*7))-${tok}`); // only this drill's own command
       return isBusy();
     }, SETUP_S());
     if (!reached) return fail('seat never went busy for the sleep tool call');
     const session = seatState().session;
     const { sent, ack } = await sendAndAck('busy', `fleet-drill busy ${token()}: reply with the single word ok.`);
-    if (!ack?.deliveredAs) return noAck('busy', sent);
+    if (!accepted(sent, ack)) return rejectReason('busy', sent, ack);
     if (ack.deliveredAs === 'typed') {
       return fail('delivered by typing onto a busy seat: that interrupts the turn and discards the tool result in flight', 'typed');
     }
@@ -253,7 +289,7 @@ const checks = {
     const { sent, ack } = await sendAndAck('permission', `fleet-drill permission ${token()}: reply with the single word ok.`);
     sendKeys('\\x1b'); // refuse the tool call, whatever happened
     await waitFor(isIdle, SETTLE_S());
-    return ack?.deliveredAs ? pass(ack.deliveredAs) : noAck('permission', sent);
+    return accepted(sent, ack) ? pass(ack.deliveredAs) : rejectReason('permission', sent, ack);
   },
 
   async merge() {
@@ -276,10 +312,11 @@ const checks = {
   },
 
   async closed() {
-    const r = run(B.claudeTab, ['--close', String(wid)], { timeoutS: 30 });
     const closedWid = wid;
+    const r = run(B.kitty, ['@', 'close-window', '--match', `id:${closedWid}`], { timeoutS: 30 });
+    if (r.status !== 0) return fail(`could not close the seat window: kitty close-window exit ${r.status}`);
     wid = null;
-    if (r.status !== 0) { wid = closedWid; return fail(`could not close the seat: claude-tab --close exit ${r.status}`); }
+    if (!(await waitFor(() => seatState().state === 'gone', 30))) return fail('the seat window is still listed after close-window');
     const text = `fleet-drill closed ${token()}: nobody is listening.`;
     const since = Date.now();
     const sent = run(B.agentSend, ['--to', String(closedWid), '--text', text], { timeoutS: limitS('closed') });
@@ -287,6 +324,7 @@ const checks = {
     if (a) return fail(`a message to a closed seat was acked (${a.deliveredAs})`, a.deliveredAs ?? null);
     if (sent.status === 0) return fail('agent-send exited 0 for a closed seat: a silent success');
     if (sent.status !== CLOSED_EXIT) return fail(`agent-send exit ${sent.status}, documented exit for a missing window is ${CLOSED_EXIT}`);
+    if (!CLOSED_TEXT.test(sent.stderr ?? '')) return fail(`exit ${CLOSED_EXIT} but not the missing-window message (expected "no kitty window with id"): ${(sent.stderr ?? '').trim().split('\n').pop()}`);
     return pass(null, `exit ${sent.status}, nothing delivered`);
   },
 };
@@ -313,24 +351,28 @@ const cleanup = () => {
 process.on('SIGINT', () => { cleanup(); process.exit(130); });
 process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
-const seatErr = await startSeat();
-if (seatErr) {
-  note(`seat did not start: ${seatErr}`);
+let failed = [];
+try {
+  const seatErr = await startSeat();
+  if (seatErr) {
+    note(`seat did not start: ${seatErr}`);
+    process.exitCode = 2;
+  } else {
+    for (const state of states) {
+      const t0 = Date.now();
+      let res;
+      try { res = await checks[state](); } catch (e) { res = fail(`drill error: ${e?.message ?? e}`); }
+      const line = { state, ok: res.ok, ms: Date.now() - t0, deliveredAs: res.deliveredAs ?? null, reason: res.reason };
+      results.push(line);
+      process.stdout.write(`${JSON.stringify(line)}\n`);
+    }
+    failed = results.filter((r) => !r.ok).map((r) => r.state);
+    process.stdout.write(`${JSON.stringify({ summary: true, ok: failed.length === 0, passed: results.filter((r) => r.ok).map((r) => r.state), failed })}\n`);
+    if (failed.length) {
+      note(`FAILED: ${failed.join(', ')}`);
+      process.exitCode = 1;
+    }
+  }
+} finally {
   cleanup();
-  process.exit(2);
-}
-for (const state of states) {
-  const t0 = Date.now();
-  let res;
-  try { res = await checks[state](); } catch (e) { res = fail(`drill error: ${e?.message ?? e}`); }
-  const line = { state, ok: res.ok, ms: Date.now() - t0, deliveredAs: res.deliveredAs ?? null, reason: res.reason };
-  results.push(line);
-  process.stdout.write(`${JSON.stringify(line)}\n`);
-}
-cleanup();
-const failed = results.filter((r) => !r.ok).map((r) => r.state);
-process.stdout.write(`${JSON.stringify({ summary: true, ok: failed.length === 0, passed: results.filter((r) => r.ok).map((r) => r.state), failed })}\n`);
-if (failed.length) {
-  note(`FAILED: ${failed.join(', ')}`);
-  process.exit(1);
 }

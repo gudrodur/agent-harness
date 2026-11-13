@@ -7,6 +7,12 @@
 //   slash  the carriage return of a slash command is swallowed (composer keeps it)
 //   busy   a send onto a busy seat is typed in and discards the tool result
 //   merge  the merge wrapper leaves the PR open
+// Other knobs: STUB_PERMISSION_FIRST=1 (a tool call asks permission first, the
+// screen shows the command), STUB_SCREEN_MISMATCH=1 (the screen shows another
+// command), STUB_NEVER_BUSY=1, STUB_SEND_EXIT=<n> (agent-send exits n after
+// writing its rows), STUB_CLOSED_MSG (agent-send's text for a missing window).
+// The stubs refuse what the real scripts refuse: a flag that needs a value and
+// has none, and `claude-tab --close` on a --seat window.
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -29,20 +35,46 @@ const flag = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 };
+const needValue = (...names) => {
+  for (const n of names) {
+    const i = args.indexOf(n);
+    if (i >= 0 && (args[i + 1] === undefined || args[i + 1].startsWith('--'))) {
+      process.stderr.write(`${role}: ${n} needs a value\n`);
+      process.exit(1);
+    }
+  }
+};
 
 if (role === 'claude-tab') {
   if (args[0] === '--close') {
+    if (seat().seat) {
+      process.stderr.write(`claude-tab: window ${args[1]} was not launched by this script - refusing to close it.\n`);
+      process.exit(1);
+    }
     save({ ...seat(), open: false });
     process.exit(0);
   }
+  needValue('--title', '--model', '--cwd', '--brief');
+  if (args.includes('--brief') && !fs.existsSync(flag('--brief'))) process.exit(1);
   fs.writeFileSync(transcript, '');
-  save({ open: true, status: 'idle' });
+  save({ open: true, status: 'idle', seat: args.includes('--seat') });
   console.log(`WINDOW_ID=${WID}`);
 } else if (role === 'kitty') {
   if (args[0] === '@' && args[1] === 'ls') console.log('[]');
-  if (args[0] === '@' && args[1] === 'send-text') {
+  if (args[0] === '@' && args[1] === 'close-window') {
+    needValue('--match');
+    save({ ...seat(), open: false });
+  }
+  if (args[0] === '@' && args[1] === 'get-text') {
     const s = seat();
-    if (s.status === 'waiting') save({ ...s, status: 'idle' });
+    console.log(s.screen ?? '');
+  }
+  if (args[0] === '@' && args[1] === 'send-text') {
+    needValue('--match');
+    const s = seat();
+    const keys = args[args.length - 1];
+    if (s.status === 'waiting' && keys === '\\r' && s.approveTo) save({ ...s, status: 'busy', busyUntil: Date.now() + 4000, screen: '' });
+    else if (s.status === 'waiting') save({ ...s, status: 'idle' });
   }
 } else if (role === 'tab-state') {
   const s = seat();
@@ -58,10 +90,16 @@ if (role === 'claude-tab') {
     session: transcript,
   }));
 } else if (role === 'kitty-send') {
+  needValue('--to', '--text', '--wait-idle');
   const text = flag('--text') ?? '';
   const s = seat();
   const m = /DRILL-\$\(\(6\*7\)\)-(\w+)/.exec(text);
-  if (m) {
+  if (m && process.env.STUB_NEVER_BUSY) {
+    // typed, nothing happens
+  } else if (m && process.env.STUB_PERMISSION_FIRST) {
+    save({ ...s, status: 'waiting', approveTo: true, screen: process.env.STUB_SCREEN_MISMATCH ? 'rm -rf /' : `Bash(sleep 45 && echo DRILL-$((6*7))-${m[1]})` });
+    fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
+  } else if (m) {
     save({ ...s, status: 'busy', busyUntil: Date.now() + 4000 });
     fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (text.includes('touch ')) {
@@ -73,9 +111,10 @@ if (role === 'claude-tab') {
   const s = seat();
   const text = flag('--text') ?? '';
   if (!s.open) {
-    process.stderr.write('agent-send: no such window\n');
+    process.stderr.write(`agent-send: ${process.env.STUB_CLOSED_MSG ?? `no kitty window with id ${WID}`}\n`);
     process.exit(1);
   }
+  needValue('--to', '--text');
   let deliveredAs = 'prompt';
   if (s.status === 'busy') {
     deliveredAs = broken.has('busy') ? 'typed' : 'tool';
@@ -92,6 +131,7 @@ if (role === 'claude-tab') {
   rows.push({ recipient: 'k', id, ts, from: 'x', to: 'k', priority: 'now', text });
   rows.push({ recipient: 'k', ack: id, ts, deliveredAs });
   writeJson('store.json', rows);
+  if (process.env.STUB_SEND_EXIT) process.exit(Number(process.env.STUB_SEND_EXIT));
 } else if (role === 'typing-proof') {
   const s = seat();
   process.exit(s.composerStuck || s.status !== 'idle' ? 2 : 0);

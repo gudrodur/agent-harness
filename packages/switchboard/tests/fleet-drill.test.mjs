@@ -38,11 +38,15 @@ before(() => {
 });
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
+const stripKeys = (env, keys) => Object.fromEntries(Object.entries(env).filter(([k]) => !keys.includes(k)));
+const seatOpen = (state) => JSON.parse(fs.readFileSync(path.join(state, 'seat.json'), 'utf8')).open;
+
 const drill = (argv, { broken = '', extra = {} } = {}) => {
   const state = fs.mkdtempSync(path.join(root, 'state-'));
   const env = isolatedEnv({
     STUB_DIR: state,
     STUB_BROKEN: broken,
+    FLEET_DRILL_STORE_DIR: path.join(state, 'store'),
     FLEET_DRILL_POLL_MS: '20',
     FLEET_DRILL_LIMIT_SLASH_S: '2',
     FLEET_DRILL_READY_S: '5',
@@ -52,7 +56,7 @@ const drill = (argv, { broken = '', extra = {} } = {}) => {
     ...Object.fromEntries(Object.entries(ROLES).filter(([k]) => k !== 'FLEET_DRILL_MERGE_CMD').map(([k, r]) => [k, path.join(root, 'bin', r)])),
     ...extra,
   });
-  const r = spawnSync('node', [SCRIPT, ...argv], { env, encoding: 'utf8', timeout: 60000 });
+  const r = spawnSync('node', [SCRIPT, ...argv], { env: extra.__noEnv ? stripKeys(env, extra.__noEnv) : env, encoding: 'utf8', timeout: 60000 });
   const lines = r.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
   return { ...r, lines, state, byState: Object.fromEntries(lines.filter((l) => l.state).map((l) => [l.state, l])), summary: lines.find((l) => l.summary) };
 };
@@ -123,4 +127,57 @@ test('the merge stage is off unless FLEET_DRILL_SANDBOX is set, and asserts the 
   const bad = drill(['--states', 'merge'], { broken: 'merge', extra: { FLEET_DRILL_SANDBOX: 'o/sandbox', FLEET_DRILL_MERGE_CMD: mergeCmd, FLEET_DRILL_LIMIT_MERGE_S: '1' } });
   assert.equal(bad.status, 1);
   assert.match(bad.byState.merge.reason, /OPEN/);
+});
+
+test('no run leaves the seat open, whether it passed, failed or timed out', () => {
+  for (const [argv, opts] of [
+    [['--states', 'all'], {}],
+    [['--states', 'all'], { broken: 'slash,busy' }],
+    [['--states', 'idle'], {}],
+    [['--states', 'busy'], { extra: { STUB_NEVER_BUSY: '1', FLEET_DRILL_SETUP_S: '1' } }],
+  ]) {
+    const r = drill(argv, opts);
+    assert.equal(seatOpen(r.state), false, `${argv} ${JSON.stringify(opts)}: ${r.stderr}`);
+  }
+});
+
+test('the setup prompts are typed: kitty-send gets a value for --wait-idle', () => {
+  const r = drill(['--states', 'busy,permission']);
+  assert.equal(r.status, 0, r.stderr + JSON.stringify(r.lines));
+});
+
+test('an empty state list is a usage error, exit 2', () => {
+  for (const v of [',', ' , ']) {
+    const r = drill(['--states', v]);
+    assert.equal(r.status, 2, v);
+    assert.equal(r.lines.length, 0);
+  }
+});
+
+test('the drill refuses to run without FLEET_DRILL_STORE_DIR', () => {
+  const r = drill(['--states', 'idle'], { extra: { __noEnv: ['FLEET_DRILL_STORE_DIR'] } });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /FLEET_DRILL_STORE_DIR/);
+});
+
+test('busy approves a permission prompt only when the screen shows its own command', () => {
+  const ok = drill(['--states', 'busy'], { extra: { STUB_PERMISSION_FIRST: '1' } });
+  assert.equal(ok.status, 0, ok.stderr + JSON.stringify(ok.lines));
+  const other = drill(['--states', 'busy'], { extra: { STUB_PERMISSION_FIRST: '1', STUB_SCREEN_MISMATCH: '1', FLEET_DRILL_SETUP_S: '1' } });
+  assert.equal(other.status, 1);
+  assert.equal(other.byState.busy.ok, false);
+});
+
+test('a typed ack after a non-zero send exit is not a pass; a consumer label is', () => {
+  const idle = drill(['--states', 'idle'], { extra: { STUB_SEND_EXIT: '3' } });
+  assert.equal(idle.byState.idle.ok, true, JSON.stringify(idle.lines));
+  const slash = drill(['--states', 'slash'], { extra: { STUB_SEND_EXIT: '3' } });
+  assert.equal(slash.byState.slash.ok, false);
+  assert.match(slash.byState.slash.reason, /exited 3/);
+});
+
+test('closed requires the missing-window message, not any exit 1', () => {
+  const r = drill(['--states', 'closed'], { extra: { STUB_CLOSED_MSG: 'something else broke' } });
+  assert.equal(r.status, 1);
+  assert.match(r.byState.closed.reason, /no kitty window/);
 });
