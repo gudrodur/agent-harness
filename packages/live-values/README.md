@@ -27,7 +27,7 @@ commit here, so a commit or a PR must not fail on it.
 ## This repo checks itself
 
 The engine is <!-- live:engine-lines -->1328<!-- /live --> lines in `engine/`,
-covered by <!-- live:test-files -->5<!-- /live --> test files under `tests/`.
+covered by <!-- live:test-files -->6<!-- /live --> test files under `tests/`.
 CI runs `node dist/live-values.mjs --check` over this repo's docs on every push.
 
 ## Adopting

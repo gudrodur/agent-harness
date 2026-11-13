@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// GENERATED from live-values@1.0.0 - https://github.com/gudrodur/agent-harness (packages/live-values/engine/, by build.mjs).
+// GENERATED from live-values@1.0.0 (built from engine/ by build.mjs).
 // Do not edit this copy: change the source there, rebuild with `node build.mjs`, and copy dist/ again.
 // Every adopting repo carries it byte-identical at scripts/live-values.mjs;
 // a copy-identity check keeps it so. Usage and the marker grammar: node scripts/live-values.mjs --help.
