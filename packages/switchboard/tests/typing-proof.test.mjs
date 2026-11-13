@@ -69,9 +69,9 @@ test('status shell (background tasks still running) with an empty composer is pr
 });
 
 // Claude Code embeds the session's custom title in the composer's top rule, so
-// every named seat showed `───── w6: Hjal composer ─` there. The proof read it
+// every named seat showed `───── example seat title ─` there. The proof read it
 // as "no prompt line under a top rule" and a --queue send waited forever.
-const LABELLED_RULE = `${'─'.repeat(40)} w6: Hjal composer ─`;
+const LABELLED_RULE = `${'─'.repeat(40)} example seat title ─`;
 
 test('a composer whose top rule carries the session title is proven', () => {
   const screen = ['● Done.', LABELLED_RULE, '❯\u00a0', RULE, '  ⏵⏵ bypass permissions on · 1 shell'].join('\n');

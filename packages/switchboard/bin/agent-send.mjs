@@ -59,7 +59,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   ack,
   appendMessage,
@@ -508,6 +508,9 @@ const main = (argv) => {
   if (text == null || text === '') die('pass --text LINE or --file /abs/path');
   if (deadline != null && !/^\d+$/.test(deadline)) die('--deadline must be a number of seconds');
   const priority = mode ?? 'now';
+  // --no-wait only leaves a mailbox row; --now, --stop and --idle-when promise an
+  // interrupt or a parked proof it would silently drop.
+  if (noWait && ['now', 'stop', 'idle'].includes(mode)) die('--no-wait only writes a mailbox row and cannot interrupt: use it bare or with --queue, not with --now, --stop or --idle-when', 2);
   // Default ack wait: 120 s for a recipient that can ack while idle (a
   // consumer with an idle poll acks within seconds; a busy consumer acks at its next
   // tool boundary). A Claude Code consumer drains its mailbox on PostToolUse
@@ -591,7 +594,9 @@ const main = (argv) => {
     // waiter that could keep a pipe open, so it keeps the inherited stderr.
     const holdErr = !verbose && !args.includes('--queue');
     const r = spawnSync(kittySend(), args, { stdio: ['inherit', 'inherit', holdErr ? 'pipe' : 'inherit'] });
-    if (holdErr && r.stderr?.length && !(requeue && KITTY_SENT_NOTHING.has(r.status))) process.stderr.write(r.stderr);
+    // Exit 1 and 11 carry kitty-send's own reason (no window, composer not clear),
+    // which the generic re-queue line cannot know: always pass it on.
+    if (holdErr && r.stderr?.length && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
     if (typedKey != null && [0, 8, 10].includes(r.status) && !args.includes('--queue')) {
@@ -711,6 +716,12 @@ const main = (argv) => {
   // AGENT_SEND_NOTICE_ROLE names a role, leave it one short notice per
   // unread role (a topic collapses repeats). Best-effort, and never for the
   // notice role itself, so two unheld roles cannot notify each other forever.
+  // Topic slugs hold 64 characters; a long role name is shortened with a hash of
+  // the whole name, so two roles sharing a long prefix keep separate notices.
+  const roleUnreadTopic = (role) => {
+    const t = `role-unread-${role}`;
+    return t.length <= 64 ? t : `${t.slice(0, 51)}-${createHash('sha256').update(role).digest('hex').slice(0, 12)}`;
+  };
   const noticeUnreadRole = (role, rowId, qfrom) => {
     const noticeRole = (process.env.AGENT_SEND_NOTICE_ROLE ?? '').trim();
     if (noticeRole === '' || noticeRole === role) return;
@@ -722,7 +733,7 @@ const main = (argv) => {
         from: qfrom,
         priority: 'now',
         text: `Mail for role ${role} has no reader: no live session holds it, and row ${rowId} (from ${qfrom}) waits for the next claimant.`,
-        topic: `role-unread-${role}`.slice(0, 64),
+        topic: roleUnreadTopic(role),
       });
       trace(`agent-send: told role ${noticeRole} that role ${role} has no reader\n`);
     } catch (e) {

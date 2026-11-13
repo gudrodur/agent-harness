@@ -1882,3 +1882,32 @@ test('no notice without AGENT_SEND_NOTICE_ROLE, and none for the notice role its
   assert.equal(rows.length, 1, 'only the message itself, no notice to itself');
   assert.equal(rows[0].text, 'y');
 });
+
+test('--no-wait with --now, --stop or --idle-when is refused with exit 2 and writes nothing', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  for (const flags of [['--now'], ['--stop'], ['--idle-when', 'x']]) {
+    const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'x', '--no-wait', ...flags], childEnv(quiet()));
+    assert.equal(code, 2, `${flags}: ${stderr}`);
+    assert.match(stderr, /--no-wait.*cannot interrupt/);
+  }
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 0);
+});
+
+test('a kitty-send exit 1 reason survives the re-queue in the quiet default', async () => {
+  const failStub = path.join(binDir, 'kitty-send-exit1.sh');
+  fs.writeFileSync(failStub, '#!/usr/bin/env bash\necho "kitty-send: no such window for the reason test" >&2\nexit 1\n', { mode: 0o755 });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: failStub }));
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, /no such window for the reason test/);
+  assert.match(stderr, /queued for 991001/);
+  for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
+});
+
+test('a long role name keeps its own notice topic', async () => {
+  const a = `${'r'.repeat(55)}-a`;
+  const b = `${'r'.repeat(55)}-b`;
+  for (const r of [a, b, 'watch-role']) fs.rmSync(mailboxPath(`role:${r}`, { dir: mboxDir }), { force: true });
+  for (const r of [a, b]) await runSend(['--to', `role:${r}`, '--text', 'x'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 2, 'one notice per role');
+});
