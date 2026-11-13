@@ -47,6 +47,12 @@ export const DIALOG_RE = /Enter to select|Esc to cancel|↑\/↓ to navigate|Ent
 // Bottom rows only: an answered dialog stays in the scrollback in full.
 const DIALOG_ROWS = 15;
 const RULE_RE = /^\s*[─━]{5,}\s*$/;
+// Claude Code prints a session's custom title inside the composer's TOP rule
+// (`───── w6: some title ─`). That rule starts with five or more rule
+// characters, then a label set off by spaces, and ends in rule characters. Only
+// the top rule is read this way; the bottom rule stays strict, so a draft line
+// cannot widen what ends the box.
+const TOP_RULE_RE = /^\s*[─━]{5,}(?:\s.*\s[─━]+)?\s*$/;
 const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
@@ -101,7 +107,7 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   const bottom = lines.findLastIndex((l) => RULE_RE.test(l));
   if (bottom < 0) return verdict(REFUSED, 'no composer box on the screen (no closing rule)');
   const at = lines.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
-  if (at < 1 || !RULE_RE.test(lines[at - 1])) return verdict(REFUSED, 'no composer box on the screen (no prompt line under a top rule)');
+  if (at < 1 || !TOP_RULE_RE.test(lines[at - 1])) return verdict(REFUSED, 'no composer box on the screen (no prompt line under a top rule)');
   const box = [lines[at].replace(/^[❯>]/, ''), ...lines.slice(at + 1, bottom)];
   if (box.some((l) => l.trim() !== '')) return verdict(REFUSED, 'composer holds text');
   return verdict(PROVEN);
