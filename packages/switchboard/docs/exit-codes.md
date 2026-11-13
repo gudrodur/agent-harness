@@ -5,7 +5,7 @@
 | Code | Meaning |
 |---|---|
 | 0 | Acked, or proven by the terminal fallback. |
-| 3 | Not delivered yet (queued, or no proof): do not resend. Queued for a role with no live holder also exits 3. |
+| 3 | Not delivered yet (queued, or no proof): do not resend. Queued for a role with no live holder also exits 3, and `--no-wait` exits 3 as soon as the row is written. |
 | 10 | Typed but not proven submitted: look at the window before resending. |
 | 11 | `--claim-role`: a live seat holds the role; the claim changed nothing (`--take-over` takes it). |
 | 12 | `--release-role`: another session holds the role. |

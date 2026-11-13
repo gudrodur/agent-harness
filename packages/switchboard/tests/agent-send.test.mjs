@@ -143,6 +143,8 @@ const childEnv = (extra = {}) => isolatedEnv({
   AGENT_MAILBOX_PRESENCE_FILE: presFile,
   AGENT_MAILBOX_KITTY: kittyStub,
   AGENT_SEND_KITTY_SEND: fallbackStub,
+  // The assertions below read the step-by-step trace; the quiet default has its own tests.
+  AGENT_SEND_VERBOSE: '1',
   ...extra,
 });
 
@@ -1785,4 +1787,98 @@ test('a window with no session record and no matching beacon pid records no hand
   const r = await takeOverAs(fx.db, ['--take-over']);
   assert.equal(r.code, 0, r.stderr);
   assert.equal((await handovers(fx.db)).length, 0);
+});
+
+// Quiet default output. A send to a busy recipient that ends queued (exit 3)
+// used to print about six lines (queued, withdrew, kitty-send fallback, "sent
+// nothing", re-queued) and read like a failure. The default is now one line,
+// the final verdict; --verbose or AGENT_SEND_VERBOSE brings the trace back.
+const quiet = (extra = {}) => ({ AGENT_SEND_VERBOSE: '', ...extra });
+const nonEmptyLines = (s) => s.split('\n').filter(Boolean);
+
+test('a busy recipient that ends queued prints one verdict line by default', async () => {
+  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' }));
+  assert.equal(code, 3, stderr);
+  const lines = nonEmptyLines(stderr);
+  assert.equal(lines.length, 1, `one line, got:\n${stderr}`);
+  assert.match(lines[0], /^agent-send: queued for 991001, delivered at its next tool call.*\(id \S+; exit 3: pending, do not resend/);
+  assert.doesNotMatch(stderr, /falling back|withdrew|sent nothing/);
+  for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
+});
+
+test('--verbose and AGENT_SEND_VERBOSE bring the step-by-step trace back', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const viaEnv = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_VERBOSE: '1' });
+  assert.match(viaEnv.stderr, /withdrew the mailbox row/);
+  assert.match(viaEnv.stderr, /falling back to kitty-send/);
+  assert.ok(nonEmptyLines(viaEnv.stderr).length >= 4, viaEnv.stderr);
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'flag', '--deadline', '1', '--verbose'], childEnv(quiet()));
+  assert.equal(code, 3);
+  assert.match(stderr, /queued \S+ for .*withdraw with --cancel --id/);
+});
+
+test('an error stays visible in the quiet default', async () => {
+  const { code, stderr } = await runSend(['--to', '991001'], childEnv(quiet()));
+  assert.equal(code, 1);
+  assert.match(stderr, /pass --text LINE or --file/);
+});
+
+// --queue waited for the recipient's drain for as long as 120 s. Its unbounded
+// wait is documented and relied on (an idle seat is typed into), so the fast
+// path is a new flag instead.
+test('--no-wait returns as soon as the row is written: exit 3, no ack wait, no kitty-send', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const t0 = Date.now();
+  const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'fire and forget', '--queue', '--no-wait'], childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2' })));
+  assert.equal(code, 3, stderr);
+  assert.ok(Date.now() - t0 < 3000, 'no ack wait');
+  assert.ok(!fs.existsSync(fallbackArgv), 'kitty-send was not run');
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1);
+  assert.equal(left[0].text, 'fire and forget');
+  assert.equal(left[0].priority, 'queue');
+  assert.equal(nonEmptyLines(stderr).length, 1, stderr);
+  assert.match(stderr, new RegExp(`queued for ${KEY_S1}.*id ${left[0].id}; exit 3`));
+});
+
+test('--queue without --no-wait still waits for the drain (documented contract)', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const t0 = Date.now();
+  const { code } = await runSend(['--to', KEY_S1, '--text', 'wait', '--queue', '--deadline', '2'], childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2' })));
+  assert.ok(Date.now() - t0 >= 1800, 'the queue wait ran to its deadline');
+  assert.equal(code, 3);
+  for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
+});
+
+// Mail for a role nobody holds exits 3 and nobody notices. With
+// AGENT_SEND_NOTICE_ROLE set, the notice role gets one short row saying so.
+test('a send to a role with no live holder also notifies the configured notice role', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(['--to', 'role:unheld-role', '--text', 'ci fault'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(code, 3, stderr);
+  const own = readUnacked('role:unheld-role', { dir: mboxDir });
+  assert.equal(own.length, 1);
+  assert.equal(own[0].text, 'ci fault');
+  const notice = readUnacked('role:watch-role', { dir: mboxDir });
+  assert.equal(notice.length, 1, 'one notice');
+  assert.match(notice[0].text, /Mail for role unheld-role has no reader/);
+  assert.match(notice[0].text, new RegExp(own[0].id));
+  // A repeat collapses into one notice through the topic.
+  await runSend(['--to', 'role:unheld-role', '--text', 'again'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 1, 'repeats do not pile up');
+});
+
+test('no notice without AGENT_SEND_NOTICE_ROLE, and none for the notice role itself', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  await runSend(['--to', 'role:unheld-role', '--text', 'x'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: '' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 0, 'unset: no notice');
+  const self = await runSend(['--to', 'role:watch-role', '--text', 'y'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(self.code, 3);
+  const rows = readUnacked('role:watch-role', { dir: mboxDir });
+  assert.equal(rows.length, 1, 'only the message itself, no notice to itself');
+  assert.equal(rows[0].text, 'y');
 });
