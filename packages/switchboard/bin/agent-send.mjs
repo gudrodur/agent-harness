@@ -374,7 +374,13 @@ const peerChannelHint = ({ sessionId, queuedId }) => {
 };
 // The hint applies when kitty-send said so (exit 12) or an earlier window-list
 // call in this run already failed; that answer is reused, never asked again.
-const rcDown = (status = null) => status === KITTY_RC_DOWN || kittyKnownDown();
+// kitty-send's 11 (nothing sent) can also mean kitty dropped after its own
+// check, so that one status asks kitty again before it counts as up.
+const rcDown = (status = null) => {
+  if (status === KITTY_RC_DOWN || kittyKnownDown()) return true;
+  if (status === 11) { kittyLs(); return kittyKnownDown(); }
+  return false;
+};
 
 const senderWindowId = () => {
   const raw = process.env.KITTY_WINDOW_ID;

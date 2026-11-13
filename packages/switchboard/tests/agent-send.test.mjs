@@ -526,6 +526,62 @@ test('the budget spent against a busy recipient with kitty down: exit 3 with the
   assert.ok(Date.now() - started < 8000, `no re-probe past the budget (${Date.now() - started}ms)`);
 });
 
+test('kitty-send exit 11 while kitty has dropped since its own check: the hint still prints', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  fs.rmSync(path.join(binDir, 'drop-flag'), { force: true });
+  const { code, stderr } = await rcDownSend(['--to', '991001', '--text', 'kitty dropped mid-send', '--deadline', '1'], {
+    // answers like the fixture stub until kitty-send has run, then drops
+    AGENT_MAILBOX_KITTY: kittyStubOf('kitty-drops', `if [ -e ${path.join(binDir, 'drop-flag')} ]; then exit 1; fi\nexec ${kittyStub} "$@"`),
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-11-drop', `touch ${path.join(binDir, 'drop-flag')}\nexit 11`),
+  });
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, hintRe);
+});
+
+test('kitty-send exit 11 while kitty answers prints no hint', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await rcDownSend(['--to', '991001', '--text', 'screen unreadable', '--deadline', '1'], {
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-11', 'exit 11'),
+  });
+  assert.equal(code, 3, stderr);
+  assert.doesNotMatch(stderr, /SendMessage/);
+});
+
+test('kittyLs: non-array JSON is "not answering" (null, known down), never a throw downstream', async () => {
+  const { kittyLs, kittyKnownDown, flattenWindows } = await import('../lib/kitty-ls.mjs');
+  const saved = process.env.AGENT_MAILBOX_KITTY;
+  try {
+    process.env.AGENT_MAILBOX_KITTY = kittyStubOf('kitty-obj', `echo '{"error":"x"}'`);
+    assert.equal(kittyLs(), null);
+    assert.equal(kittyKnownDown(), true);
+    assert.deepEqual(flattenWindows(kittyLs()), []);
+  } finally { if (saved === undefined) delete process.env.AGENT_MAILBOX_KITTY; else process.env.AGENT_MAILBOX_KITTY = saved; }
+});
+
+test('kittyLs: a missing kitty binary is not an outage, so it earns no hint', async () => {
+  const { kittyLs, kittyKnownDown } = await import('../lib/kitty-ls.mjs');
+  const saved = process.env.AGENT_MAILBOX_KITTY;
+  try {
+    process.env.AGENT_MAILBOX_KITTY = path.join(binDir, 'no-such-kitty');
+    assert.equal(kittyLs(), null);
+    assert.equal(kittyKnownDown(), false);
+  } finally { if (saved === undefined) delete process.env.AGENT_MAILBOX_KITTY; else process.env.AGENT_MAILBOX_KITTY = saved; }
+});
+
+test('the budget spent with kitty down reuses the earlier failed probe: kitty @ ls is not asked again', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const calls = path.join(binDir, 'ls-calls');
+  fs.rmSync(calls, { force: true });
+  const { code, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001 }], () =>
+    rcDownSend(['--to', KEY_S1, '--text', 'busy and kitty down'], {
+      AGENT_MAILBOX_KITTY: kittyStubOf('kitty-count', `echo x >> ${calls}\nsleep 30`), AGENT_KITTY_LS_TIMEOUT_MS: '300', AGENT_SEND_BUDGET_S: '1', AGENT_SEND_BUSY_WAIT_S: '1',
+    }));
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, hintRe);
+  const n = fs.readFileSync(calls, 'utf-8').trim().split('\n').length;
+  assert.ok(n <= 1, `kitty @ ls asked ${n} times`);
+});
+
 test('a role whose idle holder cannot be seen because kitty is down: exit 3 queued for the role, with the hint', async () => {
   const fx = await handoverFixture('rc-role');
   await seatHolder(fx, { minutesAgo: 30, windowId: 991002, pid: process.pid });

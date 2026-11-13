@@ -5,7 +5,7 @@
 // asking kitty again (a second ask costs another timeout).
 import { execFileSync } from 'node:child_process';
 
-export const KITTY_LS_TIMEOUT_MS = 5000;
+const KITTY_LS_TIMEOUT_MS = 5000;
 // AGENT_KITTY_LS_TIMEOUT_MS shortens the bound (test seam: a hanging stub).
 const timeoutMs = () => {
   const v = Number(process.env.AGENT_KITTY_LS_TIMEOUT_MS);
@@ -24,10 +24,14 @@ export const kittyLs = () => {
   try {
     const out = execFileSync(kittyBin(), ['@', 'ls'], { encoding: 'utf-8', timeout: timeoutMs(), stdio: ['ignore', 'pipe', 'ignore'] });
     const parsed = JSON.parse(out);
+    // Anything but an array (an error object) is not an answer to `ls`.
+    if (!Array.isArray(parsed)) { down = true; return null; }
     down = false;
     return parsed;
-  } catch {
-    down = true;
+  } catch (e) {
+    // A missing binary (mailbox-only setup) is not an outage: there is no
+    // remote control to wait for, so no SendMessage hint either.
+    down = e?.code !== 'ENOENT';
     return null;
   }
 };
@@ -37,5 +41,3 @@ export const kittyKnownDown = () => down === true;
 // Every window of the list, flattened.
 export const flattenWindows = (ls) => (ls ?? []).flatMap((t) => (t.tabs ?? []).flatMap((tab) => tab.windows ?? []));
 
-// Test seam: forget what this process learned.
-export const resetKittyState = () => { down = null; };

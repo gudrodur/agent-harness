@@ -23,9 +23,6 @@
 #      for an OpenCode tab a new type:user row in its opencode.db session
 #      (the only proofs that name the tab receiving the text)
 #   1  usage / precondition error (no such window, a refused flag pair)
-#   12 kitty remote control did not answer (a timeout or an unreachable
-#      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
-#      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
 #   3  sent, but could not prove it landed (nothing is retried for you).
 #      The window WAS typed into: never re-queue or resend blind.
 #   4  the target is showing a selection dialog, or its session record says
@@ -63,6 +60,9 @@
 #      burst as a paste chip while the echo proof said "delivered"). Never
 #      "delivered", and never resend blind: the text may already sit in the
 #      composer.
+#   12 kitty remote control did not answer (a timeout or an unreachable
+#      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
+#      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
 #
 # A composer echo is NOT delivery. An agent TUI's
 # composer collapses a send-text burst into a `[Pasted text #N +M lines]` chip
