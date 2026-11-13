@@ -19,7 +19,9 @@ const ISOLATED_PREFIXES = ['AGENT_SWITCHBOARD_', 'AGENT_MAILBOX_'];
 // and claimRoleFromEnv/claimNudge read it as their default, so a suite run
 // from such a seat claims a role where a test expects the claim nudge (two
 // failures measured 2026-10-26).
-const ISOLATED_KEYS = new Set(['KITTY_WINDOW_ID', 'AGENT_SEAT_ROLE']);
+// AGENT_SEND_NOTICE_ROLE and AGENT_SEND_VERBOSE change what agent-send writes, so an
+// ambient value must not reach a test.
+const ISOLATED_KEYS = new Set(['KITTY_WINDOW_ID', 'AGENT_SEAT_ROLE', 'AGENT_SEND_NOTICE_ROLE', 'AGENT_SEND_VERBOSE']);
 
 export const isIsolatedKey = (key) => ISOLATED_KEYS.has(key) || ISOLATED_PREFIXES.some((p) => key.startsWith(p));
 
