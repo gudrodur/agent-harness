@@ -1786,3 +1786,27 @@ test('a window with no session record and no matching beacon pid records no hand
   assert.equal(r.code, 0, r.stderr);
   assert.equal((await handovers(fx.db)).length, 0);
 });
+
+// Output larger than the 64 KiB pipe buffer must arrive whole: a write
+// followed by process.exit() drops whatever the pipe has not yet taken. The
+// reader here is deliberately slow to start, so the child hits a full pipe.
+test('--who --json into a slow pipe delivers the whole document, not 64 KiB', async () => {
+  const many = Array.from({ length: 600 }, (_, i) => ({ sessionId: `big-${i}`, cwd: `/repo/${'x'.repeat(200)}/${i}`, mailbox: true }));
+  writePresence(many);
+  try {
+    const child = spawn('node', [SEND, '--who', '--json'], { env: childEnv() });
+    const chunks = [];
+    await new Promise((r) => setTimeout(r, 1000));
+    child.stdout.on('data', (d) => chunks.push(d));
+    await new Promise((resolve) => child.on('close', resolve));
+    const out = Buffer.concat(chunks).toString('utf8');
+    assert.ok(out.length > 65536, `fixture must exceed one pipe buffer, got ${out.length}`);
+    assert.equal(JSON.parse(out).length >= 600, true);
+  } finally {
+    writePresence([
+      { sessionId: 's1', cwd: '/repo/a', mailbox: true },
+      { sessionId: 's2', cwd: '/repo/a' },
+      { sessionId: 's3', cwd: '/repo/b' },
+    ]);
+  }
+});
