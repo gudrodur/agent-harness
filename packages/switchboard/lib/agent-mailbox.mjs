@@ -184,7 +184,7 @@ export const kittyWindows = () => {
     for (const tab of osEntry?.tabs ?? []) {
       for (const w of tab?.windows ?? []) {
         if (typeof w?.id !== 'number') continue;
-        wins.push({ id: w.id, title: w.title ?? '', tabTitle: tab?.title ?? '', pid: w.pid ?? null, cwd: w.cwd ?? null });
+        wins.push({ id: w.id, title: w.title ?? '', tabTitle: tab?.title ?? '', pid: w.pid ?? null, cwd: w.cwd ?? null, foreground: w.foreground_processes ?? [] });
       }
     }
   }
