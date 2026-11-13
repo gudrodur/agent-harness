@@ -41,7 +41,7 @@ Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote 
 | Code | Meaning |
 |---|---|
 | 0 | Closed and marked retired, or the window was already gone (the row is marked retired and its claims released). |
-| 1 | Usage error (no numeric id, no calling session) or the handover store could not be read. |
+| 1 | Usage error (no numeric id, no calling session), the handover store could not be read, or `kitty @ ls` failed or printed something that is not a JSON array (the window is not assumed gone). Nothing closed, retired or released. |
 | 2 | No terminal remote control. |
 | 20 | No usable handover: none names the window, it names another session as taker, or it was already retired. Nothing closed. |
 | 21 | The window's pid is not the recorded one: the id was reused. Nothing closed. |

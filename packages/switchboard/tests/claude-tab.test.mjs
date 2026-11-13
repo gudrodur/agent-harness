@@ -628,6 +628,23 @@ test('--retire of a displaced window that is already gone marks the row retired 
   assert.ok(Number((await handoverRows())[0].retired_at) > 0);
 });
 
+for (const [name, garbage] of [['text', 'not json at all'], ['an object', '{"tabs":[]}'], ['null', 'null']]) {
+  test(`--retire refuses a kitty listing that is ${name}, not a JSON array: exit 1, row not retired, claims kept`, async () => {
+    await handover({ displacedWindow: 999999 });
+    await windows();
+    await fs.writeFile(path.join(stateDir, 'ls.json'), garbage);
+    const claims = path.join(stateDir, 'claims-unparseable.log');
+    await fs.rm(claims, { force: true });
+    await fs.writeFile(path.join(stateDir, 'fake-claim-unparseable.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(claims)}, process.argv.slice(2).join(' ') + '\\n');\n`);
+    const r = await retire(999999, { SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'fake-claim-unparseable.mjs') });
+    assert.equal(r.code, 1, r.err);
+    assert.doesNotMatch(r.err, /already gone/);
+    assert.equal(await exists('closed'), false);
+    assert.equal(await exists('claims-unparseable.log'), false, 'no claims released');
+    assert.equal((await handoverRows())[0].retired_at, null);
+  });
+}
+
 test('--reseat needs --role and a numeric window id, and nothing is launched without them', async () => {
   let r = await tab(['--seat', '--title', 't', '--model', 'opus', '--cwd', cwd, '--reseat', String(OTHER_WID)]);
   assert.equal(r.code, 1);

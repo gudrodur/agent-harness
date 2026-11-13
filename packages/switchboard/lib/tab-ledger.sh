@@ -242,7 +242,10 @@ tab_ledger_retire() {
   want_sid=$(printf '%s' "$verdict" | jq -r '.displacedSession // empty')
   # One listing serves the pid, the session and the gone checks. A failed
   # listing is a refusal, never "the window is gone".
-  ls=$(kitty @ ls 2>/dev/null) && [ -n "$ls" ] || die "kitty @ ls failed — cannot tell whether window $id is still there; nothing closed"
+  # The listing must parse as an array: output that exits 0 but is not JSON
+  # would otherwise read as "no such window" and release a live seat's claims.
+  ls=$(kitty @ ls 2>/dev/null) && [ -n "$ls" ] && printf '%s' "$ls" | jq -e 'type == "array"' >/dev/null 2>&1 \
+    || die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
   now_pid=$(printf '%s' "$ls" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
 
   if [ -z "$now_pid" ]; then
