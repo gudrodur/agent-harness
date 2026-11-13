@@ -2191,7 +2191,7 @@ test('--queue prints the queued id line at once, not only when it exits', async 
 
 // A re-queue after kitty-send sent nothing must keep the reason, and must not
 // promise a tool-call delivery to a seat that sits on a dialog or a draft.
-for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds unsubmitted text/]]) {
+for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds unsubmitted text/], [11, /screen unreadable or composer not clear/]]) {
   test(`a re-queue after kitty-send exit ${st} names the reason and does not promise a tool-call delivery`, async () => {
     fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
     const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`exit${st}`, st) }));
@@ -2273,13 +2273,30 @@ test('a notice already read is not raised again inside the notice window', async
 });
 
 // kitty-send's own stderr is trace in the quiet default: agent-send's line is
-// the verdict. Failures it cannot explain itself still pass through.
-for (const st of [0, 10]) {
-  test(`kitty-send stderr is not replayed on exit ${st} in the quiet default`, async () => {
+// the verdict, and EVERY exit prints exactly one. Failures it cannot explain
+// itself still pass through.
+for (const [st, verdictRe] of [[0, /delivered/], [3, /typed.*not proven|unproven/], [8, /steering queue/], [10, /not proven submitted/]]) {
+  test(`busy path, kitty-send exit ${st}: one verdict line, kitty-send chatter not replayed`, async () => {
     fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
     const { stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`noise${st}`, st, 'kitty-send: chatty detail') }));
     assert.doesNotMatch(stderr, /chatty detail/);
+    const lines = nonEmptyLines(stderr);
+    assert.equal(lines.length, 1, stderr);
+    assert.match(lines[0], verdictRe);
     clearKey(KEY_S1);
+  });
+}
+
+// The direct kitty fallback (a window with no mailbox consumer) owes the same
+// single verdict line on every outcome kitty-send can end with.
+for (const [st, code, verdictRe] of [[0, 0, /delivered/], [3, 3, /typed.*not proven|unproven/]]) {
+  test(`kitty fallback to a window with no consumer, kitty-send exit ${st}: one verdict line`, async () => {
+    const { code: got, stderr } = await runSend(['--to', '991002', '--text', 'direct'], childEnv(quiet({ AGENT_SEND_KITTY_SEND: exitStub(`direct${st}`, st, 'kitty-send: chatty detail') })));
+    assert.equal(got, code, stderr);
+    assert.doesNotMatch(stderr, /chatty detail/);
+    const lines = nonEmptyLines(stderr);
+    assert.equal(lines.length, 1, stderr);
+    assert.match(lines[0], verdictRe);
   });
 }
 
@@ -2305,4 +2322,57 @@ test('--who --json into a slow pipe delivers the whole document, not 64 KiB', as
       { sessionId: 's3', cwd: '/repo/b' },
     ]);
   }
+});
+
+// --queue --deadline holds the row when the proof refuses: the line must key its
+// wording on WHY, as the kitty-status path does. A draft or a dialog takes
+// nothing at a tool call.
+for (const [name, screen, why] of [
+  ['a draft', ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n'), /composer/],
+  ['a dialog', ['● Done.', 'Do you want to proceed?', 'Enter to select · Esc to cancel'].join('\n'), /dialog/],
+]) {
+  test(`--queue --deadline held on ${name}: the quiet line does not promise a tool-call delivery`, async () => {
+    const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue', '--deadline', '2'], { title: '✳ claude: idle seat', screen, envExtra: quiet(), killAfterMs: 15_000 });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    assert.doesNotMatch(stderr, /next tool call/);
+    assert.match(stderr, why);
+    assert.match(stderr, /exit 3/);
+  });
+}
+
+// An idle seat with a mailbox consumer, stuck on a dialog: the parked row is not
+// delivered "at its next prompt"; someone has to clear the dialog first.
+test('--queue to an idle seat on a dialog: the re-queue line says the dialog must clear first', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: IDLE_BEACON() }));
+    const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue'], {
+      title: '✳ claude: idle seat', screen: ['● Done.', 'Enter to select · Esc to cancel'].join('\n'),
+      envExtra: quiet({ AGENT_MAILBOX_PROC_DIR: procDir }),
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    assert.doesNotMatch(stderr, /next prompt|next tool call/);
+    assert.match(stderr, /dialog/);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+    clearKey(KEY_S1);
+  }
+});
+
+// --help must describe what the code does.
+test('--help lists exit 2 and does not claim --no-wait falls back to kitty', async () => {
+  const child = spawn('node', [SEND, '--help'], { env: childEnv() });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  await new Promise((resolve) => child.on('close', resolve));
+  assert.match(out, /^\s+2\s+--no-wait/m);
+  assert.doesNotMatch(out, /kitty path runs as usual/);
+  assert.match(out, /no mailbox[^]*?exit 1|exit 1[^]*?no mailbox/i);
 });
