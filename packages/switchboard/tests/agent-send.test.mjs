@@ -966,11 +966,45 @@ const bareSendArgv = async (extraArgs, title, extraEnv = null) => {
   }
 };
 
-test('a bare send to an idle recipient forwards --now to kitty-send', async () => {
+// A title with no spinner is not proof the seat is idle: kitty-send also reads
+// the session state file, and a window it finds mid-turn under --now gets the
+// text in its steering queue with the in-flight tool result DISCARDED. So a
+// bare send never forwards --now; a mid-turn target is kitty-send's exit 7,
+// which agent-send re-queues.
+test('a bare send to a title-idle recipient does not forward --now to kitty-send', async () => {
   const { code, argv } = await bareSendArgv([], 'claude: idle seat');
   assert.equal(code, 5);
-  assert.ok(argv.includes('--now'), `argv: ${argv}`);
+  assert.ok(argv.length > 0, 'kitty-send was still run');
+  assert.ok(!argv.includes('--now'), `argv: ${argv}`);
   assert.ok(!argv.includes('--deadline'));
+});
+
+test('a bare send whose idle-looking recipient is mid-turn for kitty-send keeps the row queued, never --now', async () => {
+  // The title shows no spinner, but kitty-send's own state check finds the seat
+  // mid-turn: with --now it would type into the steering queue (exit 8) and
+  // discard the in-flight tool result; without it, exit 7 sends nothing.
+  const midTurnStub = path.join(binDir, 'kitty-send-midturn.sh');
+  fs.writeFileSync(midTurnStub, [
+    '#!/usr/bin/env bash',
+    `printf '%s\\n' "$@" > ${JSON.stringify(fallbackArgv)}`,
+    'for a in "$@"; do [ "$a" = --now ] && exit 8; done',
+    'exit 7',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const { code, argv, stderr } = await busySend(
+    { AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_IDLE_WAIT_S: '0.5', AGENT_SEND_KITTY_SEND: midTurnStub, AGENT_SEND_VERBOSE: '1' },
+    'claude: idle seat',
+  );
+  assert.ok(argv, `kitty-send ran: ${stderr}`);
+  assert.ok(!argv.includes('--now'), `argv: ${argv}`);
+  assert.equal(code, 3, `exit 7 sent nothing: the row is re-queued, pending: ${stderr}`);
+  // One classification per call: a recipient read as idle is never also called busy.
+  assert.match(stderr, /idle recipient/, stderr);
+  assert.doesNotMatch(stderr, /recipient busy\/parked/, stderr);
+  const id = stderr.match(/re-queued as (\S+) in /)?.[1];
+  assert.ok(id, stderr);
+  assert.ok(readUnacked(KEY_S1, libOpts()).some((r) => r.id === id), 'the row is queued again');
+  cancelQueued({ key: KEY_S1, id, ...libOpts() });
 });
 
 test('a bare send to a busy recipient does not forward --now', async () => {

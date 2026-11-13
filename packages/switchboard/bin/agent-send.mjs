@@ -123,7 +123,8 @@ const usage = () => `Usage:
   agent-send.mjs --who [--json]
 
   --now         priority now (default when no mode is given: a bare send types and
-                submits at once to an idle recipient, a busy one keeps kitty-send's mid-turn guard)
+                submits at once to an idle recipient; it never forwards kitty-send --now, so a
+                mid-turn seat keeps its mailbox row and its in-flight tool result)
   --stop        priority stop: interrupts the consumer's current run
   --idle-when   priority idle (REGEX is the consumer's parked proof)
   --queue       priority queue: deliver without interrupting the recipient's turn.
@@ -668,16 +669,16 @@ const main = (argv) => {
       else args.push('--queue');
     }
     // An explicit --now/--stop sends mid-turn, --stop becoming --now (the one
-    // kitty flag that does). A bare send (no mode) is priority now: to an IDLE
-    // recipient it forwards --now too, since typing into an idle window is safe
-    // and otherwise kitty-send.sh's mid-turn default exits 7 and the re-queued
-    // row waits for a prompt an idle seat never makes. A busy recipient forwards
-    // nothing, so kitty-send's mid-turn guard and the re-queue path still apply.
+    // kitty flag that does). A bare send (no mode) NEVER forwards --now: a title
+    // with no spinner is not proof the seat is idle (kitty-send also reads the
+    // session state file, and the title can flap), and --now into a mid-turn seat
+    // lands in its steering queue and DISCARDS the tool result in flight. Without
+    // --now a mid-turn target is kitty-send's exit 7 (nothing sent), which the
+    // callers re-queue; a truly idle target is typed into as before.
     // --deadline goes along only without --now: kitty-send refuses the pair
     // (exit 1, "mutually exclusive"), and here --deadline bounded agent-send's
     // own ack wait, not a kitty-send idle wait.
-    const bareToIdle = mode == null && /^\d+$/.test(String(target)) && windowIsIdle(target);
-    if (mode === 'now' || mode === 'stop' || bareToIdle) args.push('--now');
+    if (mode === 'now' || mode === 'stop') args.push('--now');
     else if (deadline != null && !(requeue && priority === 'queue')) args.push('--deadline', deadline);
     if (timeoutS != null) args.push('--timeout', String(timeoutS));
     // A foreground run that the caller re-queues on "sent nothing" has its
@@ -923,6 +924,10 @@ const main = (argv) => {
   const envS = (name, dflt) => { const v = Number(process.env[name] ?? dflt); return Number.isFinite(v) && v >= 0 ? v : dflt; };
   const budgetEndMs = Date.now() - process.uptime() * 1000 + envS('AGENT_SEND_BUDGET_S', 30) * 1000;
   let busyBudgetEndMs = null;
+  // The one idle/busy reading of the recipient window this call acts on (null:
+  // window unreadable or unknown). Every later line names this reading, so a
+  // call never calls the same recipient idle and then busy.
+  let recipientTitleIdle = null;
   const clampToBudget = () => {
     deadlineMs = Math.min(envS('AGENT_SEND_BUSY_WAIT_S', 15) * 1000, Math.max(0, budgetEndMs - Date.now()));
     return budgetEndMs;
@@ -931,6 +936,7 @@ const main = (argv) => {
     const rwin = recipient.windowId ?? recipient.beaconWindowId ?? null;
     if (rwin != null) {
       const rIdle = windowIsIdle(rwin);
+      recipientTitleIdle = rIdle;
       if (!rIdle) busyBudgetEndMs = clampToBudget();
       if (rIdle) {
         const capS = Number(process.env.AGENT_SEND_IDLE_WAIT_S ?? 5);
@@ -1042,6 +1048,7 @@ const main = (argv) => {
   // note for the one race left, a drain that read the row just before.
   // The withdraw decides: a drain that acked the row since the re-read above
   // has delivered it, so typing it too would deliver it twice.
+  const pendingWhy = recipientTitleIdle === true ? 'idle recipient did not ack' : 'recipient busy/parked';
   const withdrawal = cancelQueued({ key: recipient.key, id: row.id });
   if (!withdrawal.withdrawn) {
     if (withdrawal.state === 'delivered') {
@@ -1050,9 +1057,9 @@ const main = (argv) => {
     }
     die(`row ${row.id} was ${withdrawal.state ?? 'not found'} before the fallback (withdrawn by --cancel?); nothing was typed and nothing is queued`);
   }
-  trace(`agent-send: queued, recipient busy/parked for ${row.id} in ${mbox}; withdrew the mailbox row, next: kitty-send to ${target} (its exit 8 means pending in the steering queue until the tool boundary, not lost)\n`);
+  trace(`agent-send: queued, ${pendingWhy} for ${row.id} in ${mbox}; withdrew the mailbox row, next: kitty-send to ${target} (its exit 8 means pending in the steering queue until the tool boundary, not lost)\n`);
   const status = runKittySend(
-    `queued, recipient busy/parked for ${row.id}`,
+    `queued, ${pendingWhy} for ${row.id}`,
     target,
     `${text} (If this same steer reaches you twice, act on it once: the mailbox copy was withdrawn.)`,
     row.id,
