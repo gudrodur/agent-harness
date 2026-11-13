@@ -51,7 +51,7 @@ Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote 
 
 ## claude-tab.sh --close --after-loka
 
-`--close <window-id> --after-loka` closes a window the launcher did not start, once its seat is shown to be finished: the Claude Code session in the window sent a message saying "loka done" after it started (read from the store by `bin/seat-finished.mjs`), and it is idle. Plain `--close` still refuses such a window. Codes 0, 1 and 2 are as above (a window already gone exits 0 with its claims released).
+`--close <window-id> --after-loka` closes a window the launcher did not start, once its seat is shown to be finished: the Claude Code session in the window sent one message whose whole text is `LOKA-DONE <session-id>` after it started, holds no role in `seat_roles`, has no message or transcript prompt newer than it (read by `bin/seat-finished.mjs`), and is idle. Code 24 is any missing proof (no session, no marker, a role, later activity, an unreadable transcript, no `startedAt`); 23 is a busy seat, 22 the caller's own window. Plain `--close` still refuses such a window. Codes 0, 1 and 2 are as above (a window already gone exits 0 with its claims released).
 
 | Code | Meaning |
 |---|---|

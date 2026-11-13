@@ -287,14 +287,16 @@ tab_ledger_retire() {
 }
 
 # --close <id> --after-loka. Closes a window THIS ledger never launched, on the
-# evidence that its seat finished: the session in the window sent a "loka done"
-# message after it started (bin/seat-finished.mjs), and it is idle now. The
-# evidence is read from the store and the window, never from the seat's words
-# to the caller. Exit codes (docs/exit-codes.md):
+# evidence that its seat finished: the session in the window sent the structured
+# marker "LOKA-DONE <session-id>" after it started, holds no role, has no mail
+# or prompt newer than the marker (bin/seat-finished.mjs), and is idle now. The
+# marker's sender is self-asserted (CLAUDE_CODE_SESSION_ID), so it can be forged
+# by a process that knows the id; the other guards bound that. Exit codes
+# (docs/exit-codes.md):
 #   22  the id is the caller's own window
 #   23  the seat is not idle (busy, or its state cannot be proven)
-#   24  no finished proof: no Claude Code session in the window, or it has sent
-#       no "loka done" message since it started
+#   24  no finished proof: no Claude Code session in the window, no marker since
+#       it started, it holds a seat role, or it shows activity after the marker
 # 1 is a usage or store error and 2 is no kitty remote control. A window that is
 # already gone is not a refusal: its claims are released and the exit is 0.
 tab_ledger_close_finished() {
@@ -318,18 +320,26 @@ tab_ledger_close_finished() {
   rec=$(claude_session_json "$id" "$ls") \
     || die "window $id runs no Claude Code session, so nothing shows that its seat finished. Refusing." 24
   sid=$(printf '%s' "$rec" | jq -r '.sessionId // empty')
-  started=$(printf '%s' "$rec" | jq -r '.startedAt // 0')
-  verdict=$(node "$bin/seat-finished.mjs" check "$sid" "$started") \
+  started=$(printf '%s' "$rec" | jq -r '.startedAt // empty')
+  case "$started" in ""|*[!0-9]*) die "window $id's session record has no startedAt, so no marker can be dated against it. Refusing." 24 ;; esac
+  verdict=$(node "$bin/seat-finished.mjs" check "$sid" "$started" "$(claude_transcript_of "$rec")") \
     || die "could not read the switchboard store — nothing closed"
-  [ "$(printf '%s' "$verdict" | jq -r .finished)" = true ] \
-    || die "window $id (session $sid) has sent no \"loka done\" message since it started, so it is not shown to be finished. Refusing.
-        The seat runs /compact-session and /loka and reports \"loka done\"; close it when that row exists." 24
+  if [ "$(printf '%s' "$verdict" | jq -r .finished)" != true ]; then
+    case "$(printf '%s' "$verdict" | jq -r '.reason // "no-marker"')" in
+      holds-role) die "window $id (session $sid) holds a seat role; role mail would go to a dead window. Hand the role over first. Refusing." 24 ;;
+      later-mail) die "window $id (session $sid) has mail to or from it newer than its LOKA-DONE marker, so it is working again. Refusing." 24 ;;
+      later-turn) die "window $id (session $sid) has a prompt in its transcript newer than its LOKA-DONE marker, so it is working again. Refusing." 24 ;;
+      no-transcript) die "window $id (session $sid): its transcript cannot be read, so activity after the marker cannot be ruled out. Refusing." 24 ;;
+      *) die "window $id (session $sid) has sent no LOKA-DONE marker since it started, so it is not shown to be finished. Refusing.
+        The marker is one message whose whole text is \"LOKA-DONE $sid\", sent by that session; free text saying \"loka done\" is not proof." 24 ;;
+    esac
+  fi
   st=$("$bin/tab-state.sh" "$id" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
   [ "$st" = "state=idle" ] \
-    || die "window $id is not idle (${st:-state=unknown}) — the seat is still working after its \"loka done\"; retry when it is idle." 23
+    || die "window $id is not idle (${st:-state=unknown}) — the seat is still working after its LOKA-DONE marker; retry when it is idle." 23
 
   if kitty @ close-window --match "id:$id" 2>/dev/null; then
-    note "closed finished window $id (session $sid reported loka done)"
+    note "closed finished window $id (session $sid sent its LOKA-DONE marker)"
   else
     die "close-window FAILED for $id — the window may still be open; go look"
   fi

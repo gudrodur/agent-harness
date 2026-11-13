@@ -48,12 +48,15 @@
 #                the store (role held by the new session, handover retired) and
 #                exits 3 naming the missing half. Needs --role; implies --seat.
 #   --close ID --after-loka  close window ID, which this script did not launch, once
-#                its seat is shown to be finished: the session in the window sent a
-#                "loka done" message after it started (read from the store), and it
-#                is idle. Refuses the caller's own window (exit 22), a busy seat
-#                (23), and a window with no Claude Code session or no such message
-#                (24, naming what is missing). Plain --close still refuses a window
-#                this script did not launch.
+#                its seat is shown to be finished: the session in the window sent ONE
+#                message whose whole text is "LOKA-DONE <its session id>" after it
+#                started (read from the store), holds no seat role, has no mail or
+#                prompt newer than that message, and is idle. The sender is
+#                self-asserted, so the marker can be forged. Refuses the caller's
+#                own window (exit 22), a busy seat (23), and a window with no
+#                Claude Code session, no marker, a role or later activity (24,
+#                naming which). Plain --close still refuses a window this script
+#                did not launch.
 #   --retire ID  close window ID, which this script did not launch, only for the
 #                session that took its role over: a handover row written by
 #                `agent-send --claim-role ... --take-over` must name ID and the
@@ -85,6 +88,12 @@
 #   21  the window's pid is not the one recorded: the id was reused
 #   22  the id is the caller's own window
 #   23  the displaced seat is not idle (busy, or its state cannot be proven)
+#
+# --close ID --after-loka exit codes (0 closed, or the window was already gone; 1 and 2 as above):
+#   22  the id is the caller's own window
+#   23  the seat is not idle (busy, or its state cannot be proven)
+#   24  no finished proof: no session, no LOKA-DONE marker, a seat role held, or
+#       activity after the marker
 # HELP-END
 #
 # The Claude Code sibling of opencode-tab.sh (2026-09-29). Like opencode, the
@@ -124,8 +133,9 @@ case "${1:-}" in
   --list) tab_ledger_list; exit $? ;;
   --close)
     case "${3:-}" in
-      "") CLOSE_HINT=$'\n        If its seat finished /loka and reported "loka done", close it with --close <id> --after-loka.' tab_ledger_close "${2:-}"; exit $? ;;
-      --after-loka) tab_ledger_close_finished "${2:-}"; exit $? ;;
+      "") CLOSE_HINT=$'\n        If its seat finished /loka and sent its LOKA-DONE marker, close it with --close <id> --after-loka.' tab_ledger_close "${2:-}"; exit $? ;;
+      --after-loka) [ $# -le 3 ] || die "--close <id> --after-loka takes no further argument, got: $4"
+                    tab_ledger_close_finished "${2:-}"; exit $? ;;
       *) die "--close takes a window id and optionally --after-loka, got: $3" ;;
     esac ;;
   --retire)

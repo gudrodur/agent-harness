@@ -783,34 +783,46 @@ test('seat-handover verify counts only the handover for the asked role', async (
 
 // --close <id> --after-loka: closing a finished seat this launcher never started.
 //
-// The proof is the seat's own end-of-work report: a message row whose sender
-// key ends in the session id of the window's claude process and whose text says
-// "loka done", written after that session started, plus an idle session.
+// The proof is the seat's own end-of-work marker: a message row whose sender
+// key ends in the session id of the window's claude process and whose whole text
+// is "LOKA-DONE <session-id>", written after that session started, with no role
+// held, no mail or prompt after it, and an idle session.
 const ledgerFile = () => path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid);
 const lokaDone = (over = {}) => withStore((db) => {
   const row = {
     id: `m-${Math.random()}`, ts: new Date(Date.now() - 10_000).toISOString(), from: `-x__${OLD_SESSION}`,
-    to: 'role:lead', priority: 'now', text: 'loka done', ...over,
+    to: 'role:lead', priority: 'now', text: `LOKA-DONE ${OLD_SESSION}`, ...over,
   };
   db.run('INSERT INTO mailbox_rows (recipient_key, kind, msg_id, ts, row_json) VALUES (?, ?, ?, ?, ?)', 'role-lead', 'message', row.id, row.ts, JSON.stringify(row));
 });
-const closeFinished = (id = OTHER_WID, env = {}) => tab(['--close', String(id), '--after-loka'], { KITTY_WINDOW_ID: String(WID), ...env });
+const closeFinished = (id = OTHER_WID, env = {}, extra = []) => tab(['--close', String(id), '--after-loka', ...extra], { KITTY_WINDOW_ID: String(WID), CLAUDE_PROJECTS_DIR: projects, ...env });
+// The seat's own transcript: one prompt 30 s ago, and (with `after`) another 5 s
+// ago, which is after the default marker 10 s ago.
+const seatTranscript = async ({ after = false } = {}) => {
+  const row = (agoMs, content) => JSON.stringify({ type: 'user', timestamp: new Date(Date.now() - agoMs).toISOString(), message: { role: 'user', content } });
+  const rows = [row(30_000, 'start the close-out'), JSON.stringify({ type: 'assistant', timestamp: new Date(Date.now() - 9_000).toISOString(), message: { content: [] } }), row(8_000, [{ type: 'tool_result', content: 'sent' }])];
+  if (after) rows.push(row(5_000, 'one more thing'));
+  await fs.mkdir(tdir, { recursive: true });
+  await fs.writeFile(path.join(tdir, `${OLD_SESSION}.jsonl`), rows.join('\n') + '\n');
+};
+// A ready seat: window, marker, transcript.
+const finishedSeat = async (over = {}) => { await windows(); await seatTranscript(); await lokaDone(over); };
 
 test('--help documents --after-loka', async () => {
   const r = await tab(['--help']);
   assert.match(r.out, /--close <window-id> \[--after-loka\]/);
 });
 
-test('--close --after-loka closes an idle seat this script did not launch once its loka done is recorded', async () => {
-  await windows();
-  await lokaDone();
+test('--close --after-loka closes an idle seat this script did not launch once its LOKA-DONE marker is recorded', async () => {
+  await finishedSeat();
   const r = await closeFinished();
   assert.equal(r.code, 0, r.err);
   assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
 });
 
-test('--close --after-loka refuses a busy seat with exit 23 even with a loka done on record', async () => {
+test('--close --after-loka refuses a busy seat with exit 23 even with a marker on record', async () => {
   await windows({ status: 'busy' });
+  await seatTranscript();
   await lokaDone();
   const r = await closeFinished();
   assert.equal(r.code, 23);
@@ -818,13 +830,14 @@ test('--close --after-loka refuses a busy seat with exit 23 even with a loka don
   assert.equal(await exists('closed'), false);
 });
 
-test('--close --after-loka refuses a seat with no loka done on record, naming what is missing (exit 24)', async () => {
+test('--close --after-loka refuses a seat with no marker on record, naming what is missing (exit 24)', async () => {
   await windows();
+  await seatTranscript();
   let r = await closeFinished();
   assert.equal(r.code, 24);
-  assert.match(r.err, /no "loka done" message/);
+  assert.match(r.err, /no LOKA-DONE marker/);
   assert.equal(await exists('closed'), false);
-  // A loka done from another session, or one older than this session, is not proof.
+  // A marker from another session, or one older than this session, is not proof.
   await lokaDone({ from: '-x__someone-else' });
   await lokaDone({ ts: new Date(Date.now() - 3_600_000).toISOString() });
   r = await closeFinished();
@@ -832,9 +845,89 @@ test('--close --after-loka refuses a seat with no loka done on record, naming wh
   assert.equal(await exists('closed'), false);
 });
 
-test('--close --after-loka refuses the caller\'s own window (22) and a window with no Claude Code session (24)', async () => {
+test('--close --after-loka: free text saying "loka done" is not proof, the overseer broadcast included', async () => {
   await windows();
-  await lokaDone();
+  await seatTranscript();
+  for (const text of [
+    'loka done',
+    'Wind-down: run /loka, then send "loka done" to me.',
+    'not loka done yet',
+    `LOKA-DONE ${OLD_SESSION} and more`,
+    `please send LOKA-DONE ${OLD_SESSION}`,
+    'LOKA-DONE some-other-session',
+  ]) await lokaDone({ text });
+  const r = await closeFinished();
+  assert.equal(r.code, 24, r.err);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses a seat that holds a role, however finished it looks', async () => {
+  const { claimRole } = await import('../lib/seat-roles.mjs');
+  await finishedSeat();
+  await withStore((db) => claimRole(db, { role: 'overseer', sessionId: OLD_SESSION, cwd, windowId: OTHER_WID }));
+  const r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /holds a seat role/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses a seat with mail to or from it after the marker, or a prompt in its transcript after it', async () => {
+  await finishedSeat();
+  await lokaDone({ id: 'm-later-from', ts: new Date(Date.now() - 2_000).toISOString(), text: 'one more result' });
+  let r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /newer than its LOKA-DONE marker/);
+  await withStore((db) => db.run('DELETE FROM mailbox_rows WHERE msg_id = ?', 'm-later-from'));
+  // Mail TO the session after the marker.
+  const to = { id: 'm-later-to', ts: new Date(Date.now() - 2_000).toISOString(), from: '-y__supervisor', text: 'new work' };
+  await withStore((db) => db.run('INSERT INTO mailbox_rows (recipient_key, kind, msg_id, ts, row_json) VALUES (?, ?, ?, ?, ?)', `-x__${OLD_SESSION}`, 'message', to.id, to.ts, JSON.stringify(to)));
+  r = await closeFinished();
+  assert.equal(r.code, 24);
+  await withStore((db) => db.run('DELETE FROM mailbox_rows WHERE msg_id = ?', 'm-later-to'));
+  // A prompt in the transcript after the marker.
+  await seatTranscript({ after: true });
+  r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /prompt in its transcript/);
+  assert.equal(await exists('closed'), false);
+  // Back to quiet: closes.
+  await seatTranscript();
+  r = await closeFinished();
+  assert.equal(r.code, 0, r.err);
+});
+
+test('--close --after-loka refuses when the transcript cannot be read, and a withdrawn marker does not count', async () => {
+  await windows();
+  await lokaDone({ id: 'm-marker' });
+  let r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /transcript cannot be read/);
+  await seatTranscript();
+  await withStore((db) => db.run('INSERT INTO mailbox_rows (recipient_key, kind, msg_id, ts, row_json) VALUES (?, ?, ?, ?, ?)', 'role-lead', 'withdraw', 'm-marker', new Date().toISOString(), JSON.stringify({ withdraw: 'm-marker' })));
+  r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /no LOKA-DONE marker/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses a session record without startedAt, and an extra argument', async () => {
+  await finishedSeat();
+  const rec = path.join(sessionsDir(), `${other.pid}.json`);
+  const j = JSON.parse(await fs.readFile(rec, 'utf8'));
+  delete j.startedAt;
+  await fs.writeFile(rec, JSON.stringify(j));
+  let r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /no startedAt/);
+  await windows();
+  r = await closeFinished(OTHER_WID, {}, ['--dry-run']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /takes no further argument/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses the caller\'s own window (22) and a window with no Claude Code session (24)', async () => {
+  await finishedSeat();
   let r = await closeFinished(WID);
   assert.equal(r.code, 22);
   await fs.rm(sessionsDir(), { recursive: true, force: true });
@@ -846,8 +939,7 @@ test('--close --after-loka refuses the caller\'s own window (22) and a window wi
 });
 
 test('plain --close of a window this script did not launch still refuses, and points at --after-loka', async () => {
-  await windows();
-  await lokaDone();
+  await finishedSeat();
   const r = await tab(['--close', String(OTHER_WID)]);
   assert.equal(r.code, 1);
   assert.match(r.err, /was not launched by this script/);
