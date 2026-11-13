@@ -327,11 +327,14 @@ title_busy() {
   LC_ALL=C.UTF-8 printf '%s' "$1" | LC_ALL=C.UTF-8 grep -qP '[\x{2800}-\x{28FF}]'
 }
 
-# Dialog = the footer/markers of an ask-the-user widget on the visible screen.
-# The markers are today's; add a TUI's own footer text here when it shows
-# one, rather than teaching a caller to know. Bottom 15 rows only: a dialog
-# that was answered stays in the scrollback in full, and that must not count.
-DIALOG_MARKERS='Enter select|Esc cancel|↑/↓ move|✎ note|Enter to select|Esc to cancel|to navigate|Do you want to|Would you like to proceed|Ready to code\?'
+# Dialog = the footer of an ask-the-user widget on the visible screen. ONLY
+# strings Claude Code itself renders in a dialog's footer: a prose marker
+# ("Do you want to ...") also matches a seat's own last reply and would block
+# every send to it. An open permission prompt or question is otherwise caught
+# by the session record status `waiting`. Add a TUI's own footer text here when
+# it shows one, rather than teaching a caller to know. Bottom 15 rows only: a
+# dialog that was answered stays in the scrollback in full, and that must not count.
+DIALOG_MARKERS='Enter select|Esc cancel|↑/↓ move|✎ note|Enter to select|Esc to cancel|↑/↓ to navigate'
 # 0 = dialog on screen, 1 = none, 2 = the screen could not be read. A failed
 # read is NOT "no dialog": failing open here would type into exactly the
 # widget this check exists to protect, so the callers treat 2 as fatal.
@@ -858,6 +861,11 @@ fi
 # submits on that first \r. A short message submits either way. `send-key
 # enter` submits nothing, so press_enter is not used for this.
 CLAUDE_ENTERS=0
+# From here the keystrokes are out. Any command that fails after this point
+# exits 3 ("sent, delivery not proven"): under set -e it would exit 1, which
+# agent-send reads as "nothing was sent" and re-queues, delivering twice.
+set -E
+trap 'exit 3' ERR
 if [ "$CLAUDE_TAB" = 1 ] && [ "$SLASH_SEND" = 0 ]; then
   kitty @ send-text --match "id:$WID" "$TEXT" 2>/dev/null || true
   sleep 1
@@ -909,7 +917,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # (measured 2026-09-12: four /join sends reported "no new role:user row"
     # although each had run). Its proof is the screen changing since the snapshot.
     if [ "$SLASH_SEND" = 1 ]; then
-      slash_screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]')
+      slash_screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]' || true)
       if [ -n "$slash_screen" ] && [ "$slash_screen" != "$before_screen" ]; then
         confirmed=1; where="screen changed after the send (slash command: it writes no session row, so the screen is its proof; weaker than a session row)"; break
       fi
@@ -918,11 +926,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # Echo proofs below run ONLY when the state was unknown (no linked session
   # file). With a linked file the session-row check above is the whole proof:
   # the screen cannot add evidence, and every paragraph below this gate is
-  # the weaker proof the header names. A failed screen read here is harmless
-  # (screen stays empty, no fragment matches); the pre-send read that guards
-  # the false green already ran above and still fails closed.
+  # the weaker proof the header names. A failed screen read here leaves the
+  # screen empty (no fragment matches) and the run ends in exit 3, "sent, not
+  # proven": the keystrokes are out, so the exit must never be 1 or 11. The
+  # pre-send read that guards the false green already ran above and fails closed.
   if [ "$STATE_KNOWN" = 0 ]; then
-  screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]')
+  screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]' || true)
   if printf '%s' "$screen" | grep -qF -- '[Pastedtext#'; then
   # An unsubmitted paste chip after the send means NOT DELIVERED, whatever
   # the fragment match below says: the trailing \r was swallowed into the

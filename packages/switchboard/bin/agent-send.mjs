@@ -44,7 +44,6 @@
 // lib/agent-mailbox.mjs apply.
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -98,7 +97,7 @@ const usage = () => `Usage:
   --stop        priority stop: interrupts the consumer's current run
   --idle-when   priority idle (REGEX is the consumer's parked proof)
   --queue       priority queue: deliver without interrupting the recipient's turn.
-                A recipient proven idle (Claude Code tab, session status idle,
+                A recipient proven idle (Claude Code tab, session status idle or shell,
                 no dialog, empty prompt line) when you send, or later, gets
                 it typed in once it has been idle AGENT_SEND_IDLE_WAIT_S
                 (default 5 s); exit 0. Without that proof nothing is typed
@@ -175,7 +174,8 @@ const usage = () => `Usage:
         there is no mailbox to fall back to; a withdrawn row is re-queued and
         exits 3 instead): 1 usage or precondition, 4 selection dialog open,
         5 idle wait ran out, 6 a send is already queued, 7 mid-turn without
-        --now/--queue/--wait-idle, 9 composer holds unsubmitted text
+        --now/--queue/--wait-idle, 9 composer holds unsubmitted text; kitty-send's
+        own 11 (screen unreadable before the send) is reported as 1
     11  --claim-role refused: the role's holder is live (nothing changed)
     12  --release-role refused: another session holds the role (nothing changed)
     13  --cancel found the row already delivered or already withdrawn (nothing written)
@@ -199,6 +199,8 @@ const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11]);
 // How often a --queue sender re-reads the recipient window's title while it
 // waits for the drain (one `kitty @ ls` per poll).
 const QUEUE_POLL_MS = 2000;
+// How long kitty-send may wait for idle after the typing proof passed (no --deadline).
+const TYPE_AFTER_PROOF_WAIT_S = 5;
 const KITTY_NOTHING_REASON = {
   1: 'usage or precondition error',
   4: 'selection dialog open',
@@ -482,10 +484,12 @@ const main = (argv) => {
     if (priority === 'queue') {
       // The withdraw path runs under --queue when --deadline ran out or the
       // recipient window showed idle with the row undrained. Without --deadline
-      // kitty-send waits up to 120 s for idle and no dialog; it found the window
-      // idle moments ago, so it normally types at once, and a window that went
-      // busy again gets the row back in the mailbox (exit 5, re-queued).
-      if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : '120');
+      // kitty-send waits a few seconds for idle and no dialog; the proof found the
+      // window idle moments ago, so it normally types at once, and a window that
+      // went busy again gets the row back in the mailbox (exit 5, re-queued).
+      // Long waits are not allowed here: the proof is not re-run while kitty-send
+      // waits, so a long wait would type up to that long after it was taken.
+      if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : String(TYPE_AFTER_PROOF_WAIT_S));
       else args.push('--queue');
     }
     // An explicit --now/--stop sends mid-turn, --stop becoming --now (the one
@@ -551,14 +555,32 @@ const main = (argv) => {
   };
   // A role is not a kitty target: fall back to the window its holder's
   // beacon recorded, and fail loudly when it recorded none.
-  const kittyFallback = (why) => {
+  //
+  // A --queue send types into the window, so it gets the same proof as the
+  // mailbox path (typingVerdict, one function): without proof nothing is typed.
+  // With a mailbox key (`queueKey`, an idle seat) the text is queued there for
+  // the seat's own drain and the exit is 3; without one nothing is queued and
+  // the exit is 1, so the sender knows the message did not go.
+  const kittyFallback = (why, queueKey = null) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
+    if (priority === 'queue') {
+      const refusal = /^\d+$/.test(String(t)) ? typingVerdict(t) : 'the target is not a window id, so its screen cannot be proven';
+      if (refusal != null) {
+        process.stderr.write(`agent-send: ${why}; not typed into ${t}: ${refusal}\n`);
+        if (queueKey == null) die(`nothing was sent and nothing is queued for ${t}: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
+        const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+        const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
+        process.stderr.write(`agent-send: queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
+        process.exit(3);
+      }
+    }
     const st = runKittySend(why, t, text);
     // A --queue waiter that was only started is not a delivery: the verdict
     // lands later in the queue log (exit 3: pending, do not resend).
     if (st === 0 && priority === 'queue') process.exit(3);
-    process.exit(st ?? 1);
+    // kitty-send's 11 (nothing sent) is not agent-send's 11 (--claim-role refused).
+    process.exit(st === 11 ? 1 : (st ?? 1));
   };
   try {
     recipient = resolveRecipient(to, { senderSessionId, senderCwd: process.cwd(), senderWindowId: senderWindowId() });
@@ -566,7 +588,7 @@ const main = (argv) => {
     // Never just "no consumer": a stale beacon (parked past the presence
     // window) and no beacon at all need different next steps.
     dupCheck(e?.key ?? null);
-    if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`);
+    if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`, e.key ?? null);
     if (e?.code === 'mailbox-stale') kittyFallback(`stale mailbox beacon for ${to} (${e.message})`);
     if (e?.code === 'mailbox-self' || e?.code === 'mailbox-no-beacon') kittyFallback(`no mailbox consumer at ${to}`);
     die(e.message);
@@ -581,7 +603,7 @@ const main = (argv) => {
     process.exit(3);
   }
   if (!recipient.hasConsumer) {
-    if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`);
+    if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
   }
   const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
@@ -639,7 +661,7 @@ const main = (argv) => {
     let idleSince = null;
     let lastWhy = null;
     for (;;) {
-      const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin) : 'recipient window not idle';
+      const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin, { text }) : 'recipient window not idle';
       if (rwin != null && why == null) {
         idleSince ??= Date.now();
         if (Date.now() - idleSince >= capMs) {

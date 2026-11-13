@@ -141,6 +141,50 @@ test('a send to an idle seat says so, types to wake it, and keeps kitty-send exi
   assert.ok(argv.includes('410') && argv.includes('wake up'));
 });
 
+// --queue to a seat idle past the presence window goes through the same typing
+// proof as every other queued send: a half-typed draft is never appended to.
+const idleQueueSend = (screenText, status = 'idle') => {
+  const sessDir = path.join(tmp, 'idle-queue-sessions');
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.writeFileSync(path.join(sessDir, '4343.json'), JSON.stringify({ sessionId: 'idle-1', cwd: '/r/idle', status }));
+  const screen = path.join(tmp, 'idle-queue-screen');
+  fs.writeFileSync(screen, screenText);
+  const proofKitty = path.join(tmp, 'kitty-idle-proof');
+  fs.writeFileSync(proofKitty, [
+    '#!/usr/bin/env bash',
+    `if [ "$2" = "get-text" ]; then cat ${JSON.stringify(screen)}; exit 0; fi`,
+    `printf '%s' '[{"tabs":[{"windows":[{"id":410,"title":"idle seat","cwd":"/r/idle","foreground_processes":[{"pid":4343,"cmdline":["claude"]}]}]}]}]'`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.rmSync(argvFile, { force: true });
+  const r = send(['--to', '410', '--queue', '--text', 'queued for an idle seat'], { AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir });
+  return { r, typed: fs.existsSync(argvFile) ? fs.readFileSync(argvFile, 'utf-8').split('\n') : null };
+};
+const IDLE_KEY = recipientKey({ cwd: '/r/idle', sessionId: 'idle-1' });
+test('--queue to a seat idle past 20 minutes is never typed onto a half-typed draft', () => {
+  const before = readUnacked(IDLE_KEY, {}).length;
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ half a thought\n────────\n');
+  assert.equal(typed, null, `kitty-send must not run: ${r.stderr}`);
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /not typed.*composer holds text/);
+  assert.equal(readUnacked(IDLE_KEY, {}).length, before + 1, 'the row stays queued for the seat');
+});
+test('--queue to a seat idle past 20 minutes is never typed over a multi-line draft', () => {
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n  second line\n────────\n');
+  assert.equal(typed, null, r.stderr);
+  assert.match(r.stderr, /composer holds text/);
+});
+test('--queue to a seat idle past 20 minutes is refused when its record is not idle', () => {
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'waiting');
+  assert.equal(typed, null, r.stderr);
+  assert.match(r.stderr, /status waiting/);
+});
+test('--queue to a seat idle past 20 minutes with a proven empty composer is typed', () => {
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n');
+  assert.equal(r.status, 3, r.stderr); // a started --queue waiter is pending, not delivered
+  assert.ok(typed?.includes('--queue') && typed.includes('410'), `argv: ${typed}`);
+});
+
 test('a send to a role whose holder is idle wakes the holder window instead of queueing', async () => {
   const { claimRole } = await roles();
   await withDb((db) => claimRole(db, { role: 'idle-role', sessionId: 'idle-1', cwd: '/r/idle', windowId: 410 }));

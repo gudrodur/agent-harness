@@ -15,13 +15,19 @@ import { execFileSync } from 'node:child_process';
 //     permission prompt or question, `blocked` a stuck turn, and an unknown
 //     or missing status proves nothing);
 //   - the screen must be readable and carry no dialog;
-//   - the prompt line (the last line starting with the prompt mark) must be
-//     empty. A fresh session's placeholder hint reads as text: not typed.
+//   - the composer box (the last line starting with the prompt mark and every
+//     line under it up to the closing rule) must be empty. A fresh session's placeholder hint reads as text: not typed.
 // `shell`: the turn ended and background shells or monitors still run (seen on live
 // screens with an empty composer and the title idle).
 const QUEUE_IDLE_STATUSES = new Set(['idle', 'shell']);
-const DIALOG_RE = /Enter to select|Esc to cancel|to navigate|Do you want to|Would you like to proceed|Ready to code\?|Enter select|↑\/↓ move|✎ note/;
-export const typingVerdict = (winId) => {
+// Footer strings only (the set kitty-send.sh's DIALOG_MARKERS holds): prose such as
+// "Do you want to ..." also appears in a seat's own reply. A permission prompt or a
+// question is otherwise refused through the record status `waiting`.
+const DIALOG_RE = /Enter to select|Esc to cancel|↑\/↓ to navigate|Enter select|Esc cancel|↑\/↓ move|✎ note/;
+// `text`, when given, is the message about to be typed: one that starts with `/` would run as a
+// slash command in the seat (`/compact` compacts it) instead of arriving as a message.
+export const typingVerdict = (winId, { text = null } = {}) => {
+  if (text != null && /^\s*\//.test(text)) return 'the text starts with "/", which would run as a command in the seat';
   const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
   let win;
   try {
@@ -44,6 +50,12 @@ export const typingVerdict = (winId) => {
   if (lines.slice(-15).some((l) => DIALOG_RE.test(l))) return 'a dialog is open on the screen';
   const at = lines.findLastIndex((l) => /^\s*[❯>](\s|$)/.test(l));
   if (at < 0) return 'no prompt line on the screen';
-  if (lines[at].replace(/^\s*[❯>]/, '').trim() !== '') return 'composer holds text';
+  // The whole composer box: the prompt line and every line under it up to the
+  // closing rule (a draft may start with an empty line). Without a closing rule
+  // everything below counts, so a screen that cannot be read as a box is refused.
+  const rest = lines.slice(at + 1);
+  const close = rest.findIndex((l) => /^\s*[─━]{5,}\s*$/.test(l));
+  const box = [lines[at].replace(/^\s*[❯>]/, ''), ...(close < 0 ? rest : rest.slice(0, close))];
+  if (box.some((l) => l.trim() !== '')) return 'composer holds text';
   return null;
 };

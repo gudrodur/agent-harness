@@ -64,7 +64,7 @@ before(async () => {
     `transcript=${JSON.stringify(transcript)}`,
     'row() { jq -cn --arg t "$1" \'{type:"user",message:{role:"user",content:$t}}\' >> "$transcript"; }',
     'case "$1/$2" in',
-    `  @/ls) printf '%s\\n' ${JSON.stringify(lsJson)} ;;`,
+    `  @/ls) if [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
     '  @/send-text)',
     '    text="${@: -1}"',
     '    if [ "$text" = $\'\\r\' ]; then',
@@ -95,7 +95,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -174,3 +174,13 @@ for (const status of ['waiting', 'blocked']) {
     assert.deepEqual(await calls(), []);
   });
 }
+
+// `shell` is a finished turn with a background shell still running: the seat is
+// at the prompt. The session record outranks a spinner left in the title.
+test('a Claude tab whose session status is shell is sendable even with a spinner in the title', async () => {
+  await reset('burst', 'shell');
+  await fs.writeFile(path.join(stateDir, 'title'), '⠹ Claude Code');
+  const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['text']);
+});

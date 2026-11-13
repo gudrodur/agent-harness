@@ -119,6 +119,24 @@ after(async () => {
   await fs.promises.rm(mboxDir, { recursive: true, force: true }).catch(() => {});
 });
 
+// A kitty stand-in whose window carries the typing proof a --queue send needs:
+// a Claude Code process, an idle session record and an empty composer.
+const provenKitty = (winId, cwd) => {
+  const pid = 4000 + (winId % 1000);
+  const sessDir = path.join(binDir, `proven-sessions-${winId}`);
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.writeFileSync(path.join(sessDir, `${pid}.json`), JSON.stringify({ sessionId: `proven-${winId}`, cwd, status: 'idle' }));
+  const screen = path.join(binDir, `proven-screen-${winId}`);
+  fs.writeFileSync(screen, '● Done.\n────────────────────\n❯ \n────────────────────\n');
+  const kitty = path.join(binDir, `kitty-proven-${winId}`);
+  fs.writeFileSync(kitty, [
+    '#!/usr/bin/env bash',
+    `if [ "$2" = "get-text" ]; then cat ${JSON.stringify(screen)}; exit 0; fi`,
+    `printf '%s' '[{"tabs":[{"windows":[{"id":${winId},"title":"claude: idle seat","cwd":"${cwd}","foreground_processes":[{"pid":${pid},"cmdline":["claude"]}]}]}]}]'`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { AGENT_MAILBOX_KITTY: kitty, CLAUDE_SESSIONS_DIR: sessDir };
+};
 const libOpts = () => ({ dir: mboxDir, presenceFile: presFile });
 const childEnv = (extra = {}) => isolatedEnv({
   AGENT_MAILBOX_DIR: mboxDir,
@@ -657,7 +675,7 @@ test('priority flags reach kitty-send unchanged on the fallback path', async () 
     fs.rmSync(fallbackArgv, { force: true });
     const queued = await runSend(
       ['--to', '991002', '--queue', '--text', 'queued steer'],
-      childEnv({ CLAUDE_CODE_SESSION_ID: 's1' }),
+      childEnv({ CLAUDE_CODE_SESSION_ID: 's1', ...provenKitty(991002, '/repo/b') }),
     );
     assert.equal(queued.code, 5);
     argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
@@ -677,7 +695,7 @@ test('priority flags reach kitty-send unchanged on the fallback path', async () 
 // Bare send (no mode) is priority now: an idle recipient gets --now so kitty-send
 // types and submits at once; a busy one (spinner in the title) does not, so
 // kitty-send's mid-turn guard still applies.
-const bareSendArgv = async (extraArgs, title) => {
+const bareSendArgv = async (extraArgs, title, extraEnv = null) => {
   const saved = fs.readFileSync(presFile, 'utf-8');
   const busyKitty = path.join(binDir, 'kitty-title-stub');
   try {
@@ -689,7 +707,7 @@ const bareSendArgv = async (extraArgs, title) => {
     ].join('\n'), { mode: 0o755 });
     fs.rmSync(fallbackArgv, { force: true });
     const r = await runSend(['--to', '991002', ...extraArgs, '--text', 'hello'],
-      childEnv({ CLAUDE_CODE_SESSION_ID: 's1', AGENT_MAILBOX_KITTY: busyKitty }));
+      childEnv({ CLAUDE_CODE_SESSION_ID: 's1', AGENT_MAILBOX_KITTY: busyKitty, ...extraEnv }));
     return { code: r.code, argv: fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean) };
   } finally {
     fs.writeFileSync(presFile, saved);
@@ -709,7 +727,7 @@ test('a bare send to a busy recipient does not forward --now', async () => {
 });
 
 test('an explicit --queue to an idle recipient is unchanged', async () => {
-  const { argv } = await bareSendArgv(['--queue'], 'claude: idle seat');
+  const { argv } = await bareSendArgv(['--queue'], 'claude: idle seat', provenKitty(991002, '/repo/b'));
   assert.ok(argv.includes('--queue'));
   assert.ok(!argv.includes('--now'), `argv: ${argv}`);
 });
@@ -1088,7 +1106,7 @@ test('a queued kitty fallback (exit 0 under --queue) is pending: exit 3, names t
   fs.writeFileSync(queueStub, ['#!/usr/bin/env bash', 'exit 0', ''].join('\n'), { mode: 0o755 });
   const { code, stderr } = await runSend(
     ['--to', '991002', '--text', 'queued steer', '--queue'],
-    { ...childEnv(), AGENT_SEND_KITTY_SEND: queueStub, XDG_RUNTIME_DIR: queueDir },
+    { ...childEnv(), AGENT_SEND_KITTY_SEND: queueStub, XDG_RUNTIME_DIR: queueDir, ...provenKitty(991002, '/repo/b') },
   );
   // A started waiter is not a delivery: exit 3, not 0.
   assert.equal(code, 3, stderr);
@@ -1380,7 +1398,7 @@ test('an idle recipient is unchanged by the budget: no --timeout forwarded', asy
 // unreadable screen.
 const EMPTY_COMPOSER = ['● Done.', '', '─'.repeat(40), '❯ ', '─'.repeat(40), '  ? for shortcuts'].join('\n');
 const QUEUE_WIN_PID = 424242;
-const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null } = {}) => {
+const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null, text = 'queued for an idle seat' } = {}) => {
   const titleFile = path.join(binDir, 'queue-title');
   const screenFile = path.join(binDir, 'queue-screen');
   const sessDir = path.join(binDir, 'queue-claude-sessions');
@@ -1407,7 +1425,7 @@ const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envE
     CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_KITTY: titleKitty, AGENT_SEND_KITTY_SEND: realRulesStub, AGENT_SEND_IDLE_WAIT_S: '0', CLAUDE_SESSIONS_DIR: sessDir, ...envExtra,
   });
   const run = new Promise((resolve) => {
-    const child = spawn('node', [SEND, ...args, '--text', 'queued for an idle seat'], { env });
+    const child = spawn('node', [SEND, ...args, '--text', text], { env });
     let stderr = '';
     let killed = false;
     child.stderr.on('data', (d) => { stderr += d; });
@@ -1538,4 +1556,61 @@ test('--queue never types over a question dialog', () => notTyped('question', { 
 test('--queue never types over a plan approval', () => notTyped('plan', { screen: PLAN_DIALOG }, /not typed.*dialog/));
 test('--queue never types when the screen cannot be read', () => notTyped('unreadable', { screen: null }, /not typed.*screen could not be read/));
 test('--queue never types onto a half-typed draft', () => notTyped('draft', { screen: ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n') }, /not typed.*composer holds text/));
+// Prose in the seat's own last reply must not read as a dialog.
+test('--queue types into an idle seat whose last reply asks a question', async () => {
+  const screen = ['● All checks passed. Do you want to merge it now? Would you like to proceed?', '', '─'.repeat(40), '❯ ', '─'.repeat(40), '  ? for shortcuts'].join('\n');
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: '✳ claude: idle seat', screen });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
+});
+
+test('--queue never types onto a multi-line draft whose first line is empty', () => notTyped('multi-line draft', { screen: ['● Done.', '─'.repeat(40), '❯ ', '  second line of a draft', '─'.repeat(40), '  ? for shortcuts'].join('\n') }, /not typed.*composer holds text/));
+test('--queue never types onto a draft with several lines under an empty first line', () => notTyped('multi-line draft', { screen: ['● Done.', '─'.repeat(40), '❯', '', '  third line of a draft', '─'.repeat(40)].join('\n') }, /not typed.*composer holds text/));
+test('--queue never types text that starts with "/": it would run as a command in the seat', () => notTyped('slash text', { text: '/compact now' }, /not typed.*starts with "\/"/));
+test('after the proof, kitty-send waits only a few seconds for idle, so a seat woken since is not typed into late', async () => {
+  const { argv, stderr } = await queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat' });
+  assert.ok(argv, stderr);
+  const wait = Number(argv[argv.indexOf('--wait-idle') + 1]);
+  assert.ok(wait > 0 && wait <= 10, `--wait-idle ${wait}: argv ${argv}`);
+});
+test('kitty-send exit 11 on the direct fallback exits 1, never 11 (that is --claim-role refused)', async () => {
+  const queueDir = path.join(binDir, 'xdg-run-11');
+  fs.mkdirSync(queueDir, { recursive: true });
+  const { code, stderr } = await runSend(
+    ['--to', '991002', '--text', 'direct'],
+    childEnv({ AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '11', XDG_RUNTIME_DIR: queueDir }),
+  );
+  assert.equal(code, 1, stderr);
+  assert.match(stderr, /nothing was sent/);
+});
+
+// A seat with no mailbox consumer, reached by --queue through the kitty fallback,
+// gets the same proof as every other queued send.
+test('--queue through the kitty fallback is never typed onto a half-typed draft', async () => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]); // beacon without the consumer flag
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+      title: 'claude: idle seat', screen: ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n'),
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(argv, null, `kitty-send must not run: ${stderr}`);
+    assert.notEqual(code, 0, stderr);
+    assert.match(stderr, /not typed.*composer holds text/);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+  }
+});
+test('--queue through the kitty fallback is typed when the composer is proven empty', async () => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]);
+    const { killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat' });
+    assert.equal(killed, false, stderr);
+    assert.ok(argv?.includes('--queue'), `argv: ${argv}`);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+  }
+});
 test('--queue never types when no prompt line is on screen', () => notTyped('no prompt', { screen: '● Done.\n' }, /not typed.*no prompt line/));

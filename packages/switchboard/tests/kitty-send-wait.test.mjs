@@ -237,13 +237,24 @@ test('a dialog still wins over --idle-when: it is the human\'s to answer', async
 // any of them, whatever the session record says.
 for (const [name, screen] of [
   ['a question dialog footer', 'Which one?\n  Enter to select · ↑/↓ to navigate · Esc to cancel'],
-  ['a permission prompt', ' Do you want to proceed?\n ❯ 1. Yes\n   2. No'],
-  ['a plan approval', ' Would you like to proceed?\n ❯ 1. Yes, and auto-accept edits'],
+  ['a permission prompt', ' Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel'],
+  ['a plan approval', ' Would you like to proceed?\n ❯ 1. Yes, and auto-accept edits\n\n ctrl-g to edit plan · Esc to cancel'],
 ]) {
   test(`${name} is a dialog: refused with exit 4`, async () => {
     const { code, err } = await runScript(['--to', WID, '--text', 'hi', '--idle-when', 'Bíð eftir næsta'], { KITTY_MOCK_SCREEN: `Bíð eftir næsta\n${screen}` });
     assert.equal(code, 4);
     assert.match(err, /refusing to type into a dialog/);
+  });
+}
+
+// Prose in a seat's own last reply is not a dialog. Only the footer strings
+// Claude Code renders for one count; an open permission prompt or question is
+// otherwise caught by the record status `waiting`.
+for (const prose of ['Do you want to merge it now?', 'Would you like to proceed with the rebase?', 'Use the arrow keys to navigate; Ready to code? Say so.']) {
+  test(`a reply that says "${prose}" is not a dialog`, async () => {
+    const { code, err } = await runScript(['--to', WID, '--text', 'hi', '--idle-when', 'Bíð eftir næsta', '--timeout', '2'], { KITTY_MOCK_SCREEN: `${prose}\nBíð eftir næsta` });
+    assert.notEqual(code, 4, err);
+    assert.doesNotMatch(err, /refusing to type into a dialog/);
   });
 }
 
