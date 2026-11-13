@@ -233,12 +233,15 @@ test('a dialog still wins over --idle-when: it is the human\'s to answer', async
   assert.match(err, /refusing to type into a dialog/);
 });
 
-// The footers and questions Claude Code shows today: a send must not type into
-// any of them, whatever the session record says.
+// Footer strings the screen check keys on. ASSUMED, not captured from a live
+// dialog: composed from the strings in the Claude Code 2.1.323 binary
+// ("↑/↓ to navigate", "Enter to select", "←/→ to switch", "Esc to cancel"). A
+// permission prompt and a plan approval are refused through the session record
+// status `waiting` (kitty-send-claude.test.mjs), not through a screen string,
+// so no footer is invented for them here.
 for (const [name, screen] of [
   ['a question dialog footer', 'Which one?\n  Enter to select · ↑/↓ to navigate · Esc to cancel'],
-  ['a permission prompt', ' Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel'],
-  ['a plan approval', ' Would you like to proceed?\n ❯ 1. Yes, and auto-accept edits\n\n ctrl-g to edit plan · Esc to cancel'],
+  ['a tabbed question dialog footer', 'Which one?\n  ↑/↓ to navigate · Enter to select · ←/→ to switch · Esc to cancel'],
 ]) {
   test(`${name} is a dialog: refused with exit 4`, async () => {
     const { code, err } = await runScript(['--to', WID, '--text', 'hi', '--idle-when', 'Bíð eftir næsta'], { KITTY_MOCK_SCREEN: `Bíð eftir næsta\n${screen}` });

@@ -390,7 +390,7 @@ test('withdraw path under --queue --deadline forwards --wait-idle, re-queues on 
   fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
   const { code, stderr } = await runSend(
     ['--to', '991001', '--queue', '--deadline', '1', '--text', 'queued steer'],
-    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '5' }),
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '5', ...provenKitty(991001, '/repo/a') }),
   );
   const argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
   assert.ok(!argv.includes('--queue'), `--queue must not be forwarded: ${argv}`);
@@ -1536,9 +1536,14 @@ test('--queue --deadline still bounds the wait for a busy recipient', async () =
 // Fail closed: text is typed only on positive proof that the seat is idle AND
 // its composer is empty. Every case below leaves the row queued, sends no
 // keystroke (the fake sender never runs) and says on one stderr line why.
-const PERMISSION_DIALOG = ['● Bash(rm -rf build)', '', ' Do you want to proceed?', ' ❯ 1. Yes', '   2. No', '', ' Esc to cancel'].join('\n');
+// Dialog fixtures. A permission prompt and a plan approval are caught by the
+// session record status `waiting`, so their screens carry NO footer string here:
+// nothing is invented for them. QUESTION_DIALOG's footer is ASSUMED, composed
+// from the strings in the Claude Code 2.1.323 binary ("↑/↓ to navigate", "Enter
+// to select", "Esc to cancel"); no live dialog was captured to confirm it.
+const PERMISSION_DIALOG = ['● Bash(rm -rf build)', '', ' Do you want to proceed?', ' ❯ 1. Yes', '   2. No'].join('\n');
 const QUESTION_DIALOG = ['Which database should we use?', ' ❯ 1. Postgres', '   2. SQLite', '', 'Enter to select · ↑/↓ to navigate · Esc to cancel'].join('\n');
-const PLAN_DIALOG = ['Ready to code?', ' Here is Claude\'s plan:', ' Would you like to proceed?', ' ❯ 1. Yes, and auto-accept edits', '   2. No, keep planning', '', ' ctrl-g to edit plan · Esc to cancel'].join('\n');
+const PLAN_DIALOG = ['Ready to code?', ' Here is Claude\'s plan:', ' Would you like to proceed?', ' ❯ 1. Yes, and auto-accept edits', '   2. No, keep planning'].join('\n');
 const notTyped = async (why, opts, reason) => {
   const { killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: '✳ claude: idle seat', killAfterMs: 2500, ...opts });
   assert.equal(killed, true, `${why}: the sender must keep waiting, not type or exit: ${stderr}`);
@@ -1551,9 +1556,9 @@ test('--queue never types into a seat whose record status is waiting', () => not
 test('--queue never types into a seat whose record status is blocked', () => notTyped('blocked', { status: 'blocked' }, /not typed.*status blocked/));
 test('--queue never types into a seat whose record status is unknown', () => notTyped('unknown status', { status: 'thinking' }, /not typed.*status thinking/));
 test('--queue never types into a seat with no session record', () => notTyped('no record', { status: null }, /not typed.*no session record/));
-test('--queue never types over a permission prompt', () => notTyped('permission', { screen: PERMISSION_DIALOG }, /not typed.*dialog/));
+test('--queue never types over a permission prompt', () => notTyped('permission', { status: 'waiting', screen: PERMISSION_DIALOG }, /not typed.*status waiting/));
 test('--queue never types over a question dialog', () => notTyped('question', { screen: QUESTION_DIALOG }, /not typed.*dialog/));
-test('--queue never types over a plan approval', () => notTyped('plan', { screen: PLAN_DIALOG }, /not typed.*dialog/));
+test('--queue never types over a plan approval', () => notTyped('plan', { status: 'waiting', screen: PLAN_DIALOG }, /not typed.*status waiting/));
 test('--queue never types when the screen cannot be read', () => notTyped('unreadable', { screen: null }, /not typed.*screen could not be read/));
 test('--queue never types onto a half-typed draft', () => notTyped('draft', { screen: ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n') }, /not typed.*composer holds text/));
 // Prose in the seat's own last reply must not read as a dialog.
@@ -1613,4 +1618,37 @@ test('--queue through the kitty fallback is typed when the composer is proven em
     fs.writeFileSync(presFile, saved);
   }
 });
-test('--queue never types when no prompt line is on screen', () => notTyped('no prompt', { screen: '● Done.\n' }, /not typed.*no prompt line/));
+test('--queue never types when no prompt line is on screen', () => notTyped('no prompt', { screen: '● Done.\n' }, /not typed.*no composer box/));
+
+// ---- review scenarios: the early verdict decides only whether to WITHDRAW ----
+
+// Idle title, `❯ half a thought`, --deadline 2. The deadline used to withdraw the
+// row and type it through kitty-send --wait-idle with no composer check. Now the
+// row stays queued (never withdrawn first in the hope that kitty-send refuses),
+// kitty-send is never reached, and the sender exits 3 saying why.
+test('--queue --deadline against an idle seat with a draft: the row stays queued, kitty-send never runs', async () => {
+  const draft = ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40), '  ? for shortcuts'].join('\n');
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue', '--deadline', '2'], { title: '✳ claude: idle seat', screen: draft, killAfterMs: 15_000 });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 3, stderr);
+  assert.equal(argv, null, `no keystroke path may run: ${argv}`);
+  assert.match(stderr, /--deadline ran out; not typed into 991001: composer holds text/);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row was not withdrawn');
+  assert.equal(typedRows().length, 0);
+});
+
+// The fallback (a seat with no mailbox consumer) passes the text to the proof
+// too: `/compact now` would otherwise run as a command in the seat.
+test('--queue --text "/compact now" through the kitty fallback is never typed', async () => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]);
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat', text: '/compact now' });
+    assert.equal(killed, false, stderr);
+    assert.equal(argv, null, `kitty-send must not run: ${stderr}`);
+    assert.notEqual(code, 0, stderr);
+    assert.match(stderr, /not typed into 991001: the text starts with "\//);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+  }
+});

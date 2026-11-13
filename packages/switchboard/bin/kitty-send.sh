@@ -25,7 +25,9 @@
 #   1  usage / precondition error (no kitty remote control, no such window)
 #   3  sent, but could not prove it landed (nothing is retried for you).
 #      The window WAS typed into: never re-queue or resend blind.
-#   4  the target is showing a selection dialog — NOTHING WAS SENT (see below)
+#   4  the target is showing a selection dialog, or its session record says
+#      `waiting`/`blocked` — NOTHING WAS SENT, in EVERY mode (--now included;
+#      see below)
 #   5  --wait-idle/--deadline ran out before the target went idle — NOTHING WAS SENT
 #   6  --queue: a send is already queued for that window — NOTHING WAS SENT
 #   7  the target is mid-turn and none of --wait-idle / --queue / --now was
@@ -41,8 +43,12 @@
 #   delivery verdict (any code above) lands later in the queue log. A caller
 #   that needs the verdict must use --wait-idle N, which runs in the
 #   foreground (agent-send does, on its withdraw path).
-#   11 NOTHING WAS SENT: the screen could not be read before the send, or the
-#      composer still held a chip after the recovery Enter. The window was not
+#   11 NOTHING WAS SENT: the screen could not be read before the send, the
+#      composer still held a chip after the recovery Enter, or the typing proof
+#      (lib/typing-proof.mjs, run immediately before the first keystroke by
+#      --queue, --wait-idle, --deadline and the detached waiter) did not pass:
+#      not a Claude Code tab, not idle, a draft in the composer, a text starting
+#      with "/", or node / the module missing. The window was not
 #      typed into, so a caller may put the message back safely. (Until
 #      2026-11-13 these two shared exit 3 with "sent, unproven".)
 #   10 typed, not proven submitted: the window has no session record to read,
@@ -136,7 +142,7 @@
 # no stable waiting-state string to key on (measured 2026-09-07) — the line
 # above was the delegated agent's own prose, in Icelandic, because its brief
 # was written that way. A list of markers would only ever match the briefs
-# that happened to be written first. DIALOG_MARKERS below can be a fixed list
+# that happened to be written first. The dialog markers in lib/typing-proof.mjs can be a fixed list
 # because a dialog IS the TUI's own widget.
 #
 # Multi-line input is refused rather than guessed at: inside single quotes a
@@ -327,24 +333,46 @@ title_busy() {
   LC_ALL=C.UTF-8 printf '%s' "$1" | LC_ALL=C.UTF-8 grep -qP '[\x{2800}-\x{28FF}]'
 }
 
-# Dialog = the footer of an ask-the-user widget on the visible screen. ONLY
-# strings Claude Code itself renders in a dialog's footer: a prose marker
-# ("Do you want to ...") also matches a seat's own last reply and would block
-# every send to it. An open permission prompt or question is otherwise caught
-# by the session record status `waiting`. Add a TUI's own footer text here when
-# it shows one, rather than teaching a caller to know. Bottom 15 rows only: a
-# dialog that was answered stays in the scrollback in full, and that must not count.
-DIALOG_MARKERS='Enter select|Esc cancel|↑/↓ move|✎ note|Enter to select|Esc to cancel|↑/↓ to navigate'
+# Dialog = a permission prompt, a question or a stuck turn waiting on the human.
+# The verdict is lib/typing-proof.mjs's: the session record status `waiting` or
+# `blocked`, or a dialog FOOTER string in the bottom rows of the screen (the one
+# marker list lives in that module; prose such as "Do you want to ..." also
+# matches a seat's own last reply and would block every send to it). The same
+# module proves a queued send's target idle with an empty composer, so the two
+# questions cannot drift apart.
+TYPING_PROOF="${KITTY_SEND_TYPING_PROOF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/typing-proof.mjs}"
+# run_proof <window id> <idle|dialog>: sets PROOF_RC (0 proven/clear, 2 refused,
+# 3 a dialog is open, anything else = the proof could not run) and PROOF_REASON.
+# `idle` also gets the message text on stdin. Node or the module missing is
+# PROOF_RC=127: callers refuse, they never fall back to typing unproven.
+# KITTY_SEND_TYPING_PROOF is a test seam (a path to a stand-in or a missing
+# file); production never sets it.
+PROOF_RC=0; PROOF_REASON=""
+run_proof() {
+  PROOF_RC=0; PROOF_REASON=""
+  if ! command -v node >/dev/null 2>&1 || [ ! -f "$TYPING_PROOF" ]; then
+    PROOF_RC=127; PROOF_REASON="the typing proof ($TYPING_PROOF, run by node) is not available"
+    return 0
+  fi
+  if [ "$2" = idle ]; then
+    PROOF_REASON=$(printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$1" --mode idle --stdin 2>&1 >/dev/null) || PROOF_RC=$?
+  else
+    PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode dialog 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
+  fi
+}
 # 0 = dialog on screen, 1 = none, 2 = the screen could not be read. A failed
 # read is NOT "no dialog": failing open here would type into exactly the
 # widget this check exists to protect, so the callers treat 2 as fatal.
 dialog_open() {
-  local screen
-  screen=$(kitty @ get-text --match "id:$1" --extent screen 2>/dev/null) || return 2
-  printf '%s' "$screen" | tail -15 | grep -qE -- "$DIALOG_MARKERS"
+  run_proof "$1" dialog
+  case "$PROOF_RC" in
+    0) return 1 ;;
+    3) return 0 ;;
+    *) return 2 ;;
+  esac
 }
 # --idle-when: does the bottom of the screen say this target is waiting rather
-# than working? Same window as DIALOG_MARKERS and for the same reason — an
+# than working? Same bottom rows as the dialog check and for the same reason — an
 # earlier turn's output must not count. 0 = matches (treat as idle), 1 = no
 # match or no pattern given, 2 = the screen could not be read. Unlike the dialog
 # check this one may fail CLOSED without harm: an unreadable screen just leaves
@@ -382,7 +410,7 @@ dialog_or_die() {
   dialog_open "$1" || rc=$?
   case "$rc" in
     0|1) return "$rc" ;;
-    *) die "could not read window $1's screen (nothing was sent) — look at the window first" 11 ;;
+    *) die "could not check window $1 for a dialog (nothing was sent): ${PROOF_REASON:-the screen could not be read} — look at the window first" 11 ;;
   esac
 }
 
@@ -618,7 +646,7 @@ if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
 fi
 
 if dialog_or_die "$WID"; then
-  note "window $WID is showing a selection dialog (${DIALOG_MARKERS//|/ / })."
+  note "window $WID is showing a selection dialog (${PROOF_REASON})."
   note "Keystrokes sent now are hotkeys in that dialog, and the \\r selects the highlighted option."
   die "refusing to type into a dialog (nothing was sent) — answer it in the window, or pass --wait-idle N" 4
 fi
@@ -861,11 +889,38 @@ fi
 # submits on that first \r. A short message submits either way. `send-key
 # enter` submits nothing, so press_enter is not used for this.
 CLAUDE_ENTERS=0
-# From here the keystrokes are out. Any command that fails after this point
-# exits 3 ("sent, delivery not proven"): under set -e it would exit 1, which
-# agent-send reads as "nothing was sent" and re-queues, delivering twice.
-set -E
-trap 'exit 3' ERR
+# THE CHOKEPOINT. The proof runs here, immediately before the first keystroke,
+# in every mode, so no path to a keystroke skips it: not --queue's waiter, not
+# agent-send's --wait-idle on its withdraw path, not a gap between the last
+# idle poll and this line. A mode that CLAIMS the seat is idle (--queue,
+# --wait-idle, --deadline, the detached waiter) gets the full proof: Claude Code
+# tab, record status idle, no dialog, an empty composer, and a text that does not
+# start with "/". Every other mode (--now, a bare send, --idle-when, whose
+# caller states its own parked proof) gets the dialog verdict only: a busy
+# mid-turn seat stays allowed there and the composer is not read. A dialog is
+# refused in EVERY mode (exit 4); no proof, or no node, refuses exit 11.
+proof_mode=dialog
+if { [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; } && [ -z "$IDLE_WHEN" ]; then proof_mode=idle; fi
+run_proof "$WID" "$proof_mode"
+case "$PROOF_RC" in
+  0) ;;
+  3) die "refusing to type into a dialog (nothing was sent): ${PROOF_REASON} — answer it in the window" 4 ;;
+  *) die "the typing proof did not pass (nothing was sent): ${PROOF_REASON:-exit $PROOF_RC}" 11 ;;
+esac
+# From here the keystrokes are out. SENT=1 plus the EXIT trap is the one
+# mechanism that keeps the promise of the exit codes: any exit that is not one
+# this section chooses (0, 3, 8, 10) becomes 3, "sent, delivery not proven". A
+# command that fails under set -e (or an unset variable, or a signal) would
+# otherwise exit 1, which agent-send reads as "nothing was sent" and re-queues,
+# delivering twice.
+SENT=1
+on_exit() {
+  local rc=$?
+  if [ "${SENT:-0}" = 1 ]; then
+    case "$rc" in 0|3|8|10) ;; *) exit 3 ;; esac
+  fi
+}
+trap on_exit EXIT
 if [ "$CLAUDE_TAB" = 1 ] && [ "$SLASH_SEND" = 0 ]; then
   kitty @ send-text --match "id:$WID" "$TEXT" 2>/dev/null || true
   sleep 1
@@ -917,7 +972,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # (measured 2026-09-12: four /join sends reported "no new role:user row"
     # although each had run). Its proof is the screen changing since the snapshot.
     if [ "$SLASH_SEND" = 1 ]; then
-      slash_screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]' || true)
+      slash_screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]')
       if [ -n "$slash_screen" ] && [ "$slash_screen" != "$before_screen" ]; then
         confirmed=1; where="screen changed after the send (slash command: it writes no session row, so the screen is its proof; weaker than a session row)"; break
       fi
@@ -931,7 +986,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # proven": the keystrokes are out, so the exit must never be 1 or 11. The
   # pre-send read that guards the false green already ran above and fails closed.
   if [ "$STATE_KNOWN" = 0 ]; then
-  screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]' || true)
+  screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]')
   if printf '%s' "$screen" | grep -qF -- '[Pastedtext#'; then
   # An unsubmitted paste chip after the send means NOT DELIVERED, whatever
   # the fragment match below says: the trailing \r was swallowed into the

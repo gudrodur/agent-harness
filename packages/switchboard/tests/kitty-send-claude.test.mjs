@@ -67,6 +67,7 @@ before(async () => {
     `  @/ls) if [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
     '  @/send-text)',
     '    text="${@: -1}"',
+    '    : > "$state/sent"',
     '    if [ "$text" = $\'\\r\' ]; then',
     '      echo enter >> "$state/calls"',
     '      if [ -f "$state/eat" ]; then rm -f "$state/eat"',
@@ -82,12 +83,20 @@ before(async () => {
     '    fi',
     '    ;;',
     '  @/send-key) echo send-key >> "$state/calls" ;;',
-    "  @/get-text) printf '%s\\n' 'claude composer' ;;",
+    '  @/get-text)',
+    '    # screen: what the window shows; screen_late replaces it from the late_at-th read on',
+    '    n=$(( $(cat "$state/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$state/reads"',
+    '    if [ -f "$state/screen_late" ] && [ "$n" -ge "$(cat "$state/late_at")" ]; then cat "$state/screen_late"',
+    '    elif [ -f "$state/screen" ]; then cat "$state/screen"',
+    "    else printf '%s\\n' 'claude composer'; fi ;;",
     'esac',
     'exit 0',
     '',
   ].join('\n');
   await fs.writeFile(path.join(binDir, 'kitty'), stub, { mode: 0o755 });
+  // `date` that fails once KITTY_TEST_FAIL_DATE_AFTER names an existing file:
+  // a command failing after the keystrokes are out, with no `|| true` to hide it.
+  await fs.writeFile(path.join(binDir, 'date'), '#!/usr/bin/env bash\n[ -f "${KITTY_TEST_FAIL_DATE_AFTER:-/nonexistent}" ] && exit 1\nexec /usr/bin/date "$@"\n', { mode: 0o755 });
 });
 
 after(async () => {
@@ -95,7 +104,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat', 'title']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_late', 'late_at', 'reads', 'sent']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -106,7 +115,7 @@ const reset = async (mode, status = 'idle') => {
 
 const calls = async () => (await fs.readFile(path.join(stateDir, 'calls'), 'utf8').catch(() => '')).split('\n').filter(Boolean);
 
-const runScript = async (args) => {
+const runScript = async (args, extraEnv = {}) => {
   try {
     const r = await run(SCRIPT, args, {
       env: isolatedEnv({
@@ -114,6 +123,7 @@ const runScript = async (args) => {
         XDG_RUNTIME_DIR: stateDir,
         CLAUDE_CONFIG_DIR: claudeDir,
         KITTY_SEND_CLAUDE_ENTER_AFTER: '2',
+        ...extraEnv,
       }),
       timeout: 30_000,
     });
@@ -164,15 +174,19 @@ test('a Claude tab whose session status is busy is refused (exit 7), nothing sen
 });
 
 // `waiting` (a permission prompt, a question, a plan approval) and `blocked`
-// are not "at the prompt": a send must be refused like a busy turn, never
-// fall through to the title check, which reads an idle-looking mark.
+// are a DIALOG, not a busy turn: keystrokes are hotkeys in the widget and the
+// \r selects the highlighted option. Refused with exit 4 in every mode, --now
+// included (which does let a plain mid-turn seat through).
 for (const status of ['waiting', 'blocked']) {
-  test(`a Claude tab whose session status is ${status} is refused (exit 7), nothing sent`, async () => {
-    await reset('burst', status);
-    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4']);
-    assert.equal(r.code, 7, `${r.out}${r.err}`);
-    assert.deepEqual(await calls(), []);
-  });
+  for (const flags of [[], ['--now']]) {
+    test(`a Claude tab whose session status is ${status} is refused (exit 4) with ${flags.join(' ') || 'no mode flag'}, nothing sent`, async () => {
+      await reset('burst', status);
+      const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...flags]);
+      assert.equal(r.code, 4, `${r.out}${r.err}`);
+      assert.match(r.err, new RegExp(`session record status ${status}`));
+      assert.deepEqual(await calls(), []);
+    });
+  }
 }
 
 // `shell` is a finished turn with a background shell still running: the seat is
@@ -183,4 +197,107 @@ test('a Claude tab whose session status is shell is sendable even with a spinner
   const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '8']);
   assert.equal(r.code, 0, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), ['text']);
+});
+
+// ---- the chokepoint: the typing proof runs immediately before the first keystroke ----
+//
+// Every mode that claims the seat is idle (--wait-idle, --deadline, --queue and
+// its detached waiter) gets the full proof AT TYPING TIME, whoever called: a
+// stale early verdict, a gap between the last poll and this process, or a caller
+// that skipped its own check cannot reach a keystroke. The empty composer is the
+// shape read from live windows (top rule, `❯` + no-break space, bottom rule).
+const RULE = '─'.repeat(40);
+const EMPTY = ['● Done.', '', RULE, '❯\u00a0', RULE, '  ⏵⏵ bypass permissions on · 1 shell'].join('\n');
+const DRAFT = ['● Done.', '', RULE, '❯ half a thought', RULE, '  ? for shortcuts'].join('\n');
+const put = (name, text) => fs.writeFile(path.join(stateDir, name), text);
+
+test('--wait-idle types into an idle seat with an empty composer', async () => {
+  await reset('burst');
+  await put('screen', EMPTY);
+  const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '4', '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['text']);
+});
+
+for (const [name, screen] of [
+  ['a half-typed draft', DRAFT],
+  ['a draft written under a rule-shaped line', ['● Done.', RULE, '❯\u00a0', RULE, 'typed after a rule', RULE, '  ? for shortcuts'].join('\n')],
+  ['bash mode', ['● Done.', RULE, '! ls', RULE].join('\n')],
+]) {
+  test(`--wait-idle never types onto ${name}: exit 11, nothing sent`, async () => {
+    await reset('burst');
+    await put('screen', screen);
+    const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '4', '--timeout', '4']);
+    assert.equal(r.code, 11, `${r.out}${r.err}`);
+    assert.match(r.err, /typing proof did not pass \(nothing was sent\)/);
+    assert.deepEqual(await calls(), []);
+  });
+}
+
+test('--wait-idle refuses a text starting with "/" (it would run as a command), nothing sent', async () => {
+  await reset('burst');
+  await put('screen', EMPTY);
+  const r = await runScript(['--to', WID, '--text', '/compact now', '--wait-idle', '4', '--timeout', '4']);
+  assert.equal(r.code, 11, `${r.out}${r.err}`);
+  assert.match(r.err, /starts with "\/"/);
+  assert.deepEqual(await calls(), []);
+});
+
+test('--queue: the detached waiter proves at typing time too (exit 11 in its log, nothing sent)', async () => {
+  await reset('burst');
+  await put('screen', DRAFT);
+  const r = await runScript(['--to', WID, '--text', MSG, '--queue', '--timeout', '4']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  const log = path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
+  for (let i = 0; i < 60 && !/queued waiter exit rc=/.test(await fs.readFile(log, 'utf8').catch(() => '')); i++) await new Promise((res) => setTimeout(res, 200));
+  const text = await fs.readFile(log, 'utf8');
+  assert.match(text, /queued waiter exit rc=11/, text);
+  assert.match(text, /composer holds text/);
+  assert.deepEqual(await calls(), []);
+});
+
+test('the proof is read at typing time: a draft that appears after the idle poll is not typed over', async () => {
+  // The screen reads in order: the wait loop's dialog check (1), the pre-send
+  // dialog check (2), the chokepoint (3). The draft shows from the third read on,
+  // so only a proof run at the chokepoint can see it.
+  await reset('burst');
+  await put('screen', EMPTY);
+  await put('screen_late', DRAFT);
+  await put('late_at', '3');
+  const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '4', '--timeout', '4']);
+  assert.equal(r.code, 11, `${r.out}${r.err}`);
+  assert.match(r.err, /composer holds text/);
+  assert.deepEqual(await calls(), []);
+});
+
+test('--now needs no empty-composer proof: it types onto a seat with a draft (documented in exit-codes.md)', async () => {
+  await reset('burst');
+  await put('screen', DRAFT);
+  const r = await runScript(['--to', WID, '--text', MSG, '--now', '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['text']);
+});
+
+test('a missing typing proof (node or the module) refuses: exit 11 for an idle-claiming send and a plain one, nothing sent', async () => {
+  for (const args of [['--wait-idle', '4'], []]) {
+    await reset('burst');
+    await put('screen', EMPTY);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...args], { KITTY_SEND_TYPING_PROOF: '/nonexistent/typing-proof.mjs' });
+    assert.equal(r.code, 11, `${args}: ${r.out}${r.err}`);
+    assert.match(r.err, /typing proof .* is not available/);
+    assert.deepEqual(await calls(), []);
+  }
+});
+
+// ---- after the keystrokes are out, only 0, 3, 8 and 10 are possible exits ----
+//
+// A command that fails after the send would exit 1 under set -e, which
+// agent-send reads as "nothing was sent" and re-queues: a double delivery. The
+// stub `date` fails once the send-text stub has recorded a send.
+test('a command failing after the send exits 3, never 1', async () => {
+  await reset('burst');
+  await put('screen', EMPTY);
+  const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4'], { KITTY_TEST_FAIL_DATE_AFTER: path.join(stateDir, 'sent') });
+  assert.deepEqual(await calls(), ['text'], 'the keystrokes did go out');
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
 });

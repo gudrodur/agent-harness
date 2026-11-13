@@ -483,12 +483,11 @@ const main = (argv) => {
     if (priority === 'idle') args.push('--idle-when', idleWhen);
     if (priority === 'queue') {
       // The withdraw path runs under --queue when --deadline ran out or the
-      // recipient window showed idle with the row undrained. Without --deadline
-      // kitty-send waits a few seconds for idle and no dialog; the proof found the
-      // window idle moments ago, so it normally types at once, and a window that
-      // went busy again gets the row back in the mailbox (exit 5, re-queued).
-      // Long waits are not allowed here: the proof is not re-run while kitty-send
-      // waits, so a long wait would type up to that long after it was taken.
+      // recipient window showed idle with the row undrained. kitty-send runs the
+      // typing proof (lib/typing-proof.mjs) immediately before its first
+      // keystroke in every --wait-idle run, so a window that went busy, grew a
+      // draft or opened a dialog since the early verdict gets nothing typed
+      // (exit 5 or 11, and the row goes back in the mailbox).
       if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : String(TYPE_AFTER_PROOF_WAIT_S));
       else args.push('--queue');
     }
@@ -565,7 +564,7 @@ const main = (argv) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     if (priority === 'queue') {
-      const refusal = /^\d+$/.test(String(t)) ? typingVerdict(t) : 'the target is not a window id, so its screen cannot be proven';
+      const refusal = /^\d+$/.test(String(t)) ? typingVerdict(t, { text }) : 'the target is not a window id, so its screen cannot be proven';
       if (refusal != null) {
         process.stderr.write(`agent-send: ${why}; not typed into ${t}: ${refusal}\n`);
         if (queueKey == null) die(`nothing was sent and nothing is queued for ${t}: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
@@ -653,6 +652,7 @@ const main = (argv) => {
   // later, and the row goes the withdraw-and-type way below, under kitty-send
   // --wait-idle, but only after typingVerdict proved the seat idle with an empty
   // composer (anything less leaves the row queued). --deadline still caps the whole wait.
+  let heldWhy = null;
   const waitQueued = () => {
     const rwin = recipient.windowId ?? recipient.beaconWindowId ?? null;
     const capS = Number(process.env.AGENT_SEND_IDLE_WAIT_S ?? 5);
@@ -660,6 +660,7 @@ const main = (argv) => {
     const endMs = deadlineMs == null ? null : Date.now() + deadlineMs;
     let idleSince = null;
     let lastWhy = null;
+    heldWhy = null;
     for (;;) {
       const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin, { text }) : 'recipient window not idle';
       if (rwin != null && why == null) {
@@ -679,7 +680,15 @@ const main = (argv) => {
       const left = endMs == null ? QUEUE_POLL_MS : endMs - Date.now();
       const untilIdleCap = idleSince == null ? QUEUE_POLL_MS : idleSince + capMs - Date.now();
       if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(QUEUE_POLL_MS, left, untilIdleCap)) })) return true;
-      if (endMs != null && Date.now() >= endMs) return false;
+      if (endMs != null && Date.now() >= endMs) {
+        // The deadline ran out. A window whose title says idle but whose proof
+        // is refused (a draft in the composer, a dialog) would be typed into by
+        // the withdraw path's kitty-send --wait-idle at once; that is the
+        // early verdict: hold the row instead. kitty-send re-proves at typing
+        // time either way, so this never decides to TYPE, only to NOT withdraw.
+        if (rwin != null && why !== 'recipient window not idle' && why != null) heldWhy = why;
+        return false;
+      }
     }
   };
   const ok = priority === 'queue' ? waitQueued() : waitForAck({ key: recipient.key, id: row.id, deadlineMs });
@@ -694,6 +703,13 @@ const main = (argv) => {
   if (!readUnacked(recipient.key, {}).some((r) => r.id === row.id)) {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox} (after the wait limit)\n`);
     process.exit(0);
+  }
+  // --queue --deadline ran out against a seat that looks idle but is not
+  // provably safe to type into: the row stays queued, and nothing is withdrawn
+  // first in the hope that kitty-send refuses.
+  if (priority === 'queue' && heldWhy != null) {
+    process.stderr.write(`agent-send: --deadline ran out; not typed into ${to}: ${heldWhy}. Row ${row.id} stays queued in ${mbox} for the recipient's own drain (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`);
+    process.exit(3);
   }
   // Still pending. Find the window BEFORE withdrawing: a mailbox
   // key whose beacon recorded no window id (a tab before its consumer

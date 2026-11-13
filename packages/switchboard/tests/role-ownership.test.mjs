@@ -143,7 +143,7 @@ test('a send to an idle seat says so, types to wake it, and keeps kitty-send exi
 
 // --queue to a seat idle past the presence window goes through the same typing
 // proof as every other queued send: a half-typed draft is never appended to.
-const idleQueueSend = (screenText, status = 'idle') => {
+const idleQueueSend = (screenText, status = 'idle', text = 'queued for an idle seat') => {
   const sessDir = path.join(tmp, 'idle-queue-sessions');
   fs.mkdirSync(sessDir, { recursive: true });
   fs.writeFileSync(path.join(sessDir, '4343.json'), JSON.stringify({ sessionId: 'idle-1', cwd: '/r/idle', status }));
@@ -157,7 +157,7 @@ const idleQueueSend = (screenText, status = 'idle') => {
     '',
   ].join('\n'), { mode: 0o755 });
   fs.rmSync(argvFile, { force: true });
-  const r = send(['--to', '410', '--queue', '--text', 'queued for an idle seat'], { AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir });
+  const r = send(['--to', '410', '--queue', '--text', text], { AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir });
   return { r, typed: fs.existsSync(argvFile) ? fs.readFileSync(argvFile, 'utf-8').split('\n') : null };
 };
 const IDLE_KEY = recipientKey({ cwd: '/r/idle', sessionId: 'idle-1' });
@@ -173,6 +173,14 @@ test('--queue to a seat idle past 20 minutes is never typed over a multi-line dr
   const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n  second line\n────────\n');
   assert.equal(typed, null, r.stderr);
   assert.match(r.stderr, /composer holds text/);
+});
+test('--queue "/compact now" to a seat idle past 20 minutes is queued for the seat, never typed as a command', () => {
+  const before = readUnacked(IDLE_KEY, {}).length;
+  const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'idle', '/compact now');
+  assert.equal(typed, null, `kitty-send must not run: ${r.stderr}`);
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /not typed.*starts with "\//);
+  assert.equal(readUnacked(IDLE_KEY, {}).length, before + 1, 'the row stays queued for the seat');
 });
 test('--queue to a seat idle past 20 minutes is refused when its record is not idle', () => {
   const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'waiting');
