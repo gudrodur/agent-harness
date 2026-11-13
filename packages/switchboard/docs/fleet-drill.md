@@ -20,6 +20,12 @@ A state passes on an ack row with a `deliveredAs` value; when `agent-send` exite
 
 The seat is started with a short confining brief: one action per message, and never approve a permission itself. The `busy` setup approves only a prompt whose screen shows its own `sleep` command; the `permission` state approves nothing. The seat window is always closed at the end, on a pass, a failure or a signal.
 
+The seat starts with the drill's private store pinned (`AGENT_SWITCHBOARD_DIR` and `AGENT_SWITCHBOARD_DB`): `claude-tab.sh` passes any such pin on to the seat with kitty's `--env`, because kitty starts the tab from its own environment, not the launcher's.
+
+The first turn of the seat reads its brief, and that turn counts against `FLEET_DRILL_READY_S` (180 s by default, ample for a haiku greeting; raise it on a slow machine).
+
+The `merge` state needs the seat's tools (`git`, `gh`, a push) pre-allowed in its Claude Code settings; the drill approves nothing there, so an unapproved tool call leaves it waiting until the limit and the state fails.
+
 The seat needs the mailbox hooks in its Claude Code config, and the throwaway folder must be one Claude Code trusts (`FLEET_DRILL_CWD_ROOT` points it at a folder under a trusted tree).
 
 ## States

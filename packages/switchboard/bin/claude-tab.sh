@@ -352,6 +352,11 @@ case "${KITTY_WINDOW_ID:-}" in
   ""|*[!0-9]*) ;;
   *) ENV_ARGS+=(--env "AGENT_DISPATCHED_BY=$KITTY_WINDOW_ID") ;;
 esac
+# kitty starts the tab from its OWN environment, not this script's: a store pin
+# here (a test drive or a drill with a private store) must be passed on, or the
+# seat's hooks write to whatever store kitty itself was started with.
+[ -n "${AGENT_SWITCHBOARD_DIR:-}" ] && ENV_ARGS+=(--env "AGENT_SWITCHBOARD_DIR=$AGENT_SWITCHBOARD_DIR")
+[ -n "${AGENT_SWITCHBOARD_DB:-}" ] && ENV_ARGS+=(--env "AGENT_SWITCHBOARD_DB=$AGENT_SWITCHBOARD_DB")
 WID=$(kitty @ launch --type=tab --tab-title "$TITLE" --cwd "$CWD" "${ENV_ARGS[@]}" "${ARGS[@]}" 2>/dev/null)
 case "$WID" in *[!0-9]*|"") die "kitty @ launch did not return a plain window id, got: '$WID'" ;; esac
 WPID=$(win_pid "$WID")

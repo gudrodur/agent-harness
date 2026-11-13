@@ -128,8 +128,13 @@ if (wanted.includes('merge') && !(SANDBOX && MERGE_CMD)) usage('the merge state 
 const states = STATES.filter((s) => wanted.includes(s));
 
 // Children see the injected store dir; the ambient store pin would win over it.
-const childEnv = { ...process.env, AGENT_SWITCHBOARD_DIR: process.env.FLEET_DRILL_STORE_DIR };
-delete childEnv.AGENT_SWITCHBOARD_DB;
+// Both pins, because the db pin outranks the dir. claude-tab.sh passes them on
+// to the seat with kitty's --env, since kitty starts the tab from its own env.
+const childEnv = {
+  ...process.env,
+  AGENT_SWITCHBOARD_DIR: process.env.FLEET_DRILL_STORE_DIR,
+  AGENT_SWITCHBOARD_DB: path.join(process.env.FLEET_DRILL_STORE_DIR, 'state.db'),
+};
 fs.mkdirSync(childEnv.AGENT_SWITCHBOARD_DIR, { recursive: true });
 const run = (cmd, args, { timeoutS = 120, input } = {}) =>
   spawnSync(cmd, args, { env: childEnv, encoding: 'utf8', timeout: timeoutS * 1000, input });
@@ -162,9 +167,14 @@ const ensureKitty = async () => {
   return Boolean(await waitFor(() => run(B.kitty, ['@', 'ls'], { timeoutS: 5 }).status === 0, 30));
 };
 
+// tab-state prints JSON for a window it can read, and the plain line
+// `window N state=gone ...` (exit 1) for one that is gone, even under --json.
+// Anything else is a crash, never "gone".
 const seatState = () => {
   const r = run(B.tabState, [String(wid), '--json'], { timeoutS: 20 });
-  try { return JSON.parse(r.stdout); } catch { return { state: 'gone' }; }
+  try { return JSON.parse(r.stdout); } catch { /* not JSON */ }
+  if (r.status === 1 && /\bstate=gone\b/.test(r.stdout ?? '')) return { state: 'gone' };
+  return { state: 'error', reason: `tab-state exit ${r.status}: ${(r.stderr || r.stdout || '').trim().split('\n').pop()}` };
 };
 const isIdle = () => seatState().state === 'idle';
 const isWaiting = () => { const s = seatState(); return s.state === 'unknown' && /waiting/.test(s.reason ?? ''); };
@@ -200,8 +210,11 @@ const startSeat = async () => {
 // claude-tab --close refuses a --seat window (no launcher state row), so the
 // window is closed through kitty itself.
 const closeSeat = () => {
-  if (wid != null) run(B.kitty, ['@', 'close-window', '--match', `id:${wid}`], { timeoutS: 30 });
+  if (wid == null) return true;
+  const r = run(B.kitty, ['@', 'close-window', '--match', `id:${wid}`], { timeoutS: 30 });
+  if (r.status !== 0) note(`kitty close-window for window ${wid} exited ${r.status}: the seat may still be open`);
   wid = null;
+  return r.status === 0;
 };
 
 // ---- the store -----------------------------------------------------------
@@ -344,7 +357,7 @@ const transcriptHasToolResult = (file, marker) => {
 // ---- main ----------------------------------------------------------------
 const results = [];
 const cleanup = () => {
-  if (wid != null) closeSeat();
+  if (!closeSeat() && !process.exitCode) process.exitCode = 1;
   if (headless) headless.kill();
   if (cwd) fs.rmSync(cwd, { recursive: true, force: true });
 };

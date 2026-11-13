@@ -54,6 +54,7 @@ if (role === 'claude-tab') {
     save({ ...seat(), open: false });
     process.exit(0);
   }
+  writeJson('launch-env.json', { dir: process.env.AGENT_SWITCHBOARD_DIR, db: process.env.AGENT_SWITCHBOARD_DB });
   needValue('--title', '--model', '--cwd', '--brief');
   if (args.includes('--brief') && !fs.existsSync(flag('--brief'))) process.exit(1);
   fs.writeFileSync(transcript, '');
@@ -63,6 +64,7 @@ if (role === 'claude-tab') {
   if (args[0] === '@' && args[1] === 'ls') console.log('[]');
   if (args[0] === '@' && args[1] === 'close-window') {
     needValue('--match');
+    if (process.env.STUB_CLOSE_FAIL) process.exit(3);
     save({ ...seat(), open: false });
   }
   if (args[0] === '@' && args[1] === 'get-text') {
@@ -78,8 +80,13 @@ if (role === 'claude-tab') {
   }
 } else if (role === 'tab-state') {
   const s = seat();
+  if (process.env.STUB_TABSTATE_GARBAGE && !s.open) {
+    process.stderr.write('tab-state: boom\n');
+    process.exit(2);
+  }
   if (!s.open) {
-    console.log(JSON.stringify({ window: WID, state: 'gone', reason: 'no-such-window' }));
+    // The real tab-state prints this plain line even under --json.
+    console.log(`window ${WID} state=gone reason=no-such-window`);
     process.exit(1);
   }
   const waiting = s.status === 'waiting';

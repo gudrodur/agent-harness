@@ -484,6 +484,22 @@ test('the launcher\'s numeric KITTY_WINDOW_ID goes in as AGENT_DISPATCHED_BY, fo
   assert.match(args, /^AGENT_DISPATCHED_BY=4$/m);
 });
 
+test('a store pin in the launcher env goes in with --env, so a seat started through an ambient kitty uses the same store', async () => {
+  await session('claude-opus-5-5');
+  const r = await tab(full(), { AGENT_SWITCHBOARD_DIR: '/tmp/drill-store', AGENT_SWITCHBOARD_DB: '/tmp/drill-store/state.db' });
+  assert.equal(r.code, 0, r.err);
+  const args = await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8');
+  assert.match(args, /^--env\nAGENT_SWITCHBOARD_DIR=\/tmp\/drill-store$/m);
+  assert.match(args, /^--env\nAGENT_SWITCHBOARD_DB=\/tmp\/drill-store\/state.db$/m);
+});
+
+test('no dir pin in the launcher env: none passed', async () => {
+  await session('claude-opus-5-5');
+  const r = await tab(full());
+  assert.equal(r.code, 0, r.err);
+  assert.doesNotMatch(await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8'), /AGENT_SWITCHBOARD_DIR/);
+});
+
 test('no AGENT_DISPATCHED_BY when the launcher has no numeric KITTY_WINDOW_ID', async () => {
   await session('claude-opus-5-5');
   const r = await tab(full(), { KITTY_WINDOW_ID: 'x1' });

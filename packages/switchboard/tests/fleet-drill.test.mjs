@@ -181,3 +181,22 @@ test('closed requires the missing-window message, not any exit 1', () => {
   assert.equal(r.status, 1);
   assert.match(r.byState.closed.reason, /no kitty window/);
 });
+
+test('the seat is launched with the drill\'s private store, both dir and db', () => {
+  const r = drill(['--states', 'idle']);
+  const env = JSON.parse(fs.readFileSync(path.join(r.state, 'launch-env.json'), 'utf8'));
+  assert.equal(env.dir, path.join(r.state, 'store'));
+  assert.equal(env.db, path.join(r.state, 'store', 'state.db'));
+});
+
+test('an unparsable tab-state is an error, never a closed window', () => {
+  const r = drill(['--states', 'closed'], { extra: { STUB_TABSTATE_GARBAGE: '1' } });
+  assert.notEqual(r.status, 0);
+  assert.equal(r.byState.closed?.ok ?? false, false);
+});
+
+test('a failed close-window is reported and fails the run', () => {
+  const r = drill(['--states', 'idle'], { extra: { STUB_CLOSE_FAIL: '1' } });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /close-window/);
+});
