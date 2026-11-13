@@ -381,6 +381,49 @@ test('a fallback refused at a dirty composer (exit 9) puts the message back in t
   assert.equal(left[0].text, 'dirty composer steer');
 });
 
+// kitty remote control timing out is the one failure the built-in peer channel
+// covers: the row stays queued (exit 3) and stderr tells a Claude Code session
+// to SendMessage the seat by its session name and to withdraw the queued row.
+// The stubs: kitty-send exits 1 and, like a hung socket, leaves `kitty @ ls`
+// failing from then on (a flag file the stub kitty checks).
+const rcDownEnv = ({ kittySendExit, sessionName }) => {
+  const down = path.join(binDir, 'rc-down.flag');
+  fs.rmSync(down, { force: true });
+  const sessDir = path.join(binDir, 'rcdown-sessions');
+  fs.rmSync(sessDir, { recursive: true, force: true });
+  fs.mkdirSync(sessDir);
+  if (sessionName != null) fs.writeFileSync(path.join(sessDir, '4242.json'), JSON.stringify({ pid: 4242, sessionId: 's1', name: sessionName }));
+  const kitty = path.join(binDir, 'kitty-rcdown');
+  fs.writeFileSync(kitty, ['#!/usr/bin/env bash', `if [ -e ${JSON.stringify(down)} ]; then sleep 0.1; exit 1; fi`, `exec ${JSON.stringify(kittyStub)} "$@"`, ''].join('\n'), { mode: 0o755 });
+  const send = path.join(binDir, 'kitty-send-rcdown.sh');
+  fs.writeFileSync(send, ['#!/usr/bin/env bash', `: > ${JSON.stringify(down)}`, `exit ${kittySendExit}`, ''].join('\n'), { mode: 0o755 });
+  return childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_KITTY: kitty, AGENT_SEND_KITTY_SEND: send, CLAUDE_SESSIONS_DIR: sessDir });
+};
+
+test('kitty remote control down: the row stays queued and stderr names the SendMessage target and the cancel', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--text', 'steer while kitty is down', '--deadline', '1'],
+    rcDownEnv({ kittySendExit: 1, sessionName: 'reviewer · example · docs' }),
+  );
+  assert.equal(code, 3, stderr);
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1, 'the row stays queued');
+  assert.match(stderr, /SendMessage\(\{to: "reviewer · example · docs", message: /);
+  assert.match(stderr, new RegExp(`--cancel --id ${left[0].id}`));
+  assert.match(stderr, /ListAgents/);
+});
+
+test('kitty-send exit 1 while kitty answers is a plain failure: no SendMessage hint', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const env = rcDownEnv({ kittySendExit: 1, sessionName: 'reviewer · x' });
+  const send = path.join(binDir, 'kitty-send-plain1.sh');
+  fs.writeFileSync(send, '#!/usr/bin/env bash\nexit 1\n', { mode: 0o755 });
+  const { code, stderr } = await runSend(['--to', '991001', '--text', 'usage failure', '--deadline', '1'], { ...env, AGENT_SEND_KITTY_SEND: send });
+  assert.equal(code, 3, stderr);
+  assert.doesNotMatch(stderr, /SendMessage/);
+});
+
 // the exit code is the delivery verdict. On the withdraw
 // path kitty-send must run SYNCHRONOUSLY (--wait-idle, never --queue, whose
 // detached waiter returns 0 at once), so a wait that runs out (exit 5) is seen

@@ -306,6 +306,44 @@ const displacedSeat = (sessionId, liveBeacon) => {
 const claudeSessionsDir = () =>
   process.env.CLAUDE_SESSIONS_DIR || path.join(process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'), 'sessions');
 
+// The session name Claude Code shows to peers (the /rename title ListAgents
+// lists), read from the per-process session record, which needs no kitty.
+const peerSessionName = (sessionId) => {
+  if (sessionId == null) return null;
+  try {
+    const dir = claudeSessionsDir();
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^\d+\.json$/.test(f)) continue;
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8'));
+        if (rec.sessionId === sessionId && typeof rec.name === 'string' && rec.name !== '') return rec.name;
+      } catch { /* an unreadable record is not the one */ }
+    }
+  } catch { /* no sessions dir */ }
+  return null;
+};
+
+// True when kitty remote control does not answer (a timeout or a dead
+// socket): the one case where Claude Code's built-in peer channel is the way
+// to reach a seat. Probed here, because kitty-send's exit 1 also covers plain
+// usage errors.
+const kittyRemoteControlDown = () => {
+  try {
+    execFileSync(process.env.AGENT_MAILBOX_KITTY ?? 'kitty', ['@', 'ls'], { stdio: 'ignore', timeout: 5000 });
+    return false;
+  } catch { return true; }
+};
+
+// One stderr line for the calling Claude Code session: deliver through the
+// built-in channel (ListAgents names the peers, SendMessage delivers), and
+// withdraw the queued mailbox row so the text does not arrive twice.
+const peerChannelHint = ({ sessionId, queuedId }) => {
+  const name = peerSessionName(sessionId);
+  const to = name != null ? JSON.stringify(name) : '"<the name ListAgents shows for the recipient>"';
+  const cancel = queuedId != null ? `, then withdraw the queued row with --cancel --id ${queuedId} so it does not arrive twice` : '';
+  process.stderr.write(`agent-send: kitty remote control is not answering (timed out or unreachable); if you are a Claude Code session, deliver this message with the built-in channel instead: SendMessage({to: ${to}, message: <the same text>}) (ListAgents lists the peers by name)${cancel}\n`);
+};
+
 const senderWindowId = () => {
   const raw = process.env.KITTY_WINDOW_ID;
   if (raw == null || raw === '') return null;
@@ -623,11 +661,12 @@ const main = (argv) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
-    const requeueForSeat = (reason) => {
+    const requeueForSeat = (reason, kittyStatus = null) => {
       if (queueKey == null) return false;
       const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
       const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
       process.stderr.write(`agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
+      if (kittyStatus === 1 && kittyRemoteControlDown()) peerChannelHint({ sessionId: recipient?.sessionId, queuedId: qrow.id });
       process.exit(3);
     };
     const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
@@ -656,10 +695,11 @@ const main = (argv) => {
     const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
     if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
-      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`);
+      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st);
       process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
       process.exit(st === 11 ? 1 : st);
     }
+    if (st === 1 && kittyRemoteControlDown()) peerChannelHint({ sessionId: recipient?.sessionId, queuedId: null });
     // kitty-send's 11 (nothing sent) is not agent-send's 11 (--claim-role refused).
     process.exit(st === 11 ? 1 : (st ?? 1));
   };
@@ -841,6 +881,7 @@ const main = (argv) => {
   if (KITTY_SENT_NOTHING.has(status)) {
     const again = appendMessage({ to: recipient.key, from, priority, text, topic });
     process.stderr.write(`agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`);
+    if (status === 1 && kittyRemoteControlDown()) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);
   }
   if (status === 3 || status === 10) {
