@@ -1658,7 +1658,7 @@ test('--queue --text "/compact now" through the kitty fallback is never typed', 
 // A store of its own, and presence in that store: AGENT_SWITCHBOARD_DB wins
 // over the file pins above, in this process and in the child.
 const handoverEnv = (db, extra = {}) => childEnv({ AGENT_SWITCHBOARD_DB: db, CLAUDE_SESSIONS_DIR: path.join(binDir, 'claude-sessions'), ...extra });
-// The session record of the claude process in window 991002 (pid 112): the
+// The session record of the claude process in the fake kitty window (pid 112): the
 // proof that the window still holds the displaced session.
 const sessionRecord = (sessionId) => {
   fs.mkdirSync(path.join(binDir, 'claude-sessions'), { recursive: true });
