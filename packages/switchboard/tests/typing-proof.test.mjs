@@ -68,6 +68,42 @@ test('status shell (background tasks still running) with an empty composer is pr
   assert.equal(verdict({ status: 'shell' }).kind, PROVEN);
 });
 
+// Claude Code embeds the session's custom title in the composer's top rule, so
+// every named seat showed `───── example seat title ─` there. The proof read it
+// as "no prompt line under a top rule" and a --queue send waited forever.
+const LABELLED_RULE = `${'─'.repeat(40)} example seat title ─`;
+
+test('a composer whose top rule carries the session title is proven', () => {
+  const screen = ['● Done.', LABELLED_RULE, '❯\u00a0', RULE, '  ⏵⏵ bypass permissions on · 1 shell'].join('\n');
+  const v = verdict({ screen });
+  assert.equal(v.kind, PROVEN, JSON.stringify(v));
+});
+
+// A narrow split gives the rule fewer leading characters, and a long title is
+// cut off at the edge: no trailing rule characters at all.
+test('a narrow top rule whose long title runs to the edge is proven', () => {
+  const screen = ['● Done.', `${'─'.repeat(4)} a very long example seat title that is cut off at the ed…`, '❯\u00a0', RULE, '  ? for shortcuts'].join('\n');
+  const v = verdict({ screen });
+  assert.equal(v.kind, PROVEN, JSON.stringify(v));
+});
+
+test('a labelled top rule with no trailing rule characters is proven', () => {
+  const screen = ['● Done.', `${'─'.repeat(40)} example seat title`, '❯\u00a0', RULE, '  ? for shortcuts'].join('\n');
+  assert.equal(verdict({ screen }).kind, PROVEN);
+});
+
+test('a labelled top rule with text in the composer is still refused', () => {
+  const screen = ['● Done.', LABELLED_RULE, '❯ a draft', RULE, '  ? for shortcuts'].join('\n');
+  const v = verdict({ screen });
+  assert.equal(v.kind, REFUSED, JSON.stringify(v));
+  assert.match(v.reason, /composer holds text/);
+});
+
+test('a label on the bottom rule does not make a box: it stays strict', () => {
+  const screen = ['● Done.', RULE, '❯ ', LABELLED_RULE, '  ? for shortcuts'].join('\n');
+  assert.match(verdict({ screen }).reason, /no composer box/);
+});
+
 test('a narrow window with an empty composer is proven', () => {
   const screen = ['● Done.', NARROW_RULE, '❯ ', NARROW_RULE, '  ? for shortcuts'].join('\n');
   assert.equal(verdict({ screen }).kind, PROVEN);
