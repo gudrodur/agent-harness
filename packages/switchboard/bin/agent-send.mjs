@@ -74,7 +74,7 @@ import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
-import { typingVerdict, proofVerdict, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
+import { typingVerdict, proofVerdict, titleShowsBusy, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
 
 // A pipe takes stdout asynchronously, so process.exit() straight after a
 // large write drops what the pipe has not yet accepted (64 KiB cut). An empty
@@ -174,7 +174,8 @@ const usage = () => `Usage:
     0   delivered: acked in the mailbox, or kitty-send proved the text landed
     3   pending, do not resend: queued in the mailbox for the consumer (a
         Claude Code seat drains it at its next tool call, its next prompt
-        or when its current turn ends),
+        or when its current turn ends; a window showing the busy marker is
+        never typed into, whatever the mode, so its row stays queued),
         re-queued after kitty-send sent nothing, a kitty --queue waiter
         started (its verdict lands in the queue log), or kitty-send sent it
         and could not prove it
@@ -595,7 +596,15 @@ const main = (argv) => {
   // "not idle": callers then keep the cautious (busy) behaviour.
   const windowIsIdle = (winId) => {
     const rec = flattenWindows(kittyLs()).find((w) => w.id === Number(winId));
-    return rec != null && !/[\u2800-\u28FF\u25D0-\u25D3]/.test(rec.title ?? '');
+    return rec != null && !titleShowsBusy(rec.title);
+  };
+  // The opposite is NOT "not idle": busy means the window was read and its title
+  // carries the busy marker. An unreadable window is neither, and a caller that
+  // must never type only acts on a positive busy reading.
+  const windowIsBusy = (winId) => {
+    if (!/^\d+$/.test(String(winId))) return false;
+    const rec = flattenWindows(kittyLs()).find((w) => w.id === Number(winId));
+    return rec != null && titleShowsBusy(rec.title);
   };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
@@ -706,6 +715,11 @@ const main = (argv) => {
       process.exit(3);
     };
     const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
+    // A typed fallback never lands on a busy seat: typing mid-turn discards the
+    // tool result in flight. The busy marker is read from the window now, and a
+    // busy seat gets the row in its mailbox, where its tool-boundary drain
+    // picks it up (exit 3), whatever the send mode (--now and --stop included).
+    if (queueKey != null && windowIsBusy(t)) requeueForSeat(`recipient window ${t} is busy, not typed`);
     if (priority === 'queue') {
       const v = /^\d+$/.test(String(t)) ? proofVerdict(t, { mode: 'idle', text }) : { kind: REFUSED, reason: 'the target is not a window id, so its screen cannot be proven' };
       if (v.kind !== PROVEN) {
@@ -906,6 +920,15 @@ const main = (argv) => {
       if (rcDown()) peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
       process.exit(3);
     }
+  }
+  // The ack wait is over and the row is still unacked. A recipient window that
+  // still shows the busy marker is never typed into, whatever the send mode:
+  // the text would land in the middle of a turn and discard the tool result in
+  // flight. The row stays queued for the tool-boundary drain.
+  if (windowIsBusy(target)) {
+    process.stderr.write(`agent-send: queued, recipient busy for ${row.id} in ${mbox}; window ${target} shows the busy marker, so nothing is typed and the row stays queued for the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`);
+    if (rcDown()) peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
+    process.exit(3);
   }
   // Withdraw, then deliver over kitty. The withdraw is one O_APPEND write
   // (atomic against a concurrent drain), so a late drain cannot deliver the

@@ -52,6 +52,13 @@ const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
 
+// The ONE busy marker: a braille spinner (U+2800-28FF) or Claude Code's
+// half-circle spinner (U+25D0-25D3) in the window title means a turn is in
+// progress. Idle shows no spinner. bin/agent-send.mjs reuses this for its own
+// idle and busy checks, so the definition lives only here.
+export const BUSY_TITLE_RE = /[\u2800-\u28FF\u25D0-\u25D3]/;
+export const titleShowsBusy = (title) => BUSY_TITLE_RE.test(title ?? '');
+
 export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
@@ -84,7 +91,7 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   if (lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l))) return verdict(DIALOG, 'a dialog is open on the screen');
   if (dialogOnly) return verdict(PROVEN);
 
-  if (/[⠀-⣿◐-◓]/.test(win.title ?? '')) return verdict(REFUSED, 'title shows a turn in progress');
+  if (titleShowsBusy(win.title)) return verdict(REFUSED, 'title shows a turn in progress');
   if (proc == null) return verdict(REFUSED, 'not a Claude Code tab, whose composer cannot be read reliably');
   if (record == null) return verdict(REFUSED, 'no session record');
   if (!QUEUE_IDLE_STATUSES.has(record.status)) return verdict(REFUSED, `session record status ${record.status ?? 'missing'}, not idle`);
