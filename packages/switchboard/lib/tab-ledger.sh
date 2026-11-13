@@ -15,6 +15,8 @@
 #                                                release a gone window's brief claims
 #   tab_ledger_close <id>                        --close: close only a window this ledger
 #                                                recorded, refusing a stranger or a reused id
+#   tab_ledger_close_finished <id>               --close --after-loka: close a window this ledger never
+#                                                launched, once its seat has recorded "loka done" and is idle
 #   tab_ledger_retire <id> <taker-session>       --retire: close the window a takeover displaced,
 #                                                on the strength of a handover row (below)
 #
@@ -167,7 +169,7 @@ tab_ledger_close() {
   [ -n "$row" ] \
     || die "window $id was not launched by this script — refusing to close it.
         Another session's agent window looks identical in \`kitty @ ls\`;
-        closing it interrupts work you cannot see."
+        closing it interrupts work you cannot see.${CLOSE_HINT:-}"
 
   want_pid=$(printf '%s' "$row" | awk '{print $2}')
   now_pid=$(win_pid "$id")
@@ -279,6 +281,58 @@ tab_ledger_retire() {
     die "close-window FAILED for $id — the window may still be open; go look"
   fi
   node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1 || note "could not mark handover $hid retired"
+  sed -i "/^$id /d" "$STATE" 2>/dev/null
+  claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+  return 0
+}
+
+# --close <id> --after-loka. Closes a window THIS ledger never launched, on the
+# evidence that its seat finished: the session in the window sent a "loka done"
+# message after it started (bin/seat-finished.mjs), and it is idle now. The
+# evidence is read from the store and the window, never from the seat's words
+# to the caller. Exit codes (docs/exit-codes.md):
+#   22  the id is the caller's own window
+#   23  the seat is not idle (busy, or its state cannot be proven)
+#   24  no finished proof: no Claude Code session in the window, or it has sent
+#       no "loka done" message since it started
+# 1 is a usage or store error and 2 is no kitty remote control. A window that is
+# already gone is not a refusal: its claims are released and the exit is 0.
+tab_ledger_close_finished() {
+  local id="${1:-}" bin verdict ls now_pid rec sid started st
+  bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+  [ -n "$id" ] || die "--close needs a window id"
+  case "$id" in *[!0-9]*|"") die "--close takes a numeric window id, got: $id" ;; esac
+  [ "$id" != "${KITTY_WINDOW_ID:-}" ] \
+    || die "window $id is this session's own window — refusing to close it." 22
+  kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
+  ls=$(kitty @ ls 2>/dev/null) && [ -n "$ls" ] && printf '%s' "$ls" | jq -e 'type == "array"' >/dev/null 2>&1 \
+    || die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
+  now_pid=$(printf '%s' "$ls" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
+  if [ -z "$now_pid" ]; then
+    sed -i "/^$id /d" "$STATE" 2>/dev/null
+    claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+    note "window $id was already gone — nothing to close (claims released)"
+    return 0
+  fi
+  . "$bin/../lib/claude-session.sh"
+  rec=$(claude_session_json "$id" "$ls") \
+    || die "window $id runs no Claude Code session, so nothing shows that its seat finished. Refusing." 24
+  sid=$(printf '%s' "$rec" | jq -r '.sessionId // empty')
+  started=$(printf '%s' "$rec" | jq -r '.startedAt // 0')
+  verdict=$(node "$bin/seat-finished.mjs" check "$sid" "$started") \
+    || die "could not read the switchboard store — nothing closed"
+  [ "$(printf '%s' "$verdict" | jq -r .finished)" = true ] \
+    || die "window $id (session $sid) has sent no \"loka done\" message since it started, so it is not shown to be finished. Refusing.
+        The seat runs /compact-session and /loka and reports \"loka done\"; close it when that row exists." 24
+  st=$("$bin/tab-state.sh" "$id" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
+  [ "$st" = "state=idle" ] \
+    || die "window $id is not idle (${st:-state=unknown}) — the seat is still working after its \"loka done\"; retry when it is idle." 23
+
+  if kitty @ close-window --match "id:$id" 2>/dev/null; then
+    note "closed finished window $id (session $sid reported loka done)"
+  else
+    die "close-window FAILED for $id — the window may still be open; go look"
+  fi
   sed -i "/^$id /d" "$STATE" 2>/dev/null
   claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
   return 0

@@ -780,3 +780,85 @@ test('seat-handover verify counts only the handover for the asked role', async (
   const out = await run('node', [HANDOVER, 'verify', 'lead', String(OTHER_WID), NEW_SESSION], { env: isolatedEnv({ AGENT_SWITCHBOARD_DB: dbFile() }) });
   assert.deepEqual(JSON.parse(out.stdout), { claimed: true, retired: false });
 });
+
+// --close <id> --after-loka: closing a finished seat this launcher never started.
+//
+// The proof is the seat's own end-of-work report: a message row whose sender
+// key ends in the session id of the window's claude process and whose text says
+// "loka done", written after that session started, plus an idle session.
+const ledgerFile = () => path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid);
+const lokaDone = (over = {}) => withStore((db) => {
+  const row = {
+    id: `m-${Math.random()}`, ts: new Date(Date.now() - 10_000).toISOString(), from: `-x__${OLD_SESSION}`,
+    to: 'role:lead', priority: 'now', text: 'loka done', ...over,
+  };
+  db.run('INSERT INTO mailbox_rows (recipient_key, kind, msg_id, ts, row_json) VALUES (?, ?, ?, ?, ?)', 'role-lead', 'message', row.id, row.ts, JSON.stringify(row));
+});
+const closeFinished = (id = OTHER_WID, env = {}) => tab(['--close', String(id), '--after-loka'], { KITTY_WINDOW_ID: String(WID), ...env });
+
+test('--help documents --after-loka', async () => {
+  const r = await tab(['--help']);
+  assert.match(r.out, /--close <window-id> \[--after-loka\]/);
+});
+
+test('--close --after-loka closes an idle seat this script did not launch once its loka done is recorded', async () => {
+  await windows();
+  await lokaDone();
+  const r = await closeFinished();
+  assert.equal(r.code, 0, r.err);
+  assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
+});
+
+test('--close --after-loka refuses a busy seat with exit 23 even with a loka done on record', async () => {
+  await windows({ status: 'busy' });
+  await lokaDone();
+  const r = await closeFinished();
+  assert.equal(r.code, 23);
+  assert.match(r.err, /not idle/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses a seat with no loka done on record, naming what is missing (exit 24)', async () => {
+  await windows();
+  let r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /no "loka done" message/);
+  assert.equal(await exists('closed'), false);
+  // A loka done from another session, or one older than this session, is not proof.
+  await lokaDone({ from: '-x__someone-else' });
+  await lokaDone({ ts: new Date(Date.now() - 3_600_000).toISOString() });
+  r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses the caller\'s own window (22) and a window with no Claude Code session (24)', async () => {
+  await windows();
+  await lokaDone();
+  let r = await closeFinished(WID);
+  assert.equal(r.code, 22);
+  await fs.rm(sessionsDir(), { recursive: true, force: true });
+  await windows({ status: null });
+  r = await closeFinished();
+  assert.equal(r.code, 24);
+  assert.match(r.err, /no Claude Code session/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('plain --close of a window this script did not launch still refuses, and points at --after-loka', async () => {
+  await windows();
+  await lokaDone();
+  const r = await tab(['--close', String(OTHER_WID)]);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /was not launched by this script/);
+  assert.match(r.err, /--after-loka/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('plain --close of a launched window is unchanged: closes it and drops its ledger row', async () => {
+  await fs.writeFile(ledgerFile(), `${OTHER_WID} ${other.pid} @claude-tab claude: test\n`);
+  const r = await tab(['--close', String(OTHER_WID)]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
+  assert.doesNotMatch(await fs.readFile(ledgerFile(), 'utf8'), new RegExp(`^${OTHER_WID} `, 'm'));
+});

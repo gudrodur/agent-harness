@@ -49,4 +49,14 @@ Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote 
 | 22 | The id is the caller's own window. Nothing closed. |
 | 23 | The displaced seat is not idle (busy, or its state cannot be proven). Nothing closed; retry when it is idle. |
 
+## claude-tab.sh --close --after-loka
+
+`--close <window-id> --after-loka` closes a window the launcher did not start, once its seat is shown to be finished: the Claude Code session in the window sent a message saying "loka done" after it started (read from the store by `bin/seat-finished.mjs`), and it is idle. Plain `--close` still refuses such a window. Codes 0, 1 and 2 are as above (a window already gone exits 0 with its claims released).
+
+| Code | Meaning |
+|---|---|
+| 22 | The id is the caller's own window. Nothing closed. |
+| 23 | The seat is not idle (busy, or its state cannot be proven). Nothing closed; retry when it is idle. |
+| 24 | No finished proof: the window runs no Claude Code session, or its session has sent no "loka done" message since it started. The message names which. |
+
 `--seat --role R --reseat <window-id>` exits 3 when the new seat started but the store does not show both halves within 90 seconds: the role claimed by the new session, and the handover retired. The message names the missing half.
