@@ -163,7 +163,7 @@ Retention, enforced by `pruneStale`: acked or cancelled rows are deleted 14 days
 ## Limits, plainly
 
 - Same machine only. The store is files on disk and the fallback types into a local window; nothing here crosses a network boundary.
-- Kitty remote control must be on for the fallback and the launcher. Without it the launcher exits 2, which tells the caller to fall back to headless and say so, and the sender leaves the row queued with exit 3.
+- Kitty remote control must be on for the fallback and the launcher. Without it the launcher exits 2, which tells the caller to fall back to headless and say so, and the sender falls back: where the recipient has a mailbox key the row stays queued (exit 3, id on the line); a window target with no mailbox key queues nothing and exits 1. Either way one stderr line tells a calling Claude Code session to deliver with `ListAgents` plus `SendMessage({to: "<session name>", message})` and, if a row is queued, to withdraw it with `--cancel --id <id>`.
 - Mailbox-only mode works anywhere node runs: set `AGENT_SWITCHBOARD_DIR`, wire one hook, and `agent-send.mjs --queue` never needs a terminal.
 - A message between host-agent sessions in different permission modes waits for the human's approval, and that hold is visible only to the human. Silence is not delivery: a held message is invisible to the receiving agent.
 - Anything injected into a joined session leaves the machine — a guest sees the host's whole history, including what the machine injected into it. Never share a session link beyond the people who may read that history.

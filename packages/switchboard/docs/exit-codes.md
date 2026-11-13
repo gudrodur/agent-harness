@@ -12,14 +12,15 @@
 | 13 | `--cancel`: the row was already delivered or withdrawn. |
 | 14 | `--cancel`: no such row. |
 | 15 | `--topic`: the topic was already delivered to the recipient within `--topic-window`; this message was suppressed and nothing was sent (`--force-topic` sends anyway). |
-| other | `bin/kitty-send.sh`'s code, below. |
+| other | `bin/kitty-send.sh`'s code, below, except its 11 and 12, which agent-send reports as 1 because its own 11 and 12 mean a refused role claim or release. |
 
 ## kitty-send.sh
 
 | Code | Meaning |
 |---|---|
 | 0 | Sent and proven (a new user row in the tab's session record). Under `--queue` it means only that the background waiter started; the verdict lands in the queue log. |
-| 1 | Usage or precondition error (no kitty remote control, no such window). |
+| 1 | Usage or precondition error (no such window, a refused flag pair). |
+| 12 | Kitty remote control unavailable (`kitty @ ls` timed out or the socket is unreachable): nothing sent. agent-send reports it as 1, keeps any queued row, and prints one stderr line telling the calling Claude Code session to deliver with `ListAgents` plus `SendMessage` and to `--cancel --id <id>` the row. |
 | 3 | Sent, but could not prove it landed: do not resend. Any failure after the keystrokes went out (a screen read, say) also exits 3, never 1 or 11. |
 | 4 | The target shows a selection dialog, or its session record status is `waiting` or `blocked`: nothing sent, in every mode (`--now` included); under `--wait-idle`, `--deadline` or `--queue` the wait loop keeps waiting for it to clear and exits 5 if it does not. |
 | 5 | `--wait-idle` or `--deadline` ran out before the target went idle: nothing sent. |

@@ -22,7 +22,10 @@
 #      Claude Code tab a new user row carrying the text in its transcript, or
 #      for an OpenCode tab a new type:user row in its opencode.db session
 #      (the only proofs that name the tab receiving the text)
-#   1  usage / precondition error (no kitty remote control, no such window)
+#   1  usage / precondition error (no such window, a refused flag pair)
+#   12 kitty remote control did not answer (a timeout or an unreachable
+#      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
+#      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
 #   3  sent, but could not prove it landed (nothing is retried for you).
 #      The window WAS typed into: never re-queue or resend blind.
 #   4  the target is showing a selection dialog, or its session record says
@@ -452,7 +455,7 @@ case "${1:-}" in
 esac
 
 if [ "${1:-}" = "--list" ]; then
-  kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 1
+  kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 12
   printf '%-6s %s\n' "ID" "TITLE"
   win_table | while IFS=$'\t' read -r id wtitle ttitle; do
     printf '%-6s %s\n' "$id" "${ttitle:-$wtitle}"
@@ -502,7 +505,7 @@ if [ "$NOW" = 1 ]; then
   [ "$WAIT_IDLE" = 0 ] || die "--now and --wait-idle/--deadline are mutually exclusive (one sends into a busy target, the other waits for it)"
 fi
 
-kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 1
+kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 12
 
 if [ -n "$FILE" ]; then
   case "$FILE" in /*) : ;; *) die "--file must be an absolute path: a relative one resolves against the TARGET's cwd, not yours" ;; esac
