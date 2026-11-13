@@ -44,6 +44,7 @@
 // lib/agent-mailbox.mjs apply.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -96,9 +97,11 @@ const usage = () => `Usage:
   --stop        priority stop: interrupts the consumer's current run
   --idle-when   priority idle (REGEX is the consumer's parked proof)
   --queue       priority queue: deliver without interrupting the recipient's turn.
-                A recipient whose window is idle when you send, or goes idle
-                later without taking the row, gets it typed in once it has
-                been idle AGENT_SEND_IDLE_WAIT_S (default 5 s); exit 0. A
+                A recipient proven idle (Claude Code tab, session status idle,
+                no dialog, empty prompt line) when you send, or later, gets
+                it typed in once it has been idle AGENT_SEND_IDLE_WAIT_S
+                (default 5 s); exit 0. Without that proof nothing is typed
+                and one line says why. A
                 recipient mid-turn keeps the row queued and takes it at its
                 next tool call or when the turn ends. So --queue is safe to
                 send to an idle seat. The wait is unbounded unless --deadline
@@ -457,6 +460,46 @@ const main = (argv) => {
       return rec != null && !/[\u2800-\u28FF\u25D0-\u25D3]/.test(rec.title ?? '');
     } catch { return false; }
   };
+  // Fail-closed proof for typing a queued row into a window: null when the
+  // seat is PROVEN idle with an empty composer, else a short reason. Anything
+  // short of proof, including "could not tell", is a reason, so the row stays
+  // queued for the seat's own drain.
+  //   - a Claude Code tab only: the composer of any other kind of tab cannot be
+  //     read reliably from its screen, so those are never typed into;
+  //   - the session record status must be on the idle whitelist (`waiting` is a
+  //     permission prompt or question, `blocked` a stuck turn, and an unknown
+  //     or missing status proves nothing);
+  //   - the screen must be readable and carry no dialog;
+  //   - the prompt line (the last line starting with the prompt mark) must be
+  //     empty. A fresh session's placeholder hint reads as text: not typed.
+  const QUEUE_IDLE_STATUSES = new Set(['idle']);
+  const DIALOG_RE = /Enter to select|Esc to cancel|to navigate|Do you want to|Would you like to proceed|Ready to code\?|Enter select|↑\/↓ move|✎ note/;
+  const typingVerdict = (winId) => {
+    const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
+    let win;
+    try {
+      const ls = execFileSync(kitty, ['@', 'ls'], { encoding: 'utf-8', timeout: 5000 });
+      win = JSON.parse(ls).flatMap((t) => (t.tabs ?? []).flatMap((tab) => tab.windows ?? [])).find((w) => w.id === Number(winId));
+    } catch { return 'window list could not be read'; }
+    if (win == null) return 'window not found';
+    if (/[\u2800-\u28FF\u25D0-\u25D3]/.test(win.title ?? '')) return 'title shows a turn in progress';
+    const proc = (win.foreground_processes ?? []).find((p) => /(^|\/)claude$/.test(p.cmdline?.[0] ?? ''));
+    if (proc == null) return 'not a Claude Code tab, whose composer cannot be read reliably';
+    const sessionsDir = process.env.KITTY_SEND_CLAUDE_SESSIONS_DIR ?? process.env.CLAUDE_SESSIONS_DIR
+      ?? path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'sessions');
+    let record;
+    try { record = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${proc.pid}.json`), 'utf-8')); } catch { return 'no session record'; }
+    if (!QUEUE_IDLE_STATUSES.has(record?.status)) return `session record status ${record?.status ?? 'missing'}, not idle`;
+    let screen;
+    try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return 'screen could not be read'; }
+    const lines = screen.split('\n').map((l) => l.trimEnd());
+    // Bottom rows only: an answered dialog stays in the scrollback in full.
+    if (lines.slice(-15).some((l) => DIALOG_RE.test(l))) return 'a dialog is open on the screen';
+    const at = lines.findLastIndex((l) => /^\s*[❯>](\s|$)/.test(l));
+    if (at < 0) return 'no prompt line on the screen';
+    if (lines[at].replace(/^\s*[❯>]/, '').trim() !== '') return 'composer holds text';
+    return null;
+  };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
   // function prints no verdict of its own for those codes (one line, not two).
@@ -622,22 +665,31 @@ const main = (argv) => {
   // AGENT_SEND_IDLE_WAIT_S on end (default 5 s, so the Stop drain of a turn
   // that just ended acks first) ends the wait, whether idle at send time or
   // later, and the row goes the withdraw-and-type way below, under kitty-send
-  // --wait-idle, which types only into an idle window with no dialog and no
-  // unsubmitted composer text. --deadline still caps the whole wait.
+  // --wait-idle, but only after typingVerdict proved the seat idle with an empty
+  // composer (anything less leaves the row queued). --deadline still caps the whole wait.
   const waitQueued = () => {
     const rwin = recipient.windowId ?? recipient.beaconWindowId ?? null;
     const capS = Number(process.env.AGENT_SEND_IDLE_WAIT_S ?? 5);
     const capMs = (Number.isFinite(capS) && capS >= 0 ? capS : 5) * 1000;
     const endMs = deadlineMs == null ? null : Date.now() + deadlineMs;
     let idleSince = null;
+    let lastWhy = null;
     for (;;) {
-      if (rwin != null && windowIsIdle(rwin)) {
+      const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin) : 'recipient window not idle';
+      if (rwin != null && why == null) {
         idleSince ??= Date.now();
         if (Date.now() - idleSince >= capMs) {
           process.stderr.write(`agent-send: idle recipient ${to}: queued row ${row.id} not drained after ${capMs / 1000}s idle, typing it into window ${rwin}\n`);
           return false;
         }
-      } else idleSince = null;
+      } else {
+        idleSince = null;
+        // Said once per distinct reason; a busy window needs no line.
+        if (why !== 'recipient window not idle' && why !== lastWhy) {
+          process.stderr.write(`agent-send: not typed into window ${rwin}: ${why}; row ${row.id} stays queued for the recipient's own drain\n`);
+        }
+        lastWhy = why;
+      }
       const left = endMs == null ? QUEUE_POLL_MS : endMs - Date.now();
       const untilIdleCap = idleSince == null ? QUEUE_POLL_MS : idleSince + capMs - Date.now();
       if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(QUEUE_POLL_MS, left, untilIdleCap)) })) return true;

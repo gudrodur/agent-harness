@@ -233,6 +233,20 @@ test('a dialog still wins over --idle-when: it is the human\'s to answer', async
   assert.match(err, /refusing to type into a dialog/);
 });
 
+// The footers and questions Claude Code shows today: a send must not type into
+// any of them, whatever the session record says.
+for (const [name, screen] of [
+  ['a question dialog footer', 'Which one?\n  Enter to select · ↑/↓ to navigate · Esc to cancel'],
+  ['a permission prompt', ' Do you want to proceed?\n ❯ 1. Yes\n   2. No'],
+  ['a plan approval', ' Would you like to proceed?\n ❯ 1. Yes, and auto-accept edits'],
+]) {
+  test(`${name} is a dialog: refused with exit 4`, async () => {
+    const { code, err } = await runScript(['--to', WID, '--text', 'hi', '--idle-when', 'Bíð eftir næsta'], { KITTY_MOCK_SCREEN: `Bíð eftir næsta\n${screen}` });
+    assert.equal(code, 4);
+    assert.match(err, /refusing to type into a dialog/);
+  });
+}
+
 test('--queue forwards --idle-when to its detached waiter', async () => {
   const { code } = await runScript(
     ['--to', WID, '--text', 'hi', '--queue', '--deadline', '4', '--idle-when', 'Bíð eftir næsta'],

@@ -1337,25 +1337,41 @@ test('an idle recipient is unchanged by the budget: no --timeout forwarded', asy
 // --queue to a seat with a mailbox consumer. A Claude Code seat drains only at
 // its next tool call, its next prompt or its Stop, so an IDLE seat never acks a
 // queued row: the sender used to wait for that ack forever while the row sat in
-// the mailbox (one seat missed three messages for about 35 minutes). Now an
-// idle recipient window gets the row typed in through kitty-send --wait-idle
-// (sent only to an idle window with no dialog), and a busy one keeps the row
-// queued for its own drain. The kitty stub reads the window title from a file
-// the test rewrites, so a recipient can go idle mid-wait.
-const queueSend = (args, { title, envExtra = {}, killAfterMs = 20_000, whileRunning = null } = {}) => {
+// the mailbox (one seat missed three messages for about 35 minutes). Now a
+// recipient PROVEN idle gets the row typed in through kitty-send --wait-idle,
+// and anything else keeps the row queued for its own drain. Proof is all of: a
+// title with no spinner, a session record whose status is `idle`, a readable
+// screen with no dialog on it, and a Claude composer showing an empty prompt
+// line. The kitty stub reads the window title and screen from files the test
+// rewrites, so a recipient can go idle mid-wait; a missing screen file is an
+// unreadable screen.
+const EMPTY_COMPOSER = ['● Done.', '', '─'.repeat(40), '❯ ', '─'.repeat(40), '  ? for shortcuts'].join('\n');
+const QUEUE_WIN_PID = 424242;
+const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null } = {}) => {
   const titleFile = path.join(binDir, 'queue-title');
+  const screenFile = path.join(binDir, 'queue-screen');
+  const sessDir = path.join(binDir, 'queue-claude-sessions');
   const titleKitty = path.join(binDir, 'kitty-queue-title-stub');
   fs.writeFileSync(titleFile, title);
+  fs.rmSync(screenFile, { force: true });
+  if (screen != null) fs.writeFileSync(screenFile, screen);
+  fs.rmSync(sessDir, { recursive: true, force: true });
+  fs.mkdirSync(sessDir);
+  if (status != null) fs.writeFileSync(path.join(sessDir, `${QUEUE_WIN_PID}.json`), JSON.stringify({ sessionId: 'q1', cwd: '/repo/a', status }));
   fs.writeFileSync(titleKitty, [
     '#!/usr/bin/env bash',
-    `node -e 'process.stdout.write(JSON.stringify([{tabs:[{windows:[{id:991001,title:require("fs").readFileSync(process.argv[1],"utf-8"),cwd:"/repo/a"}]}]}]))' ${JSON.stringify(titleFile)}`,
+    'if [ "$2" = "get-text" ]; then',
+    `  cat ${JSON.stringify(screenFile)} 2>/dev/null || exit 1`,
+    '  exit 0',
+    'fi',
+    `node -e 'process.stdout.write(JSON.stringify([{tabs:[{windows:[{id:991001,title:require("fs").readFileSync(process.argv[1],"utf-8"),cwd:"/repo/a",foreground_processes:[{pid:${QUEUE_WIN_PID},cmdline:["claude"]}]}]}]}]))' ${JSON.stringify(titleFile)}`,
     '',
   ].join('\n'), { mode: 0o755 });
   fs.rmSync(fallbackArgv, { force: true });
   fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
   let side = null;
   const env = childEnv({
-    CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_KITTY: titleKitty, AGENT_SEND_KITTY_SEND: realRulesStub, AGENT_SEND_IDLE_WAIT_S: '0', ...envExtra,
+    CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_KITTY: titleKitty, AGENT_SEND_KITTY_SEND: realRulesStub, AGENT_SEND_IDLE_WAIT_S: '0', CLAUDE_SESSIONS_DIR: sessDir, ...envExtra,
   });
   const run = new Promise((resolve) => {
     const child = spawn('node', [SEND, ...args, '--text', 'queued for an idle seat'], { env });
@@ -1449,3 +1465,28 @@ test('--queue --deadline still bounds the wait for a busy recipient', async () =
   assert.equal(argv[argv.indexOf('--wait-idle') + 1], '1', `argv: ${argv}`);
   assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 're-queued for the drain');
 });
+
+// Fail closed: text is typed only on positive proof that the seat is idle AND
+// its composer is empty. Every case below leaves the row queued, sends no
+// keystroke (the fake sender never runs) and says on one stderr line why.
+const PERMISSION_DIALOG = ['● Bash(rm -rf build)', '', ' Do you want to proceed?', ' ❯ 1. Yes', '   2. No', '', ' Esc to cancel'].join('\n');
+const QUESTION_DIALOG = ['Which database should we use?', ' ❯ 1. Postgres', '   2. SQLite', '', 'Enter to select · ↑/↓ to navigate · Esc to cancel'].join('\n');
+const PLAN_DIALOG = ['Ready to code?', ' Here is Claude\'s plan:', ' Would you like to proceed?', ' ❯ 1. Yes, and auto-accept edits', '   2. No, keep planning', '', ' ctrl-g to edit plan · Esc to cancel'].join('\n');
+const notTyped = async (why, opts, reason) => {
+  const { killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: '✳ claude: idle seat', killAfterMs: 2500, ...opts });
+  assert.equal(killed, true, `${why}: the sender must keep waiting, not type or exit: ${stderr}`);
+  assert.equal(argv, null, `${why}: no keystroke may be sent: ${argv}`);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, `${why}: the row stays queued`);
+  assert.equal(typedRows().length, 0, why);
+  assert.match(stderr, reason, `${why}: one line says why nothing was typed: ${stderr}`);
+};
+test('--queue never types into a seat whose record status is waiting', () => notTyped('waiting', { status: 'waiting' }, /not typed.*status waiting/));
+test('--queue never types into a seat whose record status is blocked', () => notTyped('blocked', { status: 'blocked' }, /not typed.*status blocked/));
+test('--queue never types into a seat whose record status is unknown', () => notTyped('unknown status', { status: 'thinking' }, /not typed.*status thinking/));
+test('--queue never types into a seat with no session record', () => notTyped('no record', { status: null }, /not typed.*no session record/));
+test('--queue never types over a permission prompt', () => notTyped('permission', { screen: PERMISSION_DIALOG }, /not typed.*dialog/));
+test('--queue never types over a question dialog', () => notTyped('question', { screen: QUESTION_DIALOG }, /not typed.*dialog/));
+test('--queue never types over a plan approval', () => notTyped('plan', { screen: PLAN_DIALOG }, /not typed.*dialog/));
+test('--queue never types when the screen cannot be read', () => notTyped('unreadable', { screen: null }, /not typed.*screen could not be read/));
+test('--queue never types onto a half-typed draft', () => notTyped('draft', { screen: ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n') }, /not typed.*composer holds text/));
+test('--queue never types when no prompt line is on screen', () => notTyped('no prompt', { screen: '● Done.\n' }, /not typed.*no prompt line/));

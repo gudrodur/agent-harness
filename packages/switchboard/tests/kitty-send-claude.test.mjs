@@ -162,3 +162,15 @@ test('a Claude tab whose session status is busy is refused (exit 7), nothing sen
   assert.equal(r.code, 7, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), []);
 });
+
+// `waiting` (a permission prompt, a question, a plan approval) and `blocked`
+// are not "at the prompt": a send must be refused like a busy turn, never
+// fall through to the title check, which reads an idle-looking mark.
+for (const status of ['waiting', 'blocked']) {
+  test(`a Claude tab whose session status is ${status} is refused (exit 7), nothing sent`, async () => {
+    await reset('burst', status);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4']);
+    assert.equal(r.code, 7, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), []);
+  });
+}

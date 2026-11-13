@@ -327,7 +327,7 @@ title_busy() {
 # The markers are today's; add a TUI's own footer text here when it shows
 # one, rather than teaching a caller to know. Bottom 15 rows only: a dialog
 # that was answered stays in the scrollback in full, and that must not count.
-DIALOG_MARKERS='Enter select|Esc cancel|↑/↓ move|✎ note'
+DIALOG_MARKERS='Enter select|Esc cancel|↑/↓ move|✎ note|Enter to select|Esc to cancel|to navigate|Do you want to|Would you like to proceed|Ready to code\?'
 # 0 = dialog on screen, 1 = none, 2 = the screen could not be read. A failed
 # read is NOT "no dialog": failing open here would type into exactly the
 # widget this check exists to protect, so the callers treat 2 as fatal.

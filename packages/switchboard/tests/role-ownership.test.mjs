@@ -228,8 +228,22 @@ test('--queue to a role whose live holder is idle is typed into the holder windo
   beacon('queue-holder', '/r/holder', { windowId: 420 });
   await withDb((db) => claimRole(db, { role: 'queue-role', sessionId: 'queue-holder', cwd: '/r/holder', windowId: 420 }));
   fs.rmSync(argvFile, { force: true });
+  // The holder's window must PROVE idle: a Claude process, a session record
+  // with status idle and a screen with an empty prompt line.
+  const sessDir = path.join(tmp, 'queue-sessions');
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.writeFileSync(path.join(sessDir, '4242.json'), JSON.stringify({ sessionId: 'queue-holder', cwd: '/r/holder', status: 'idle' }));
+  const screen = path.join(tmp, 'queue-screen');
+  fs.writeFileSync(screen, '● Done.\n\n────────\n❯ \n────────\n');
+  const proofKitty = path.join(tmp, 'kitty-proof');
+  fs.writeFileSync(proofKitty, [
+    '#!/usr/bin/env bash',
+    `if [ "$2" = "get-text" ]; then cat ${JSON.stringify(screen)}; exit 0; fi`,
+    `printf '%s' '[{"tabs":[{"windows":[{"id":420,"title":"holder","cwd":"/r/holder","foreground_processes":[{"pid":4242,"cmdline":["claude"]}]}]}]}]'`,
+    '',
+  ].join('\n'), { mode: 0o755 });
   const r = spawnSync('node', [SEND, '--to', 'role:queue-role', '--queue', '--text', 'queued for the role'], {
-    encoding: 'utf-8', env: childEnv({ AGENT_SEND_IDLE_WAIT_S: '0' }), timeout: 15_000,
+    encoding: 'utf-8', env: childEnv({ AGENT_SEND_IDLE_WAIT_S: '0', AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir }), timeout: 15_000,
   });
   assert.equal(r.signal, null, `the sender waited forever on an idle holder: ${r.stderr}`);
   assert.equal(r.status, 0, r.stderr);
