@@ -25,6 +25,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { PRESENCE_FILE, isIdleBeacon, isLiveBeacon, presenceRowToBeacon, switchboardDir } from './presence.mjs';
+import { kittyLs, kittyKnownDown } from './kitty-ls.mjs';
 import { defaultStorePath, withRetriedStore, pruneRetention } from './store.mjs';
 import {
   ROLE_PREFIX,
@@ -87,7 +88,6 @@ const withMailboxDb = (fn) =>
   );
 const dbReadRows = (store, key) =>
   store.all('SELECT row_json FROM mailbox_rows WHERE recipient_key = ? ORDER BY rowid', key).map((r) => JSON.parse(r.row_json));
- const kittyBin = () => process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
 
 // The session-id half of a mailbox key, sanitized the same way everywhere so
 // the suffix scan below matches what recipientKey builds. Every key ends in
@@ -172,13 +172,8 @@ export const readPresenceBeacons = ({ presenceFile: file, now = Date.now(), incl
 // .tabs[].windows[] only — tab ids and window ids share one number space
 // (see lib/tab-ledger.sh win_pid), so a whole-JSON grep would match a tab.
 export const kittyWindows = () => {
-  let parsed;
-  try {
-    const out = execFileSync(kittyBin(), ['@', 'ls'], { encoding: 'utf-8', timeout: 5000 });
-    parsed = JSON.parse(out);
-  } catch {
-    return [];
-  }
+  const parsed = kittyLs();
+  if (parsed == null) return [];
   const wins = [];
   for (const osEntry of parsed ?? []) {
     for (const tab of osEntry?.tabs ?? []) {
@@ -347,7 +342,7 @@ const resolveWindowRecipient = (beacons, win, sender, { presenceFile: file } = {
     const idle = aged.length > 0 ? idleBeacons({ presenceFile: file, wins: [win] }).filter((b) => aged.some((a) => a.sessionId === b.sessionId && a.cwd === b.cwd)) : [];
     if (idle.length > 0) {
       const b = idle[0];
-      throw Object.assign(resErr('mailbox-idle', `window ${win.id} is an idle seat (${idleMinutes(b)}m)`), { idleMinutes: idleMinutes(b), key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) });
+      throw Object.assign(resErr('mailbox-idle', `window ${win.id} is an idle seat (${idleMinutes(b)}m)`), { idleMinutes: idleMinutes(b), sessionId: b.sessionId ?? null, key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) });
     }
     if (aged.length > 0) {
       const tick = Date.parse(aged[0].lastTick);
@@ -415,6 +410,11 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
   }
 
   const wins = kittyWindows();
+  // An unreadable window list is not "no such window": say which, so the
+  // sender can reach for another channel instead of reporting a missing seat.
+  if (wins.length === 0 && kittyKnownDown()) {
+    throw resErr('kitty-unreachable', `kitty remote control is not answering, so window '${target}' cannot be looked up (a timeout or an unreachable socket)`);
+  }
   if (/^\d+$/.test(String(target))) {
     const win = wins.find((w) => w.id === Number(target));
     if (!win) throw new Error(`no kitty window with id ${target}${seatHint(beacons, wins, sender)}`);
