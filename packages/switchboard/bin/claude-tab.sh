@@ -13,7 +13,7 @@
 #   claude-tab.sh --resume <session-id> --title "claude: <name>" --model ...
 #                 [--rc [NAME]] [--brief /abs/brief.md]
 #   claude-tab.sh --seat --title ... --model ... --role NAME --reseat <window-id>
-#   claude-tab.sh --list | --close <window-id>       (lib/tab-ledger.sh, shared with opencode-tab.sh)
+#   claude-tab.sh --list | --close <window-id> [--after-loka]   (lib/tab-ledger.sh, shared with opencode-tab.sh)
 #   claude-tab.sh --retire <window-id> [--as <session-id>]
 #   claude-tab.sh --help | -h
 #
@@ -47,6 +47,16 @@
 #                `claude-tab.sh --retire ID`; the launcher then proves BOTH from
 #                the store (role held by the new session, handover retired) and
 #                exits 3 naming the missing half. Needs --role; implies --seat.
+#   --close ID --after-loka  close window ID, which this script did not launch, once
+#                its seat is shown to be finished: the session in the window sent ONE
+#                message whose whole text is "LOKA-DONE <its session id>" after it
+#                started (read from the store), holds no seat role, has no mail or
+#                prompt newer than that message, and is idle. The sender is
+#                self-asserted, so the marker can be forged. Refuses the caller's
+#                own window (exit 22), a busy seat (23), and a window with no
+#                Claude Code session, no marker, a role or later activity (24,
+#                naming which). Plain --close still refuses a window this script
+#                did not launch.
 #   --retire ID  close window ID, which this script did not launch, only for the
 #                session that took its role over: a handover row written by
 #                `agent-send --claim-role ... --take-over` must name ID and the
@@ -78,6 +88,13 @@
 #   21  the window's pid is not the one recorded: the id was reused
 #   22  the id is the caller's own window
 #   23  the displaced seat is not idle (busy, or its state cannot be proven)
+#
+# --close ID --after-loka exit codes (0 closed, or the window was already gone; 1 and 2 as above):
+#   22  the id is the caller's own window
+#   23  the seat is not idle (busy, or its state cannot be proven)
+#   24  no finished proof: no session, no LOKA-DONE marker, a seat role held, or
+#       activity after the marker
+#   25  the session holds a live resource lease, or waits in a resource queue
 # HELP-END
 #
 # The Claude Code sibling of opencode-tab.sh (2026-09-29). Like opencode, the
@@ -115,7 +132,13 @@ case "${1:-}" in
   # lib/tab-ledger.sh owns --list and --close, including the refusal of a
   # window no launcher recorded and the release of the window's brief claim.
   --list) tab_ledger_list; exit $? ;;
-  --close) tab_ledger_close "${2:-}"; exit $? ;;
+  --close)
+    case "${3:-}" in
+      "") CLOSE_HINT=$'\n        If its seat finished /loka and sent its LOKA-DONE marker, close it with --close <id> --after-loka.' tab_ledger_close "${2:-}"; exit $? ;;
+      --after-loka) [ $# -le 3 ] || die "--close <id> --after-loka takes no further argument, got: $4"
+                    tab_ledger_close_finished "${2:-}"; exit $? ;;
+      *) die "--close takes a window id and optionally --after-loka, got: $3" ;;
+    esac ;;
   --retire)
     RETIRE_AS="${CLAUDE_CODE_SESSION_ID:-}"
     case "${3:-}" in
