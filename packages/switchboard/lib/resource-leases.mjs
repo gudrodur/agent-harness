@@ -227,3 +227,16 @@ export const status = (db, { resource, now = Date.now(), isLive = null } = {}) =
     return { resource, lease: fmtLease(held, now), queue: fmtQueue(queueRows(db, resource)) };
   });
 };
+
+/** The live leases a session holds (not human holds), by the same expiry rule as status(). */
+export const heldBy = (db, { sessionId, now = Date.now(), isLive = null } = {}) =>
+  db.all("SELECT resource FROM resource_leases WHERE holder_session = ? AND mode != ?", String(sessionId), HUMAN)
+    .map((r) => status(db, { resource: r.resource, now, isLive }).lease)
+    .filter((l) => l && l.holder === String(sessionId));
+
+/** The resources a session is still waiting in line for, by the same staleness rule as status(). */
+export const waitingFor = (db, { sessionId, now = Date.now(), isLive = null } = {}) =>
+  db.all('SELECT resource FROM resource_queue WHERE session_id = ?', String(sessionId))
+    .map((r) => status(db, { resource: r.resource, now, isLive }))
+    .filter((st) => st.queue.some((w) => w.session === String(sessionId)))
+    .map((st) => st.resource);

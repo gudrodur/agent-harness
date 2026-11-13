@@ -27,7 +27,7 @@ import { envRoot } from "./engine/lib/config-root.mjs";
 
 export const DIST = "dist/live-values.mjs";
 const header = (root) => [
-  `// GENERATED from live-values@${JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version} - https://github.com/gudrodur/agent-harness (packages/live-values/engine/, by build.mjs).`,
+  `// GENERATED from live-values@${JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version} (built from engine/ by build.mjs).`,
   "// Do not edit this copy: change the source there, rebuild with `node build.mjs`, and copy dist/ again.",
   "// Every adopting repo carries it byte-identical at scripts/live-values.mjs;",
   "// a copy-identity check keeps it so. Usage and the marker grammar: node scripts/live-values.mjs --help.",

@@ -97,7 +97,7 @@ before(async () => {
     '#!/usr/bin/env bash',
     `err=$(PATH=${JSON.stringify(failKittyDir)}:"$PATH" bash ${JSON.stringify(REAL_KITTY_SEND)} "$@" 2>&1 >/dev/null)`,
     'rc=$?',
-    'if [ "$rc" = 1 ] && printf \'%s\' "$err" | grep -q "remote control unavailable"; then',
+    'if [ "$rc" = 12 ] && printf \'%s\' "$err" | grep -q "remote control unavailable"; then',
     `  printf '%s\\n' "$@" > ${JSON.stringify(fallbackArgv)}`,
     '  exit "${KITTY_SEND_STUB_EXIT:-0}"',
     'fi',
@@ -381,6 +381,255 @@ test('a fallback refused at a dirty composer (exit 9) puts the message back in t
   const left = readUnacked(KEY_S1, { dir: mboxDir });
   assert.equal(left.length, 1);
   assert.equal(left[0].text, 'dirty composer steer');
+});
+
+// ---- kitty remote control down: point a Claude Code caller at SendMessage ----
+//
+// kitty-send exits 12 when `kitty @ ls` does not answer. The row stays queued
+// where one exists, and one stderr line names the built-in channel (ListAgents
+// + SendMessage) and the --cancel of the queued row. Each hint site has its
+// own test; deleting any one of them turns a test red.
+const startOf = (pid) => { const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8'); return st.slice(st.lastIndexOf(')') + 2).split(' ')[19]; };
+// A Claude sessions dir: [{ sessionId, name, live }] -> one record each. A live
+// record names this test process (so /proc agrees with procStart); a dead one
+// carries a start time that process never had.
+const sessionsWith = (records) => {
+  const dir = path.join(binDir, `rc-sessions-${Math.random().toString(36).slice(2)}`);
+  fs.mkdirSync(dir);
+  records.forEach((r, i) => fs.writeFileSync(path.join(dir, `${7000 + i}.json`), JSON.stringify({
+    pid: process.pid, procStart: r.live === false ? '1' : startOf(process.pid), sessionId: r.sessionId, name: r.name,
+  })));
+  return dir;
+};
+const kittyStubOf = (name, body) => {
+  const f = path.join(binDir, name);
+  fs.writeFileSync(f, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
+  return f;
+};
+const DOWN_KITTY = () => kittyStubOf('kitty-down', 'exit 1');
+const NAMED = [{ sessionId: 's1', name: 'reviewer · example · docs' }];
+const hintRe = /SendMessage\(\{to: "reviewer · example · docs", message: <the same text>\}\) \(ListAgents lists the live sessions\)/;
+const withPresence = async (beacons, fn) => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try { writePresence(beacons); return await fn(); } finally { fs.writeFileSync(presFile, saved); }
+};
+const rcDownSend = (args, extra = {}) => runSend(args, childEnv({ CLAUDE_CODE_SESSION_ID: 's2', CLAUDE_SESSIONS_DIR: sessionsWith(NAMED), ...extra }));
+
+test('busy-path re-queue: kitty-send exit 12 keeps the row queued and prints the SendMessage hint with the cancel id', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await rcDownSend(['--to', '991001', '--text', 'steer while kitty is down', '--deadline', '1'], {
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-12', 'exit 12'),
+  });
+  assert.equal(code, 3, stderr);
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1, 'the row stays queued');
+  assert.match(stderr, hintRe);
+  assert.match(stderr, new RegExp(`--cancel --id ${left[0].id}`));
+  assert.equal((stderr.match(/SendMessage\(/g) ?? []).length, 1, 'the hint prints once');
+});
+
+test('kitty-send exit 1 (a usage failure) while kitty answers prints no hint', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await rcDownSend(['--to', '991001', '--text', 'usage failure', '--deadline', '1'], {
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-1', 'exit 1'),
+  });
+  assert.equal(code, 3, stderr);
+  assert.doesNotMatch(stderr, /SendMessage/);
+});
+
+test('plain fallback (no mailbox consumer): exit 12 from kitty-send exits 1 with the hint and no cancel clause', async () => {
+  const { code, stderr } = await withPresence([{ sessionId: 's3', cwd: '/repo/b' }], () =>
+    rcDownSend(['--to', '991002', '--text', 'plain fallback'], { AGENT_SEND_KITTY_SEND: kittyStubOf('send-12', 'exit 12') }));
+  assert.equal(code, 1, `kitty-send's 12 must leave as 1, never agent-send's own 12: ${stderr}`);
+  assert.match(stderr, /kitty remote control is not answering/);
+  assert.match(stderr, /ListAgents/);
+  assert.match(stderr, /nothing is queued, so there is no row to withdraw/);
+});
+
+test('--queue with no mailbox to park in: exit 12 exits 1 with the hint', async () => {
+  const { code, killed, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a' }], () =>
+    queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat', envExtra: { KITTY_SEND_STUB_EXIT: '12' } }));
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 1, stderr);
+  assert.match(stderr, /kitty remote control is not answering/);
+});
+
+test('--queue to a busy tab with no mailbox: the waiter path sees exit 12 and prints the hint', async () => {
+  const { code, killed, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a' }], () =>
+    queueSend(['--to', '991001', '--queue'], { title: '⠋ claude: busy seat', status: 'busy', envExtra: { KITTY_SEND_STUB_EXIT: '12' } }));
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 1, stderr);
+  assert.match(stderr, /kitty remote control is not answering/);
+});
+
+test('--queue to an idle seat: exit 12 re-queues the row and the hint names the cancel id', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }] }));
+    const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue'], {
+      title: 'claude: idle seat',
+      extraSessions: NAMED, envExtra: { KITTY_SEND_STUB_EXIT: '12', AGENT_MAILBOX_PROC_DIR: procDir },
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    const left = readUnacked(KEY_S1, { dir: mboxDir });
+    assert.equal(left.length, 1);
+    assert.match(stderr, hintRe);
+    assert.match(stderr, new RegExp(`--cancel --id ${left[0].id}`));
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+  }
+});
+
+test('kitty unreachable from the start: a window id is not "no such window"; exit 1 with the hint', async () => {
+  const { code, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001 }], () =>
+    rcDownSend(['--to', '991001', '--text', 'kitty is gone'], { AGENT_MAILBOX_KITTY: DOWN_KITTY() }));
+  assert.equal(code, 1, stderr);
+  assert.doesNotMatch(stderr, /no kitty window with id/);
+  assert.match(stderr, /kitty remote control is not answering, so window '991001' cannot be looked up/);
+  assert.match(stderr, hintRe);
+});
+
+test('kitty unreachable from the start: a title target gets the hint too', async () => {
+  const { code, stderr } = await rcDownSend(['--to', 'review docs', '--text', 'kitty is gone'], { AGENT_MAILBOX_KITTY: DOWN_KITTY() });
+  assert.equal(code, 1, stderr);
+  assert.doesNotMatch(stderr, /no kitty window matches/);
+  assert.match(stderr, /SendMessage\(\{to: <that name>/);
+});
+
+test('--queue with no --deadline and kitty down does not wait forever: exit 3, row queued, hint', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const hang = kittyStubOf('kitty-hang', 'sleep 30');
+  const started = Date.now();
+  const { code, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001 }], () =>
+    rcDownSend(['--to', KEY_S1, '--queue', '--text', 'queued while kitty hangs'], { AGENT_MAILBOX_KITTY: hang, AGENT_KITTY_LS_TIMEOUT_MS: '300' }));
+  assert.equal(code, 3, stderr);
+  assert.ok(Date.now() - started < 10_000, 'the probe timeout bounds the wait');
+  assert.match(stderr, hintRe);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued');
+});
+
+test('the budget spent against a busy recipient with kitty down: exit 3 with the hint, no extra probe', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const started = Date.now();
+  const { code, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001 }], () =>
+    rcDownSend(['--to', KEY_S1, '--text', 'busy and kitty down'], {
+      AGENT_MAILBOX_KITTY: kittyStubOf('kitty-hang', 'sleep 30'), AGENT_KITTY_LS_TIMEOUT_MS: '300', AGENT_SEND_BUDGET_S: '1', AGENT_SEND_BUSY_WAIT_S: '1',
+    }));
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, /budget of 1s spent/);
+  assert.match(stderr, hintRe);
+  assert.ok(Date.now() - started < 8000, `no re-probe past the budget (${Date.now() - started}ms)`);
+});
+
+test('kitty-send exit 11 while kitty has dropped since its own check: the hint still prints', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  fs.rmSync(path.join(binDir, 'drop-flag'), { force: true });
+  const { code, stderr } = await rcDownSend(['--to', '991001', '--text', 'kitty dropped mid-send', '--deadline', '1'], {
+    // answers like the fixture stub until kitty-send has run, then drops
+    AGENT_MAILBOX_KITTY: kittyStubOf('kitty-drops', `if [ -e ${path.join(binDir, 'drop-flag')} ]; then exit 1; fi\nexec ${kittyStub} "$@"`),
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-11-drop', `touch ${path.join(binDir, 'drop-flag')}\nexit 11`),
+  });
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, hintRe);
+});
+
+test('kitty-send exit 11 while kitty answers prints no hint', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await rcDownSend(['--to', '991001', '--text', 'screen unreadable', '--deadline', '1'], {
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-11', 'exit 11'),
+  });
+  assert.equal(code, 3, stderr);
+  assert.doesNotMatch(stderr, /SendMessage/);
+});
+
+test('kittyLs: non-array JSON is "not answering" (null, known down), never a throw downstream', async () => {
+  const { kittyLs, kittyKnownDown, flattenWindows } = await import('../lib/kitty-ls.mjs');
+  const saved = process.env.AGENT_MAILBOX_KITTY;
+  try {
+    process.env.AGENT_MAILBOX_KITTY = kittyStubOf('kitty-obj', `echo '{"error":"x"}'`);
+    assert.equal(kittyLs(), null);
+    assert.equal(kittyKnownDown(), true);
+    assert.deepEqual(flattenWindows(kittyLs()), []);
+  } finally { if (saved === undefined) delete process.env.AGENT_MAILBOX_KITTY; else process.env.AGENT_MAILBOX_KITTY = saved; }
+});
+
+test('kittyLs: a missing kitty binary is not an outage, so it earns no hint', async () => {
+  const { kittyLs, kittyKnownDown } = await import('../lib/kitty-ls.mjs');
+  const saved = process.env.AGENT_MAILBOX_KITTY;
+  try {
+    process.env.AGENT_MAILBOX_KITTY = path.join(binDir, 'no-such-kitty');
+    assert.equal(kittyLs(), null);
+    assert.equal(kittyKnownDown(), false);
+  } finally { if (saved === undefined) delete process.env.AGENT_MAILBOX_KITTY; else process.env.AGENT_MAILBOX_KITTY = saved; }
+});
+
+test('the budget spent with kitty down reuses the earlier failed probe: kitty @ ls is not asked again', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const calls = path.join(binDir, 'ls-calls');
+  fs.rmSync(calls, { force: true });
+  const { code, stderr } = await withPresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001 }], () =>
+    rcDownSend(['--to', KEY_S1, '--text', 'busy and kitty down'], {
+      AGENT_MAILBOX_KITTY: kittyStubOf('kitty-count', `echo x >> ${calls}\nsleep 30`), AGENT_KITTY_LS_TIMEOUT_MS: '300', AGENT_SEND_BUDGET_S: '1', AGENT_SEND_BUSY_WAIT_S: '1',
+    }));
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, hintRe);
+  const n = fs.readFileSync(calls, 'utf-8').trim().split('\n').length;
+  assert.ok(n <= 1, `kitty @ ls asked ${n} times`);
+});
+
+test('a role whose idle holder cannot be seen because kitty is down: exit 3 queued for the role, with the hint', async () => {
+  const fx = await handoverFixture('rc-role');
+  await seatHolder(fx, { minutesAgo: 30, windowId: 991002, pid: process.pid });
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4002'));
+  fs.writeFileSync(path.join(procDir, '4002', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4002', 'environ'), 'KITTY_WINDOW_ID=991002\0');
+  try {
+    const { code, stderr } = await runSend(['--to', 'role:lead', '--text', 'to the parked lead'], handoverEnv(fx.db, {
+      CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_KITTY: DOWN_KITTY(), AGENT_MAILBOX_PROC_DIR: procDir,
+      CLAUDE_SESSIONS_DIR: sessionsWith([{ sessionId: 'old-seat', name: 'reviewer · example · docs' }]),
+    }));
+    assert.equal(code, 3, stderr);
+    assert.match(stderr, /queued for role lead; no live holder/);
+    assert.match(stderr, hintRe);
+    assert.match(stderr, /--cancel --id \S+ so it does not arrive twice/);
+  } finally {
+    fs.rmSync(procDir, { recursive: true, force: true });
+  }
+});
+
+test('a role with a gone holder and a healthy kitty gets no hint', async () => {
+  const fx = await handoverFixture('rc-role-ok');
+  const { code, stderr } = await runSend(['--to', 'role:nobody-here', '--text', 'x'], handoverEnv(fx.db, { CLAUDE_CODE_SESSION_ID: 's2' }));
+  assert.equal(code, 3, stderr);
+  assert.doesNotMatch(stderr, /SendMessage/);
+});
+
+// ---- who the hint names: a live, unique session name, else ListAgents ----
+
+test('a session record that is not live (a resumed session leaves one behind) is never named', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { stderr } = await rcDownSend(['--to', '991001', '--text', 'x', '--deadline', '1'], {
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-12', 'exit 12'), CLAUDE_SESSIONS_DIR: sessionsWith([{ ...NAMED[0], live: false }]),
+  });
+  assert.doesNotMatch(stderr, /reviewer · example · docs/);
+  assert.match(stderr, /run ListAgents, find the recipient by its name/);
+});
+
+test('a session name shared by two live sessions is not offered as the SendMessage target', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { stderr } = await rcDownSend(['--to', '991001', '--text', 'x', '--deadline', '1'], {
+    AGENT_SEND_KITTY_SEND: kittyStubOf('send-12', 'exit 12'), CLAUDE_SESSIONS_DIR: sessionsWith([NAMED[0], { sessionId: 'other', name: NAMED[0].name }]),
+  });
+  assert.doesNotMatch(stderr, /SendMessage\(\{to: "reviewer/);
+  assert.match(stderr, /is shared by more than one live session, so pick the entry for session s1/);
 });
 
 // the exit code is the delivery verdict. On the withdraw
@@ -1399,7 +1648,7 @@ test('an idle recipient is unchanged by the budget: no --timeout forwarded', asy
 // unreadable screen.
 const EMPTY_COMPOSER = ['● Done.', '', '─'.repeat(40), '❯ ', '─'.repeat(40), '  ? for shortcuts'].join('\n');
 const QUEUE_WIN_PID = 424242;
-const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null, text = 'queued for an idle seat', cmdline = 'claude' } = {}) => {
+const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envExtra = {}, killAfterMs = 20_000, whileRunning = null, text = 'queued for an idle seat', cmdline = 'claude', extraSessions = [] } = {}) => {
   const titleFile = path.join(binDir, 'queue-title');
   const screenFile = path.join(binDir, 'queue-screen');
   const sessDir = path.join(binDir, 'queue-claude-sessions');
@@ -1410,6 +1659,7 @@ const queueSend = (args, { title, status = 'idle', screen = EMPTY_COMPOSER, envE
   fs.rmSync(sessDir, { recursive: true, force: true });
   fs.mkdirSync(sessDir);
   if (status != null) fs.writeFileSync(path.join(sessDir, `${QUEUE_WIN_PID}.json`), JSON.stringify({ sessionId: 'q1', cwd: '/repo/a', status }));
+  extraSessions.forEach((r, i) => fs.writeFileSync(path.join(sessDir, `${8000 + i}.json`), JSON.stringify({ pid: process.pid, procStart: startOf(process.pid), sessionId: r.sessionId, name: r.name })));
   fs.writeFileSync(titleKitty, [
     '#!/usr/bin/env bash',
     'if [ "$2" = "get-text" ]; then',
@@ -1910,4 +2160,28 @@ test('a long role name keeps its own notice topic', async () => {
   for (const r of [a, b, 'watch-role']) fs.rmSync(mailboxPath(`role:${r}`, { dir: mboxDir }), { force: true });
   for (const r of [a, b]) await runSend(['--to', `role:${r}`, '--text', 'x'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
   assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 2, 'one notice per role');
+});
+
+// Output larger than the 64 KiB pipe buffer must arrive whole: a write
+// followed by process.exit() drops whatever the pipe has not yet taken. The
+// reader here is deliberately slow to start, so the child hits a full pipe.
+test('--who --json into a slow pipe delivers the whole document, not 64 KiB', async () => {
+  const many = Array.from({ length: 600 }, (_, i) => ({ sessionId: `big-${i}`, cwd: `/repo/${'x'.repeat(200)}/${i}`, mailbox: true }));
+  writePresence(many);
+  try {
+    const child = spawn('node', [SEND, '--who', '--json'], { env: childEnv() });
+    const chunks = [];
+    await new Promise((r) => setTimeout(r, 1000));
+    child.stdout.on('data', (d) => chunks.push(d));
+    await new Promise((resolve) => child.on('close', resolve));
+    const out = Buffer.concat(chunks).toString('utf8');
+    assert.ok(out.length > 65536, `fixture must exceed one pipe buffer, got ${out.length}`);
+    assert.equal(JSON.parse(out).length >= 600, true);
+  } finally {
+    writePresence([
+      { sessionId: 's1', cwd: '/repo/a', mailbox: true },
+      { sessionId: 's2', cwd: '/repo/a' },
+      { sessionId: 's3', cwd: '/repo/b' },
+    ]);
+  }
 });

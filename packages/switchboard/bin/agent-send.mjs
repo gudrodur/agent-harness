@@ -57,7 +57,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -82,6 +82,7 @@ import {
   waitForAck,
 } from '../lib/agent-mailbox.mjs';
 import { switchboardDir } from '../lib/presence.mjs';
+import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
@@ -93,6 +94,13 @@ let verbose = /^(1|true|yes)$/i.test(process.env.AGENT_SEND_VERBOSE ?? '');
 const trace = (msg) => { if (verbose) process.stderr.write(msg); };
 // The final verdict: `terse` by default, `full` (the long form) under --verbose.
 const verdict = (terse, full = terse) => process.stderr.write(verbose ? full : terse);
+// A pipe takes stdout asynchronously, so process.exit() straight after a
+// large write drops what the pipe has not yet accepted (64 KiB cut). An empty
+// write's callback runs after every earlier write has been flushed.
+const exitAfterStdout = (code) => {
+  process.exitCode = code;
+  process.stdout.write('', () => process.exit(code));
+};
 
 const die = (msg, code = 1) => {
   process.stderr.write(`agent-send: ${msg}\n`);
@@ -205,7 +213,12 @@ const usage = () => `Usage:
         exits 3 instead): 1 usage or precondition, 4 selection dialog open,
         5 idle wait ran out, 6 a send is already queued, 7 mid-turn without
         --now/--queue/--wait-idle, 9 composer holds unsubmitted text; kitty-send's
-        own 11 (screen unreadable before the send) is reported as 1
+        own 11 (screen unreadable before the send) and 12 (kitty remote
+        control unavailable) are reported as 1. On 12, or whenever kitty
+        remote control is down, one stderr line tells the calling Claude
+        Code session to deliver with ListAgents + SendMessage({to: <session
+        name>, message}) and, if a row is queued (exit 3), to withdraw it
+        with --cancel --id <id>
     11  --claim-role refused: the role's holder is live (nothing changed)
     12  --release-role refused: another session holds the role (nothing changed)
     13  --cancel found the row already delivered or already withdrawn (nothing written)
@@ -225,7 +238,12 @@ const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_S
 // the composer already held a paste chip that is not kitty-send's own, 11
 // the screen was unreadable (or the composer not clear) before anything was
 // typed. Exit 3 is the opposite: sent, delivery not proven.
-const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11]);
+// 12: kitty remote control did not answer (a timeout or an unreachable socket).
+const KITTY_RC_DOWN = 12;
+const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN]);
+// kitty-send's 11 and 12 are not agent-send's own 11 (--claim-role refused) and
+// 12 (--release-role refused): both leave as 1, "nothing sent".
+const exitOfKittySend = (st) => (st === 11 || st === KITTY_RC_DOWN ? 1 : (st ?? 1));
 // How often a --queue sender re-reads the recipient window's title while it
 // waits for the drain (one `kitty @ ls` per poll).
 const QUEUE_POLL_MS = 2000;
@@ -239,6 +257,7 @@ const KITTY_NOTHING_REASON = {
   7: 'mid-turn without --now/--queue/--wait-idle',
   9: 'composer holds unsubmitted text',
   11: 'screen unreadable or composer not clear',
+  12: 'kitty remote control not answering',
 };
 // Exit 10 is typed-but-unproven (row 57): the text reached the window but no
 // session row proves the target submitted it — NOT re-queued (the composer
@@ -325,6 +344,70 @@ const displacedSeat = (sessionId, liveBeacon) => {
 const claudeSessionsDir = () =>
   process.env.CLAUDE_SESSIONS_DIR || path.join(process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'), 'sessions');
 
+// A Claude Code session record is live when its pid still runs the process that
+// wrote it: the pid's start time in /proc must equal the record's procStart
+// (the check lib/claude-session.sh's claude_record_live makes). A leftover record
+// of a resumed or closed session fails it.
+const procStartOf = (pid) => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? null;
+  } catch { return null; }
+};
+const liveSessionRecords = () => {
+  const dir = claudeSessionsDir();
+  const out = [];
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch { return out; }
+  for (const f of files) {
+    if (!/^\d+\.json$/.test(f)) continue;
+    try {
+      const rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8'));
+      if (rec.pid != null && rec.procStart != null && procStartOf(rec.pid) === String(rec.procStart)) out.push(rec);
+    } catch { /* an unreadable record is not live */ }
+  }
+  return out;
+};
+
+// How a peer reaches this session through Claude Code's built-in channel: the
+// name its live record carries (what ListAgents prints), and whether another
+// live session carries the same name, which would make the name ambiguous.
+const peerTarget = (sessionId) => {
+  if (sessionId == null) return { name: null, shared: false };
+  const live = liveSessionRecords();
+  const mine = live.find((r) => r.sessionId === sessionId && typeof r.name === 'string' && r.name !== '');
+  if (!mine) return { name: null, shared: false };
+  return { name: mine.name, shared: live.filter((r) => r.name === mine.name).length > 1 };
+};
+
+// One stderr line, once per run, for the calling Claude Code session: kitty
+// remote control is not answering, so deliver through the built-in channel
+// (ListAgents names the peers, SendMessage delivers) and withdraw the queued
+// mailbox row, if there is one, so the text does not arrive twice.
+let hinted = false;
+const peerChannelHint = ({ sessionId, queuedId }) => {
+  if (hinted) return;
+  hinted = true;
+  const { name, shared } = peerTarget(sessionId);
+  let how;
+  if (name != null && !shared) how = `SendMessage({to: ${JSON.stringify(name)}, message: <the same text>}) (ListAgents lists the live sessions)`;
+  else if (name != null) how = `run ListAgents: the name ${JSON.stringify(name)} is shared by more than one live session, so pick the entry for session ${sessionId} and use its ref in SendMessage({to: <ref>, message: <the same text>})`;
+  else how = 'run ListAgents, find the recipient by its name, and SendMessage({to: <that name>, message: <the same text>})';
+  const cancel = queuedId != null
+    ? `; then withdraw the queued row with --cancel --id ${queuedId} so it does not arrive twice`
+    : '; nothing is queued, so there is no row to withdraw';
+  process.stderr.write(`agent-send: kitty remote control is not answering (timed out or unreachable); if you are a Claude Code session, deliver this message with the built-in channel instead: ${how}${cancel}\n`);
+};
+// The hint applies when kitty-send said so (exit 12) or an earlier window-list
+// call in this run already failed; that answer is reused, never asked again.
+// kitty-send's 11 (nothing sent) can also mean kitty dropped after its own
+// check, so that one status asks kitty again before it counts as up.
+const rcDown = (status = null) => {
+  if (status === KITTY_RC_DOWN || kittyKnownDown()) return true;
+  if (status === 11) { kittyLs(); return kittyKnownDown(); }
+  return false;
+};
+
 const senderWindowId = () => {
   const raw = process.env.KITTY_WINDOW_ID;
   if (raw == null || raw === '') return null;
@@ -393,7 +476,7 @@ const main = (argv) => {
     else if (a === '--json') json = true;
     else if (a === '--help' || a === '-h') {
       process.stdout.write(usage());
-      process.exit(0);
+      return exitAfterStdout(0);
     } else die(`unknown argument: ${a} (try --help)`);
   }
   // Inbox read: print this session's unacked rows and ack them, the pull path
@@ -413,7 +496,7 @@ const main = (argv) => {
       }
     }
     process.stderr.write(`agent-send: inbox ${found.length} unacked row(s) for ${sessionId}\n`);
-    process.exit(0);
+    return exitAfterStdout(0);
   }
   if (json && !who) die('--json goes with --who');
   if (takeOver && claimRoleName == null) die('--take-over goes with --claim-role');
@@ -431,7 +514,7 @@ const main = (argv) => {
       for (const r of [head, ...rows]) process.stdout.write(`${r.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd()}\n`);
     }
     warnNoLiveSeats(seats);
-    process.exit(0);
+    return exitAfterStdout(0);
   }
   if (releaseRoleName != null) {
     if (to != null || text != null || file != null || mode != null || cancel || claimRoleName != null || takeOver) die('--release-role takes only --as');
@@ -543,12 +626,8 @@ const main = (argv) => {
   // title mark, ◐◑◒◓; idle shows ✳). Unreadable kitty, unknown window or a non-numeric id is
   // "not idle": callers then keep the cautious (busy) behaviour.
   const windowIsIdle = (winId) => {
-    try {
-      const ls = execFileSync(process.env.AGENT_MAILBOX_KITTY ?? 'kitty', ['@', 'ls'], { encoding: 'utf-8', timeout: 5000 });
-      const wins = JSON.parse(ls).flatMap((t) => (t.tabs ?? []).flatMap((tab) => tab.windows ?? []));
-      const rec = wins.find((w) => w.id === Number(winId));
-      return rec != null && !/[\u2800-\u28FF\u25D0-\u25D3]/.test(rec.title ?? '');
-    } catch { return false; }
+    const rec = flattenWindows(kittyLs()).find((w) => w.id === Number(winId));
+    return rec != null && !/[\u2800-\u28FF\u25D0-\u25D3]/.test(rec.title ?? '');
   };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
@@ -634,6 +713,8 @@ const main = (argv) => {
     return r.status;
   };
   let recipient;
+  // The session behind a lookup that threw (an idle seat), for the hint's name.
+  let thrownSession = null;
   let typedKey = null;
   // A same-topic message already delivered to this recipient: send nothing.
   const dupCheck = (key) => {
@@ -656,7 +737,7 @@ const main = (argv) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
-    const requeueForSeat = (reason) => {
+    const requeueForSeat = (reason, kittyStatus = null) => {
       if (queueKey == null) return false;
       const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
       const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
@@ -664,6 +745,7 @@ const main = (argv) => {
         `agent-send: queued for ${to}, delivered at its next prompt (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
         `agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`,
       );
+      if (rcDown(kittyStatus)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: qrow.id });
       process.exit(3);
     };
     const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
@@ -682,7 +764,8 @@ const main = (argv) => {
         if (!waitable) noQueueDie(`nothing was sent to ${t}`);
         const wst = runKittySend(why, t, text);
         if (wst === 0) process.exit(3);
-        process.exit(wst === 11 ? 1 : (wst ?? 1));
+        if (rcDown(wst)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
+        process.exit(exitOfKittySend(wst));
       }
     }
     // A --queue send runs kitty-send in the FOREGROUND under a short --wait-idle
@@ -692,12 +775,13 @@ const main = (argv) => {
     const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
     if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
-      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`);
+      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st);
       process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
-      process.exit(st === 11 ? 1 : st);
+      if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
+      process.exit(exitOfKittySend(st));
     }
-    // kitty-send's 11 (nothing sent) is not agent-send's 11 (--claim-role refused).
-    process.exit(st === 11 ? 1 : (st ?? 1));
+    if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
+    process.exit(exitOfKittySend(st));
   };
   try {
     recipient = resolveRecipient(to, { senderSessionId, senderCwd: process.cwd(), senderWindowId: senderWindowId() });
@@ -705,6 +789,15 @@ const main = (argv) => {
     // Never just "no consumer": a stale beacon (parked past the presence
     // window) and no beacon at all need different next steps.
     dupCheck(e?.key ?? null);
+    thrownSession = e?.sessionId ?? null;
+    // kitty could not be asked at all: nothing can be looked up or typed, and no
+    // row can be queued (the window has no mailbox key yet).
+    if (e?.code === 'kitty-unreachable') {
+      process.stderr.write(`agent-send: ${e.message}; nothing was sent and nothing is queued\n`);
+      const winBeacon = /^\d+$/.test(String(to)) ? readPresenceBeacons({}).find((b) => Number(b.windowId) === Number(to)) : null;
+      peerChannelHint({ sessionId: winBeacon?.sessionId ?? null, queuedId: null });
+      process.exit(1);
+    }
     if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`, e.key ?? null);
     if (e?.code === 'mailbox-stale') kittyFallback(`stale mailbox beacon for ${to} (${e.message})`);
     if (e?.code === 'mailbox-self' || e?.code === 'mailbox-no-beacon') kittyFallback(`no mailbox consumer at ${to}`);
@@ -747,6 +840,7 @@ const main = (argv) => {
     const qrow = appendMessage({ to: recipient.key, from: qfrom, priority, text, topic });
     process.stderr.write(`agent-send: queued for role ${recipient.role}; no live holder${recipient.holderSessionId ? ` (last holder ${recipient.holderSessionId} is gone)` : ''}. Row ${qrow.id} in ${mailboxPath(recipient.key)}; the next session that claims the role receives it (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
     noticeUnreadRole(recipient.role, qrow.id, qfrom);
+    if (rcDown()) peerChannelHint({ sessionId: recipient.holderSessionId ?? null, queuedId: qrow.id });
     warnNoLiveSeats();
     process.exit(3);
   }
@@ -821,6 +915,12 @@ const main = (argv) => {
     heldWhy = null;
     for (;;) {
       const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin, { text }) : 'recipient window not idle';
+      // A window list that cannot be read never turns idle: do not wait for it.
+      if (rcDown()) {
+        process.stderr.write(`agent-send: kitty remote control is not answering; row ${row.id} stays queued in ${mbox} for the recipient's own drain (exit 3: not delivered yet, do not resend)\n`);
+        peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
+        process.exit(3);
+      }
       if (rwin != null && why == null) {
         idleSince ??= Date.now();
         if (Date.now() - idleSince >= capMs) {
@@ -886,6 +986,7 @@ const main = (argv) => {
     kittyTimeoutS = Math.floor((busyBudgetEndMs - Date.now()) / 1000);
     if (kittyTimeoutS < 1) {
       pendingLine(row.id, `agent-send: budget of ${envS('AGENT_SEND_BUDGET_S', 30)}s spent waiting for an ack from busy recipient ${to}; row ${row.id} stays queued in ${mbox} and is delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`);
+      if (rcDown()) peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
       process.exit(3);
     }
   }
@@ -917,6 +1018,7 @@ const main = (argv) => {
   if (KITTY_SENT_NOTHING.has(status)) {
     const again = appendMessage({ to: recipient.key, from, priority, text, topic });
     pendingLine(again.id, `agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`);
+    if (rcDown(status)) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);
   }
   if (status === 3 || status === 10) {

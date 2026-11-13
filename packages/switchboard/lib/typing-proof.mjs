@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { kittyLs, flattenWindows } from './kitty-ls.mjs';
 
 // Verdict kinds. `dialog` is its own kind, never folded into "busy": a seat
 // that waits on a permission prompt or a question must not be typed into in
@@ -65,11 +66,9 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   // an explicit --now keeps its slash-command use.
   const slashRefusal = idleMode && text != null && /^\s*\//.test(text) ? verdict(REFUSED, 'the text starts with "/", which would run as a command in the seat') : null;
   const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
-  let win;
-  try {
-    const ls = execFileSync(kitty, ['@', 'ls'], { encoding: 'utf-8', timeout: 5000 });
-    win = JSON.parse(ls).flatMap((t) => (t.tabs ?? []).flatMap((tab) => tab.windows ?? [])).find((w) => w.id === Number(winId));
-  } catch { return verdict(REFUSED, 'window list could not be read'); }
+  const lsOut = kittyLs();
+  if (lsOut == null) return verdict(REFUSED, 'window list could not be read');
+  const win = flattenWindows(lsOut).find((w) => w.id === Number(winId));
   if (win == null) return verdict(REFUSED, 'window not found');
   const proc = (win.foreground_processes ?? []).find((p) => /(^|\/)claude$/.test(p.cmdline?.[0] ?? ''));
   // otherTabs (kitty-send, which also delivers to pi and opencode tabs): a tab
