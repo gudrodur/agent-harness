@@ -182,6 +182,8 @@ const usage = () => `Usage:
         lost; do not resend
     10  typed but not proven submitted (kitty-send reached the window, no
         session row proves submission): look at the window, never resend blind
+    16  typed, not proven submitted: a slash command still sits in the composer
+        after kitty-send's extra Enters; look at the window, never resend blind
     1 4 5 6 7 9   failed, nothing sent and nothing queued (reached only when
         there is no mailbox to fall back to; a withdrawn row is re-queued and
         exits 3 instead): 1 usage or precondition, 4 selection dialog open,
@@ -214,6 +216,9 @@ const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_S
 // typed. Exit 3 is the opposite: sent, delivery not proven.
 // 12: kitty remote control did not answer (a timeout or an unreachable socket).
 const KITTY_RC_DOWN = 12;
+// 16: a slash command typed into a Claude Code tab still sits in its composer
+// after kitty-send's bounded extra Enters. Typed, not proven submitted, like 10.
+const KITTY_TYPED_UNSUBMITTED = 16;
 const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN]);
 // kitty-send's 11 and 12 are not agent-send's own 11 (--claim-role refused) and
 // 12 (--release-role refused): both leave as 1, "nothing sent".
@@ -638,7 +643,7 @@ const main = (argv) => {
     const r = spawnSync(kittySend(), args, { stdio: 'inherit' });
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
-    if (typedKey != null && [0, 8, 10].includes(r.status) && !args.includes('--queue')) {
+    if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
       try {
         recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic });
       } catch {
@@ -650,6 +655,9 @@ const main = (argv) => {
     // through (NOT re-queued: the composer may already hold it).
     if (r.status === 10) {
       process.stderr.write(`agent-send: kitty-send exit 10 for ${args[1]}: typed, not proven submitted (reached the window, no session row proves submission); look at the window before resending, never resend blind\n`);
+    }
+    if (r.status === KITTY_TYPED_UNSUBMITTED) {
+      process.stderr.write(`agent-send: kitty-send exit 16 for ${args[1]}: the slash command is typed but still sits unsubmitted in the composer after the extra Enters; typed, not proven submitted: look at the window before resending, never resend blind\n`);
     }
     // kitty-send exit 8: sent under --now while mid-turn and still mid-turn at
     // the deadline — pending in the target's steering queue until the tool
@@ -938,7 +946,7 @@ const main = (argv) => {
     if (rcDown(status)) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);
   }
-  if (status === 3 || status === 10) {
+  if (status === 3 || status === 10 || status === KITTY_TYPED_UNSUBMITTED) {
     process.stderr.write(`agent-send: kitty-send typed into window ${target} but delivery is unproven (exit ${status}) for ${row.id}; NOT re-queued (a duplicate is worse): look at the window before resending\n`);
   }
   if (status == null) {

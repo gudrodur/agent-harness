@@ -119,7 +119,7 @@ A window id dies with its window; a **seat role** names the seat itself, and `--
 
 ```sh
 # Steer another agent; exit 0 means acked or proven, 3 means not delivered yet (do not resend),
-# 10 means typed but not proven (look at the window before resending); any other code is kitty-send.sh's.
+# 10 and 16 mean typed but not proven (look at the window before resending); any other code is kitty-send.sh's.
 agent-send.mjs --to <window-id|title-substring|mailbox-key|role:name> (--text TEXT | --file /abs/path) [--now | --stop | --idle-when REGEX | --queue] [--deadline N]
 agent-send.mjs --read [--as <session-id>]   # print and ack this session's inbox rows (incl. held roles' queues)
 agent-send.mjs --cancel --id <r> [--to <key>] # withdraw one queued row; the id alone is enough, the row's own recipient is used (exit 13: already delivered or withdrawn, 14: no such row)

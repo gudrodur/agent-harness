@@ -87,6 +87,12 @@ before(async () => {
     '    # screen: what the window shows; screen_late replaces it from the late_at-th read on',
     '    n=$(( $(cat "$state/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$state/reads"',
     '    if [ -f "$state/screen_late" ] && [ "$n" -ge "$(cat "$state/late_at")" ]; then cat "$state/screen_late"',
+    '    elif [ -f "$state/screen_dyn" ]; then',
+    '      # a live composer: typed text sits in the box until a lone \\r submits it, then the command shows its effect',
+    '      rule=$(cat "$state/rule")',
+    '      if [ -f "$state/composer" ]; then printf \'%s\\n\' "● Done." "" "$rule" "❯ $(cat "$state/composer")" "$rule" "  ⏵⏵ bypass permissions on · 1 shell"',
+    '      elif [ -f "$state/sent" ]; then printf \'%s\\n\' "● Done." "● Renamed." "" "$rule" "❯ " "$rule" "  ⏵⏵ bypass permissions on · 1 shell"',
+    '      else printf \'%s\\n\' "● Done." "" "$rule" "❯ " "$rule" "  ⏵⏵ bypass permissions on · 1 shell"; fi',
     '    elif [ -f "$state/screen" ]; then cat "$state/screen"',
     "    else printf '%s\\n' 'claude composer'; fi ;;",
     'esac',
@@ -104,7 +110,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_dyn', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -380,4 +386,30 @@ test('a non-Claude-Code tab with a dialog on screen is still not typed into (exi
   const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '2', '--timeout', '4']);
   assert.equal(r.code, 5, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), []);
+});
+
+// A slash command is typed with its \r in one call; the composer can swallow that
+// \r and leave the command text in the box. The screen then changes (the echo),
+// which used to be taken as proof. kitty-send now re-reads the composer and
+// presses Enter again, a bounded number of times.
+const live = async (mode) => {
+  await reset(mode);
+  await put('screen_dyn', '');
+  await put('rule', RULE);
+};
+
+test('a slash command left in the composer by a swallowed \\r is submitted by another Enter', async () => {
+  await live('enter');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--wait-idle', '4', '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst', 'enter', 'enter'], 'the first extra Enter is swallowed, the second submits, no third');
+  assert.equal(await fs.access(path.join(stateDir, 'composer')).then(() => true, () => false), false, 'the composer is empty');
+});
+
+test('a slash command no Enter can submit exits 16 after the bounded tries, never 0', async () => {
+  await live('never');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--wait-idle', '4', '--timeout', '8']);
+  assert.equal(r.code, 16, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst', 'enter', 'enter', 'enter'], 'three extra Enters at most');
+  assert.match(r.err, /typed, not proven submitted/);
 });

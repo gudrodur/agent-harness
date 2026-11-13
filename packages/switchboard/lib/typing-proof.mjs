@@ -52,6 +52,31 @@ const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
 
+// The composer box of a screen, found by BOTH rules (see below): `{ rows }` is
+// the box content with the prompt mark stripped, `{ error }` says why the box
+// could not be found. Shared by the typing proof and by `--mode composer`.
+const composerBox = (lines) => {
+  const bottom = lines.findLastIndex((l) => RULE_RE.test(l));
+  if (bottom < 0) return { error: 'no composer box on the screen (no closing rule)' };
+  const at = lines.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
+  if (at < 1 || !RULE_RE.test(lines[at - 1])) return { error: 'no composer box on the screen (no prompt line under a top rule)' };
+  return { rows: [lines[at].replace(/^[❯>]/, ''), ...lines.slice(at + 1, bottom)] };
+};
+
+// Does the composer still hold `text` (whitespace ignored)? true / false, or
+// null when the box cannot be found or the screen cannot be read: "could not
+// tell" is never "empty". Used by kitty-send to re-press Enter on a slash
+// command whose trailing \r the composer swallowed.
+export const composerHolds = (winId, text) => {
+  const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
+  let screen;
+  try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return null; }
+  const box = composerBox(screen.split('\n').map((l) => l.trimEnd()));
+  if (box.error != null) return null;
+  const want = text.replace(/\s+/g, '');
+  return want !== '' && box.rows.join('').replace(/\s+/g, '').includes(want);
+};
+
 export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
@@ -97,12 +122,9 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   // must be the top rule. Anything else (bash `!` mode, a panel in the way, a
   // screen scrolled mid-box) is a shape this does not know: refused.
   if (!composer) return verdict(PROVEN);
-  const bottom = lines.findLastIndex((l) => RULE_RE.test(l));
-  if (bottom < 0) return verdict(REFUSED, 'no composer box on the screen (no closing rule)');
-  const at = lines.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
-  if (at < 1 || !RULE_RE.test(lines[at - 1])) return verdict(REFUSED, 'no composer box on the screen (no prompt line under a top rule)');
-  const box = [lines[at].replace(/^[❯>]/, ''), ...lines.slice(at + 1, bottom)];
-  if (box.some((l) => l.trim() !== '')) return verdict(REFUSED, 'composer holds text');
+  const box = composerBox(lines);
+  if (box.error != null) return verdict(REFUSED, box.error);
+  if (box.rows.some((l) => l.trim() !== '')) return verdict(REFUSED, 'composer holds text');
   return verdict(PROVEN);
 };
 
@@ -122,8 +144,13 @@ if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathS
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
   const winId = opt('--window');
   const mode = opt('--mode') ?? 'idle';
+  if (mode === 'composer' && /^\d+$/.test(winId ?? '') && argv.includes('--stdin')) {
+    // Exit 0: the composer does not hold the text; 2: it still holds it; 3: could not tell.
+    const held = composerHolds(winId, fs.readFileSync(0, 'utf-8'));
+    process.exit(held === null ? 3 : held ? 2 : 0);
+  }
   if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog'].includes(mode)) {
-    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog [--stdin] [--other-tabs] [--no-composer]\n');
+    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|composer [--stdin] [--other-tabs] [--no-composer]\n');
     process.exit(64);
   }
   const text = argv.includes('--stdin') ? fs.readFileSync(0, 'utf-8') : null;
