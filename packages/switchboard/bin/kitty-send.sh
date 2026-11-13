@@ -355,10 +355,27 @@ run_proof() {
     return 0
   fi
   if [ "$2" = idle ]; then
-    PROOF_REASON=$(printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$1" --mode idle --stdin --other-tabs 2>&1 >/dev/null) || PROOF_RC=$?
+    PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode idle --other-tabs ${3:-} 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
   else
     PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode dialog 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
   fi
+}
+# proof_gate [--no-composer]: the verdict for the keystroke about to go out.
+# A mode that CLAIMS the seat is idle (--queue, --wait-idle, --deadline, the
+# detached waiter; not --idle-when, whose caller states its own parked proof)
+# gets the Claude Code idle proof; every other mode the dialog verdict only. A
+# dialog is refused in EVERY mode (exit 4); no proof, or no node, exits 11.
+# --no-composer is for the stranded-chip recovery's Enter, which acts on a
+# composer that holds kitty-send's own chip by design.
+proof_gate() {
+  local mode=dialog
+  if { [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; } && [ -z "$IDLE_WHEN" ]; then mode=idle; fi
+  run_proof "$WID" "$mode" "${1:-}"
+  case "$PROOF_RC" in
+    0) ;;
+    3) die "refusing to type into a dialog (nothing was sent): ${PROOF_REASON} — answer it in the window" 4 ;;
+    *) die "the typing proof did not pass (nothing was sent): ${PROOF_REASON:-exit $PROOF_RC}" 11 ;;
+  esac
 }
 # 0 = dialog on screen, 1 = none, 2 = the screen could not be read. A failed
 # read is NOT "no dialog": failing open here would type into exactly the
@@ -858,6 +875,7 @@ if [ "$STATE_KNOWN" = 0 ] && printf '%s' "$before_screen" | grep -qF -- '[Pasted
   fi
   if [ "$_owned" = 1 ]; then
     note "window $WID's composer already holds unsubmitted pasted text (chips ${_chips_before}) left by an earlier kitty-send — pressing Enter once to recover it"
+    proof_gate --no-composer
     press_enter "$WID"
     _rec_deadline=$(( $(date +%s) + TIMEOUT ))
     _cleared=0
@@ -894,19 +912,14 @@ CLAUDE_ENTERS=0
 # agent-send's --wait-idle on its withdraw path, not a gap between the last
 # idle poll and this line. A mode that CLAIMS the seat is idle (--queue,
 # --wait-idle, --deadline, the detached waiter) gets the full proof: Claude Code
-# tab, record status idle, no dialog, an empty composer, and a text that does not
-# start with "/". Every other mode (--now, a bare send, --idle-when, whose
+# tab, record status idle, no dialog, an empty composer; any other tab: the dialog
+# verdict only). A "/" text is NOT refused here: an explicit /rename or /compact
+# sent by a caller that means it must go through (agent-send's mailbox path
+# refuses it on its own). Every other mode (--now, a bare send, --idle-when, whose
 # caller states its own parked proof) gets the dialog verdict only: a busy
 # mid-turn seat stays allowed there and the composer is not read. A dialog is
 # refused in EVERY mode (exit 4); no proof, or no node, refuses exit 11.
-proof_mode=dialog
-if { [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; } && [ -z "$IDLE_WHEN" ]; then proof_mode=idle; fi
-run_proof "$WID" "$proof_mode"
-case "$PROOF_RC" in
-  0) ;;
-  3) die "refusing to type into a dialog (nothing was sent): ${PROOF_REASON} — answer it in the window" 4 ;;
-  *) die "the typing proof did not pass (nothing was sent): ${PROOF_REASON:-exit $PROOF_RC}" 11 ;;
-esac
+proof_gate
 # From here the keystrokes are out. SENT=1 plus the EXIT trap is the one
 # mechanism that keeps the promise of the exit codes: any exit that is not one
 # this section chooses (0, 3, 8, 10) becomes 3, "sent, delivery not proven". A

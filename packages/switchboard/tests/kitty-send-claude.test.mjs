@@ -234,13 +234,39 @@ for (const [name, screen] of [
   });
 }
 
-test('--wait-idle refuses a text starting with "/" (it would run as a command), nothing sent', async () => {
+// An explicit slash command (a /rename from a seat-rename tool) is the caller's
+// choice and goes through to an idle Claude Code tab with an empty composer.
+// The mailbox path in agent-send refuses a "/" text on its own.
+test('--wait-idle types a "/rename" into an idle Claude Code tab with an empty composer', async () => {
   await reset('burst');
   await put('screen', EMPTY);
-  const r = await runScript(['--to', WID, '--text', '/compact now', '--wait-idle', '4', '--timeout', '4']);
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--wait-idle', '4', '--timeout', '4']);
+  assert.notEqual(r.code, 11, `${r.out}${r.err}`);
+  assert.doesNotMatch(r.err, /starts with|typing proof did not pass/, r.err);
+  assert.ok((await calls()).length > 0, 'the slash command must be typed');
+});
+
+test('--queue: a "/rename" waiter types into an idle Claude Code tab too', async () => {
+  await reset('burst');
+  await put('screen', EMPTY);
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--queue', '--timeout', '4']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  const log = path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
+  for (let i = 0; i < 60 && !/queued waiter exit rc=/.test(await fs.readFile(log, 'utf8').catch(() => '')); i++) await new Promise((res) => setTimeout(res, 200));
+  assert.ok((await calls()).length > 0, 'the slash command must be typed');
+});
+
+// The stranded-chip recovery presses Enter in the composer. That is a keystroke:
+// it runs behind the idle verdict, so a seat that is not provably idle gets no Enter.
+test('the stranded-chip Enter is not pressed when the idle proof refuses (no session record)', async () => {
+  await reset('burst');
+  await fs.rm(path.join(claudeDir, 'sessions', `${process.pid}.json`), { force: true });
+  await put('screen', ['● Done.', RULE, '❯ [Pasted text #1 +1 lines]', RULE].join('\n'));
+  await fs.mkdir(path.join(stateDir, 'kitty-send-stranded'), { recursive: true });
+  await fs.writeFile(path.join(stateDir, 'kitty-send-stranded', `stranded-${WID}`), `pid=${process.pid}\ncreated=\ntime=${Math.floor(Date.now() / 1000)}\nchips=1 \n`);
+  const r = await runScript(['--to', WID, '--text', MSG, '--wait-idle', '4', '--timeout', '4']);
   assert.equal(r.code, 11, `${r.out}${r.err}`);
-  assert.match(r.err, /starts with "\/"/);
-  assert.deepEqual(await calls(), []);
+  assert.deepEqual(await calls(), [], 'no Enter and no text may be sent');
 });
 
 test('--queue: the detached waiter proves at typing time too (exit 11 in its log, nothing sent)', async () => {

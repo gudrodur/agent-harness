@@ -143,7 +143,7 @@ test('a send to an idle seat says so, types to wake it, and keeps kitty-send exi
 
 // --queue to a seat idle past the presence window goes through the same typing
 // proof as every other queued send: a half-typed draft is never appended to.
-const idleQueueSend = (screenText, status = 'idle', text = 'queued for an idle seat') => {
+const idleQueueSend = (screenText, status = 'idle', text = 'queued for an idle seat', extraEnv = {}) => {
   const sessDir = path.join(tmp, 'idle-queue-sessions');
   fs.mkdirSync(sessDir, { recursive: true });
   fs.writeFileSync(path.join(sessDir, '4343.json'), JSON.stringify({ sessionId: 'idle-1', cwd: '/r/idle', status }));
@@ -157,7 +157,7 @@ const idleQueueSend = (screenText, status = 'idle', text = 'queued for an idle s
     '',
   ].join('\n'), { mode: 0o755 });
   fs.rmSync(argvFile, { force: true });
-  const r = send(['--to', '410', '--queue', '--text', text], { AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir });
+  const r = send(['--to', '410', '--queue', '--text', text], { AGENT_MAILBOX_KITTY: proofKitty, CLAUDE_SESSIONS_DIR: sessDir, ...extraEnv });
   return { r, typed: fs.existsSync(argvFile) ? fs.readFileSync(argvFile, 'utf-8').split('\n') : null };
 };
 const IDLE_KEY = recipientKey({ cwd: '/r/idle', sessionId: 'idle-1' });
@@ -189,8 +189,20 @@ test('--queue to a seat idle past 20 minutes is refused when its record is not i
 });
 test('--queue to a seat idle past 20 minutes with a proven empty composer is typed', () => {
   const { r, typed } = idleQueueSend('● Done.\n────────\n❯ \n────────\n');
-  assert.equal(r.status, 3, r.stderr); // a started --queue waiter is pending, not delivered
-  assert.ok(typed?.includes('--queue') && typed.includes('410'), `argv: ${typed}`);
+  assert.ok(typed?.includes('--wait-idle') && !typed.includes('--queue') && typed.includes('410'), `argv: ${typed}`);
+});
+
+// The fallback runs kitty-send in the foreground, so a late refusal (exit 11) from
+// its own proof reaches the sender: the row is queued for the seat, never lost
+// behind a "do not resend" for a detached waiter that then refuses.
+test('--queue to a seat idle past 20 minutes: a late kitty-send refusal (exit 11) queues the text for the seat', () => {
+  const stub = path.join(tmp, 'kitty-send-refuses');
+  fs.writeFileSync(stub, '#!/usr/bin/env bash\nexit 11\n', { mode: 0o755 });
+  const before = readUnacked(IDLE_KEY, {}).length;
+  const { r } = idleQueueSend('● Done.\n────────\n❯ \n────────\n', 'idle', 'late refusal text', { AGENT_SEND_KITTY_SEND: stub });
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /kitty-send exit 11 sent nothing.*queued/);
+  assert.equal(readUnacked(IDLE_KEY, {}).length, before + 1, 'the row is queued for the seat');
 });
 
 test('a send to a role whose holder is idle wakes the holder window instead of queueing', async () => {

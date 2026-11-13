@@ -51,7 +51,7 @@ const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
 
-export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false } = {}) => {
+export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
   // `/` would run as a slash command in the seat (`/compact` compacts it)
@@ -97,6 +97,7 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   // column 0 starting with the prompt mark above it; the line above the prompt
   // must be the top rule. Anything else (bash `!` mode, a panel in the way, a
   // screen scrolled mid-box) is a shape this does not know: refused.
+  if (!composer) return verdict(PROVEN);
   const bottom = lines.findLastIndex((l) => RULE_RE.test(l));
   if (bottom < 0) return verdict(REFUSED, 'no composer box on the screen (no closing rule)');
   const at = lines.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
@@ -114,7 +115,7 @@ export const typingVerdict = (winId, opts = {}) => {
 };
 
 // CLI, run by bin/kitty-send.sh: `typing-proof.mjs --window N --mode idle|dialog
-// [--stdin] [--other-tabs]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
+// [--stdin] [--other-tabs] [--no-composer]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
 // 3 a dialog is open, 64 usage. The reason goes to stderr.
 const EXIT = { [PROVEN]: 0, [REFUSED]: 2, [DIALOG]: 3 };
 if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
@@ -123,11 +124,11 @@ if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathS
   const winId = opt('--window');
   const mode = opt('--mode') ?? 'idle';
   if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog'].includes(mode)) {
-    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog [--stdin] [--other-tabs]\n');
+    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog [--stdin] [--other-tabs] [--no-composer]\n');
     process.exit(64);
   }
   const text = argv.includes('--stdin') ? fs.readFileSync(0, 'utf-8') : null;
-  const v = proofVerdict(winId, { mode, text, otherTabs: argv.includes('--other-tabs') });
+  const v = proofVerdict(winId, { mode, text, otherTabs: argv.includes('--other-tabs'), composer: !argv.includes('--no-composer') });
   if (v.reason != null) process.stderr.write(`${v.reason}\n`);
   process.exit(EXIT[v.kind]);
 }

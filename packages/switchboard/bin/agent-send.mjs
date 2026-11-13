@@ -574,10 +574,22 @@ const main = (argv) => {
         process.exit(3);
       }
     }
-    const st = runKittySend(why, t, text);
-    // A --queue waiter that was only started is not a delivery: the verdict
-    // lands later in the queue log (exit 3: pending, do not resend).
-    if (st === 0 && priority === 'queue') process.exit(3);
+    // A --queue send runs kitty-send in the FOREGROUND under a short --wait-idle
+    // (the proof just passed, so the seat is idle now): its verdict is the
+    // sender's. A detached --queue waiter would answer exit 3 "do not resend"
+    // and then, if its own late proof refused, lose the message with nobody told.
+    const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
+    if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
+      const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
+      if (queueKey == null) {
+        process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
+        process.exit(st === 11 ? 1 : st);
+      }
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
+      process.stderr.write(`agent-send: kitty-send exit ${st} sent nothing (${reason}); queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it at its next prompt (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
+      process.exit(3);
+    }
     // kitty-send's 11 (nothing sent) is not agent-send's 11 (--claim-role refused).
     process.exit(st === 11 ? 1 : (st ?? 1));
   };

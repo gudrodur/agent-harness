@@ -679,7 +679,8 @@ test('priority flags reach kitty-send unchanged on the fallback path', async () 
     );
     assert.equal(queued.code, 5);
     argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
-    assert.ok(argv.includes('--queue'));
+    assert.ok(argv.includes('--wait-idle'), `a --queue fallback runs in the foreground: ${argv}`);
+    assert.ok(!argv.includes('--queue'), `${argv}`);
     fs.rmSync(fallbackArgv, { force: true });
     const now = await runSend(
       ['--to', '991002', '--now', '--text', 'urgent steer'],
@@ -728,7 +729,7 @@ test('a bare send to a busy recipient does not forward --now', async () => {
 
 test('an explicit --queue to an idle recipient is unchanged', async () => {
   const { argv } = await bareSendArgv(['--queue'], 'claude: idle seat', provenKitty(991002, '/repo/b'));
-  assert.ok(argv.includes('--queue'));
+  assert.ok(argv.includes('--wait-idle') && !argv.includes('--queue'), `argv: ${argv}`);
   assert.ok(!argv.includes('--now'), `argv: ${argv}`);
 });
 
@@ -1099,7 +1100,7 @@ test('a no-consumer fallback refused at a dirty composer (exit 9) names the queu
   assert.match(stderr, new RegExp(`kitty queue log: ${queueDir}/kitty-send/queue-991002\\.log`));
 });
 
-test('a queued kitty fallback (exit 0 under --queue) is pending: exit 3, names the queue log', async () => {
+test('a --queue kitty fallback runs in the foreground: its exit 0 is the delivery verdict', async () => {
   const queueDir = path.join(binDir, 'xdg-run');
   fs.mkdirSync(queueDir, { recursive: true });
   const queueStub = path.join(binDir, 'kitty-send-queued-stub.sh');
@@ -1108,10 +1109,8 @@ test('a queued kitty fallback (exit 0 under --queue) is pending: exit 3, names t
     ['--to', '991002', '--text', 'queued steer', '--queue'],
     { ...childEnv(), AGENT_SEND_KITTY_SEND: queueStub, XDG_RUNTIME_DIR: queueDir, ...provenKitty(991002, '/repo/b') },
   );
-  // A started waiter is not a delivery: exit 3, not 0.
-  assert.equal(code, 3, stderr);
-  assert.match(stderr, new RegExp(`kitty-send queued for 991002; .*confirm it in ${queueDir}/kitty-send/queue-991002\\.log`));
-  assert.match(stderr, /do not resend/);
+  assert.equal(code, 0, stderr);
+  assert.doesNotMatch(stderr, /do not resend/);
 });
 
 // A supervisor idle ~30 min ages past the 20-min presence window. With its
@@ -1613,7 +1612,7 @@ test('--queue through the kitty fallback is typed when the composer is proven em
     writePresence([{ sessionId: 's1', cwd: '/repo/a' }]);
     const { killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat' });
     assert.equal(killed, false, stderr);
-    assert.ok(argv?.includes('--queue'), `argv: ${argv}`);
+    assert.ok(argv?.includes('--wait-idle') && !argv.includes('--queue'), `argv: ${argv}`);
   } finally {
     fs.writeFileSync(presFile, saved);
   }
