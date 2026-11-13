@@ -12,7 +12,9 @@
 #                 [--brief /abs/brief.md] [--cwd /abs/repo]
 #   claude-tab.sh --resume <session-id> --title "claude: <name>" --model ...
 #                 [--rc [NAME]] [--brief /abs/brief.md]
+#   claude-tab.sh --seat --title ... --model ... --role NAME --reseat <window-id>
 #   claude-tab.sh --list | --close <window-id>       (lib/tab-ledger.sh, shared with opencode-tab.sh)
+#   claude-tab.sh --retire <window-id> [--as <session-id>]
 #   claude-tab.sh --help | -h
 #
 #   --rc [NAME]  start the session with Remote Control on, named NAME (default:
@@ -40,6 +42,20 @@
 #                launch and, with --rc, the new process's registry record
 #                holding a bridgeSessionId. claude-resume-set.sh replays a
 #                whole snapshot of sessions through this.
+#   --reseat ID  replace the seat in window ID: the new seat's first prompt claims
+#                --role with `agent-send --claim-role NAME --take-over`, then runs
+#                `claude-tab.sh --retire ID`; the launcher then proves BOTH from
+#                the store (role held by the new session, handover retired) and
+#                exits 3 naming the missing half. Needs --role; implies --seat.
+#   --retire ID  close window ID, which this script did not launch, only for the
+#                session that took its role over: a handover row written by
+#                `agent-send --claim-role ... --take-over` must name ID and the
+#                caller (CLAUDE_CODE_SESSION_ID, or --as: the caller's identity is
+#                self-asserted, so --as can impersonate a taker; the row still
+#                has to exist), the window's pid must be the recorded one, the
+#                session in the window must be the displaced one, ID must not be the caller's own window, and
+#                the displaced seat must be idle. On success it also releases the
+#                window's kitty:ID claims and marks the handover retired.
 #
 # --cwd must be a folder Claude Code trusts, itself or through a folder above
 # it; an untrusted one is refused (exit 1). A throwaway folder under /tmp is
@@ -53,7 +69,15 @@
 #   1  precondition failed (bad args, relative path, missing file, untrusted
 #      folder, slot held)
 #   2  kitty remote control unavailable — CALLER MUST FALL BACK TO HEADLESS AND SAY SO
-#   3  launched but not proven (window id still printed; a wrong model closes it)
+#   3  launched but not proven (window id still printed; a wrong model closes it);
+#      with --reseat, also: the role was not claimed or the old window not retired
+#
+# --retire exit codes (0 retired, or the window was already gone; 1 and 2 as above):
+#   20  no usable handover: none names the window, it names another session as
+#       taker, or it was already retired
+#   21  the window's pid is not the one recorded: the id was reused
+#   22  the id is the caller's own window
+#   23  the displaced seat is not idle (busy, or its state cannot be proven)
 # HELP-END
 #
 # The Claude Code sibling of opencode-tab.sh (2026-09-29). Like opencode, the
@@ -92,9 +116,17 @@ case "${1:-}" in
   # window no launcher recorded and the release of the window's brief claim.
   --list) tab_ledger_list; exit $? ;;
   --close) tab_ledger_close "${2:-}"; exit $? ;;
+  --retire)
+    RETIRE_AS="${CLAUDE_CODE_SESSION_ID:-}"
+    case "${3:-}" in
+      "") ;;
+      --as) RETIRE_AS="${4:-}"; [ -n "$RETIRE_AS" ] || die "--as needs a session id" ;;
+      *) die "--retire takes a window id and optionally --as <session-id>, got: $3" ;;
+    esac
+    tab_ledger_retire "${2:-}" "$RETIRE_AS"; exit $? ;;
 esac
 
-TITLE=""; BRIEF=""; OUT=""; MODEL=""; CWD="$PWD"; CWD_SET=0; SLOT_OVERRIDE=""; RC=0; RC_NAME=""; SEAT=0; RESUME=""; ROLE=""
+TITLE=""; BRIEF=""; OUT=""; MODEL=""; CWD="$PWD"; CWD_SET=0; SLOT_OVERRIDE=""; RC=0; RC_NAME=""; SEAT=0; RESUME=""; ROLE=""; RESEAT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --title) TITLE="${2:-}"; shift 2 ;;
@@ -104,6 +136,7 @@ while [ $# -gt 0 ]; do
     --cwd) CWD="${2:-}"; CWD_SET=1; shift 2 ;;
     --resume) RESUME="${2:-}"; shift 2 ;;
     --role) ROLE="${2:-}"; shift 2 ;;
+    --reseat) RESEAT="${2:-}"; shift 2 ;;
     --slot-override) SLOT_OVERRIDE="${2:-}"; shift 2 ;;
     --seat) SEAT=1; shift ;;
     --rc)
@@ -116,6 +149,19 @@ done
 [ -n "$TITLE" ] || die "--title is required"
 if [ -n "$ROLE" ] && ! printf '%s' "$ROLE" | /usr/bin/grep -Eq '^[a-z0-9][a-z0-9-]{0,63}$'; then
   die "--role must match [a-z0-9][a-z0-9-]{0,63}, got: '$ROLE'"
+fi
+if [ -n "$RESEAT" ]; then
+  case "$RESEAT" in *[!0-9]*) die "--reseat takes a numeric window id, got: $RESEAT" ;; esac
+  [ -n "$ROLE" ] || die "--reseat needs --role: the new seat takes that role from the seat in window $RESEAT"
+  [ -z "$RESUME" ] || die "--reseat and --resume do not combine"
+  # Taking the role from the wrong seat would leave the named window open.
+  HOLDER=$(node "$HERE/seat-handover.mjs" holder "$ROLE") || die "could not read the role store — nothing launched"
+  [ "$(printf '%s' "$HOLDER" | jq -r .held)" = true ] \
+    || die "nobody holds role $ROLE, so there is no seat in window $RESEAT to replace. Nothing launched."
+  [ "$(printf '%s' "$HOLDER" | jq -r .window)" = "$RESEAT" ] \
+    || die "role $ROLE is held by window $(printf '%s' "$HOLDER" | jq -r '.window // "(unknown)"'), not window $RESEAT. Nothing launched."
+  # A replacement is a seat: no state row, no slot, no brief claim.
+  SEAT=1
 fi
 [ -n "$MODEL" ] || die "--model is required: a tab on the account default is the run nobody chose"
 case "$MODEL" in
@@ -252,7 +298,16 @@ BEFORE=$(ls -1 "$TDIR" 2>/dev/null | grep '\.jsonl$' | tr '\n' ' ')
 OFFSET=0
 [ -n "$RESUME_FILE" ] && OFFSET=$(stat -c %s "$RESUME_FILE")
 
-if [ -n "$BRIEF" ]; then
+if [ -n "$RESEAT" ]; then
+  # The new seat does the handover itself: its own session id is the taker the
+  # store must name. The store pin travels in the commands, because kitty starts
+  # the window from its own environment, not this one's.
+  PIN=""
+  [ -n "${AGENT_SWITCHBOARD_DB:-}" ] && PIN="AGENT_SWITCHBOARD_DB=$(printf '%q' "$AGENT_SWITCHBOARD_DB") "
+  MSG="This tab replaces the seat in window $RESEAT (claude-tab.sh --reseat${RC_NAME:+, Remote Control \"$RC_NAME\"}). Before anything else run these two commands in order and read their output: 1) ${PIN}node $HERE/agent-send.mjs --claim-role $ROLE --take-over   2) ${PIN}$HERE/claude-tab.sh --retire $RESEAT   The second closes the old window and refuses, with an exit code and a reason, when closing it is not safe: report that reason and do not close the window another way."
+  if [ -n "$BRIEF" ]; then MSG="$MSG Then read $BRIEF and carry it out in full."
+  else MSG="$MSG Then reply with one line saying you are ready, then wait for instructions."; fi
+elif [ -n "$BRIEF" ]; then
   MSG="Read $BRIEF and carry it out in full. Run the commands rather than reasoning about them. Use absolute paths and 'git -C <dir> ...'."
   [ -n "$OUT" ] && MSG="$MSG Write your findings to $OUT"
 elif [ -n "$RESUME" ]; then
@@ -266,7 +321,10 @@ ARGS=("$CLAUDE_BIN" --model "$MODEL" --name "$TITLE")
 [ -n "$RESUME" ] && ARGS+=(--resume "$RESUME")
 ARGS+=("$MSG")
 ENV_ARGS=()
-[ -n "$ROLE" ] && ENV_ARGS=(--env "AGENT_SEAT_ROLE=$ROLE")
+# A reseat claims its role in the first prompt with --take-over, so the env
+# claim (which declines a live holder, and would take a dead one without
+# leaving a handover row) is left out.
+[ -n "$ROLE" ] && [ -z "$RESEAT" ] && ENV_ARGS=(--env "AGENT_SEAT_ROLE=$ROLE")
 case "${KITTY_WINDOW_ID:-}" in
   ""|*[!0-9]*) ;;
   *) ENV_ARGS+=(--env "AGENT_DISPATCHED_BY=$KITTY_WINDOW_ID") ;;
@@ -329,6 +387,30 @@ printf 'WINDOW_ID=%s\n' "$WID"
 if [ -n "$GOT" ] && ! model_ok "$GOT"; then
   close_it
   die "session $SESSION is on model $GOT but was launched as $MODEL — the window was closed at once." 3
+fi
+# --reseat: the model proof is only the start. The seat must also have claimed
+# the role and retired the old window, read from the store, never from its words.
+# Its session id is the transcript's name.
+if [ -n "$RESEAT" ] && [ -n "$GOT" ] && { [ "$RC" = 0 ] || [ "$BRIDGE" = 1 ]; }; then
+  TAKER=$(basename "$SESSION" .jsonl)
+  CLAIMED=false; RETIRED=false
+  for _ in $(seq 1 45); do
+    V=$(node "$HERE/seat-handover.mjs" verify "$ROLE" "$RESEAT" "$TAKER" 2>/dev/null)
+    CLAIMED=$(printf '%s' "$V" | jq -r '.claimed // false' 2>/dev/null)
+    RETIRED=$(printf '%s' "$V" | jq -r '.retired // false' 2>/dev/null)
+    [ "$CLAIMED" = true ] && [ "$RETIRED" = true ] && break
+    sleep 2
+  done
+  if [ "$CLAIMED" = true ] && [ "$RETIRED" = true ]; then
+    note "reseat verified: role $ROLE claimed, window $RESEAT retired"
+  else
+    miss=""
+    [ "$CLAIMED" = true ] || miss="role $ROLE not claimed by session $TAKER"
+    [ "$RETIRED" = true ] || miss="${miss:+$miss; }window $RESEAT not retired"
+    note "reseat not proven within 90 s: $miss — go look at window $WID before closing window $RESEAT by hand"
+    printf 'SESSION=%s\n' "$SESSION"
+    exit 3
+  fi
 fi
 if [ -n "$GOT" ] && { [ "$RC" = 0 ] || [ "$BRIDGE" = 1 ]; }; then
   note "confirmed: session $(basename "$SESSION" .jsonl) on $GOT${RC_NAME:+, Remote Control \"$RC_NAME\"}"

@@ -33,3 +33,19 @@
 The comment block at the top of `bin/kitty-send.sh` is the authority.
 
 Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote control (fall back to headless and say so); exit 3 means the session started on another model and the tab was closed.
+
+## claude-tab.sh --retire and --reseat
+
+`--retire <window-id>` closes the window a role takeover displaced. It closes only when a handover row (written by `agent-send --claim-role R --take-over`) names that window and the caller, the window's pid is the recorded one, the id is not the caller's own window, and the displaced seat is idle.
+
+| Code | Meaning |
+|---|---|
+| 0 | Closed and marked retired, or the window was already gone (the row is marked retired and its claims released). |
+| 1 | Usage error (no numeric id, no calling session) or the handover store could not be read. |
+| 2 | No terminal remote control. |
+| 20 | No usable handover: none names the window, it names another session as taker, or it was already retired. Nothing closed. |
+| 21 | The window's pid is not the recorded one: the id was reused. Nothing closed. |
+| 22 | The id is the caller's own window. Nothing closed. |
+| 23 | The displaced seat is not idle (busy, or its state cannot be proven). Nothing closed; retry when it is idle. |
+
+`--seat --role R --reseat <window-id>` exits 3 when the new seat started but the store does not show both halves within 90 seconds: the role claimed by the new session, and the handover retired. The message names the missing half.

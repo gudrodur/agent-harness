@@ -60,7 +60,7 @@ before(async () => {
       title: 'tab-one',
       windows: [
         { id: 991001, title: 'opencode: example-project review', pid: 111, cwd: '/repo/a' },
-        { id: 991002, title: 'opencode: example-project review docs', pid: 112, cwd: '/repo/b' },
+        { id: 991002, title: 'opencode: example-project review docs', pid: 112, cwd: '/repo/b', foreground_processes: [{ pid: 112, cmdline: ['/usr/bin/claude'] }] },
       ],
     }],
   }]));
@@ -1650,4 +1650,110 @@ test('--queue --text "/compact now" through the kitty fallback is never typed', 
   } finally {
     fs.writeFileSync(presFile, saved);
   }
+});
+
+// Handover rows: --claim-role --take-over leaves the evidence that lets the
+// taker retire the window it displaced (claude-tab.sh --retire).
+//
+// A store of its own, and presence in that store: AGENT_SWITCHBOARD_DB wins
+// over the file pins above, in this process and in the child.
+const handoverEnv = (db, extra = {}) => childEnv({ AGENT_SWITCHBOARD_DB: db, CLAUDE_SESSIONS_DIR: path.join(binDir, 'claude-sessions'), ...extra });
+// The session record of the claude process in window 991002 (pid 112): the
+// proof that the window still holds the displaced session.
+const sessionRecord = (sessionId) => {
+  fs.mkdirSync(path.join(binDir, 'claude-sessions'), { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'claude-sessions', '112.json'), JSON.stringify({ pid: 112, sessionId, cwd: '/repo/b' }));
+};
+const withHandoverStore = async (db, fn) => {
+  const { openStore } = await import('../lib/store.mjs');
+  const store = openStore(db);
+  try { return await fn(store); } finally { store.close(); }
+};
+const handoverFixture = async (name) => {
+  const db = path.join(binDir, `handover-${name}.db`);
+  const prev = process.env.AGENT_SWITCHBOARD_DB;
+  process.env.AGENT_SWITCHBOARD_DB = db;
+  try {
+    const { recordPresence } = await import('../lib/presence.mjs');
+    const { claimRole } = await import('../lib/seat-roles.mjs');
+    return { db, recordPresence, claimRole };
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_SWITCHBOARD_DB; else process.env.AGENT_SWITCHBOARD_DB = prev;
+  }
+};
+const seatHolder = async (fx, { minutesAgo = 0, windowId = 991002, pid = undefined } = {}) => {
+  const prev = process.env.AGENT_SWITCHBOARD_DB;
+  process.env.AGENT_SWITCHBOARD_DB = fx.db;
+  try {
+    fx.recordPresence({ sessionId: 'old-seat', cwd: '/repo/b', windowId, mailbox: true, pid: pid ?? (minutesAgo ? process.pid : null), now: Date.now() - minutesAgo * 60_000 });
+    await withHandoverStore(fx.db, (s) => fx.claimRole(s, { role: 'lead', sessionId: 'old-seat', cwd: '/repo/b', windowId }));
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_SWITCHBOARD_DB; else process.env.AGENT_SWITCHBOARD_DB = prev;
+  }
+};
+const handovers = (db) => withHandoverStore(db, (s) => s.all('SELECT * FROM seat_handovers ORDER BY id'));
+const takeOverAs = (db, args, session = 'new-seat') =>
+  runSend(['--claim-role', 'lead', ...args], handoverEnv(db, { CLAUDE_CODE_SESSION_ID: session, KITTY_WINDOW_ID: '991001' }));
+
+test('--take-over of a live holder records a handover row naming window and pid', async () => {
+  sessionRecord('old-seat');
+  const fx = await handoverFixture('live');
+  await seatHolder(fx);
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  const rows = await handovers(fx.db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].role, 'lead');
+  assert.equal(rows[0].displaced_session, 'old-seat');
+  assert.equal(rows[0].displaced_window, 991002);
+  assert.equal(rows[0].displaced_pid, 112, 'the pid kitty reports for that window');
+  assert.equal(rows[0].taker_session, 'new-seat');
+  assert.ok(Number(rows[0].ts) > 0);
+  assert.equal(rows[0].retired_at, null);
+});
+
+test('--take-over of a parked (idle) holder records a handover row too', async () => {
+  sessionRecord('old-seat');
+  const fx = await handoverFixture('idle');
+  await seatHolder(fx, { minutesAgo: 60 });
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  const rows = await handovers(fx.db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].displaced_window, 991002);
+});
+
+test('a claim that takes nothing records no handover: refused, free role, re-claim, plain claim of a dead holder', async () => {
+  const fx = await handoverFixture('none');
+  await seatHolder(fx);
+  const refused = await takeOverAs(fx.db, []);
+  assert.equal(refused.code, 11);
+  assert.equal((await handovers(fx.db)).length, 0, 'a refused claim displaces nobody');
+  const free = await runSend(['--claim-role', 'other-role', '--take-over'], handoverEnv(fx.db, { CLAUDE_CODE_SESSION_ID: 'new-seat' }));
+  assert.equal(free.code, 0, free.stderr);
+  await takeOverAs(fx.db, ['--take-over']);
+  const again = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal((await handovers(fx.db)).length, 1, 'only the first takeover displaced anyone');
+});
+
+test('a stale beacon whose window id now holds another session records no handover', async () => {
+  // The window id was reused after a restart: kitty reports a pid for it, but
+  // the session record in that window names someone else.
+  sessionRecord('a-stranger');
+  const fx = await handoverFixture('stale');
+  await seatHolder(fx, { minutesAgo: 30 * 60 });
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal((await handovers(fx.db)).length, 0, 'no row for a window that is not proven to be the displaced seat');
+  assert.match(r.stderr, /no handover recorded/);
+});
+
+test('a window with no session record and no matching beacon pid records no handover', async () => {
+  fs.rmSync(path.join(binDir, 'claude-sessions'), { recursive: true, force: true });
+  const fx = await handoverFixture('norecord');
+  await seatHolder(fx);
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal((await handovers(fx.db)).length, 0);
 });
