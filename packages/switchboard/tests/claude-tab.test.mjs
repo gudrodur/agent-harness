@@ -871,6 +871,22 @@ test('--close --after-loka refuses a seat that holds a role, however finished it
   assert.equal(await exists('closed'), false);
 });
 
+test('--close --after-loka refuses a seat that holds a live resource lease (25), and closes once it is released or expired', async () => {
+  const { acquire, release } = await import('../lib/resource-leases.mjs');
+  await finishedSeat();
+  await withStore((db) => acquire(db, { resource: 'device:s23', sessionId: OLD_SESSION }));
+  let r = await closeFinished();
+  assert.equal(r.code, 25, r.err);
+  assert.match(r.err, /resource lease/);
+  assert.equal(await exists('closed'), false);
+  // Another session's lease does not block it; an expired one of its own does not either.
+  await withStore((db) => release(db, { resource: 'device:s23', sessionId: OLD_SESSION }));
+  await withStore((db) => acquire(db, { resource: 'device:other', sessionId: 'someone-else' }));
+  await withStore((db) => acquire(db, { resource: 'lane:old', sessionId: OLD_SESSION, ttlMs: 1000, now: Date.now() - 3_600_000 }));
+  r = await closeFinished();
+  assert.equal(r.code, 0, r.err);
+});
+
 test('--close --after-loka refuses a seat with mail to or from it after the marker, or a prompt in its transcript after it', async () => {
   await finishedSeat();
   await lokaDone({ id: 'm-later-from', ts: new Date(Date.now() - 2_000).toISOString(), text: 'one more result' });

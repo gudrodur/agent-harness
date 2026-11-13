@@ -16,7 +16,7 @@
 #   tab_ledger_close <id>                        --close: close only a window this ledger
 #                                                recorded, refusing a stranger or a reused id
 #   tab_ledger_close_finished <id>               --close --after-loka: close a window this ledger never
-#                                                launched, once its seat has recorded "loka done" and is idle
+#                                                launched, once its seat sent its LOKA-DONE marker and is idle
 #   tab_ledger_retire <id> <taker-session>       --retire: close the window a takeover displaced,
 #                                                on the strength of a handover row (below)
 #
@@ -204,6 +204,49 @@ tab_ledger_close() {
   return 0
 }
 
+# Guards shared by --retire and --close --after-loka, the two paths that close a
+# window this ledger never launched. One copy, so a fix lands in both.
+#   _tab_ledger_numeric_id <flag> <id>   the id is a number
+#   _tab_ledger_target <flag> <id>       sets LS (the parsed `kitty @ ls`) and NOW_PID
+#                                        (empty: the window is gone); refuses the caller's
+#                                        own window (22), no remote control (2) and a
+#                                        listing that is not a JSON array
+#   _tab_ledger_release_gone <id>        drop the row and release the claims of a gone window
+#   _tab_ledger_require_idle <id> <why>  refuse unless the seat is idle (23)
+#   _tab_ledger_close_window <id> <ok>   close it, then drop the row and release the claims
+_tab_ledger_numeric_id() {
+  case "${2:-}" in *[!0-9]*|"") die "$1 takes a numeric window id, got: ${2:-}" ;; esac
+}
+_tab_ledger_target() {
+  local flag="$1" id="$2"
+  [ "$id" != "${KITTY_WINDOW_ID:-}" ] \
+    || die "window $id is this session's own window — refusing to close it." 22
+  kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
+  # The listing must parse as an array: output that exits 0 but is not JSON
+  # would otherwise read as "no such window" and release a live seat's claims.
+  LS=$(kitty @ ls 2>/dev/null) && [ -n "$LS" ] && printf '%s' "$LS" | jq -e 'type == "array"' >/dev/null 2>&1 \
+    || die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
+  NOW_PID=$(printf '%s' "$LS" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
+}
+_tab_ledger_release_gone() {
+  sed -i "/^$1 /d" "$STATE" 2>/dev/null
+  claim_cli --release-owner "kitty:$1" >/dev/null 2>&1 || true
+}
+_tab_ledger_require_idle() {
+  local st
+  st=$("$TAB_LEDGER_BIN/tab-state.sh" "$1" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
+  [ "$st" = "state=idle" ] \
+    || die "window $1 is not idle (${st:-state=unknown}) — $2; retry when it is idle." 23
+}
+_tab_ledger_close_window() {
+  if kitty @ close-window --match "id:$1" 2>/dev/null; then
+    note "$2"
+  else
+    die "close-window FAILED for $1 — the window may still be open; go look"
+  fi
+  _tab_ledger_release_gone "$1"
+}
+
 # --retire <id>. Closes a window THIS ledger never launched, which --close
 # refuses, on different evidence: the shared store holds a handover row that
 # `agent-send --claim-role R --take-over` wrote when the caller took a role from
@@ -218,14 +261,13 @@ tab_ledger_close() {
 # window that is already gone is not a refusal: its row is marked retired, its
 # claims are released, and the exit is 0.
 tab_ledger_retire() {
-  local id="${1:-}" taker="${2:-}" bin verdict reason hid want_pid want_sid have_sid now_pid st ls
+  local id="${1:-}" taker="${2:-}" bin verdict reason hid want_pid want_sid have_sid
   bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+  TAB_LEDGER_BIN="$bin"
   [ -n "$id" ] || die "--retire needs a window id"
-  case "$id" in *[!0-9]*|"") die "--retire takes a numeric window id, got: $id" ;; esac
+  _tab_ledger_numeric_id --retire "$id"
   [ -n "$taker" ] || die "--retire needs the calling session id: run it from the session that took the role, or pass --as <session-id>"
-  [ "$id" != "${KITTY_WINDOW_ID:-}" ] \
-    || die "window $id is this session's own window — refusing to close it." 22
-  kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
+  _tab_ledger_target --retire "$id"
 
   verdict=$(node "$bin/seat-handover.mjs" check "$id" "$taker") \
     || die "could not read the handover store — nothing closed"
@@ -242,19 +284,11 @@ tab_ledger_retire() {
   hid=$(printf '%s' "$verdict" | jq -r .id)
   want_pid=$(printf '%s' "$verdict" | jq -r '.pid // empty')
   want_sid=$(printf '%s' "$verdict" | jq -r '.displacedSession // empty')
-  # One listing serves the pid, the session and the gone checks. A failed
-  # listing is a refusal, never "the window is gone".
-  # The listing must parse as an array: output that exits 0 but is not JSON
-  # would otherwise read as "no such window" and release a live seat's claims.
-  ls=$(kitty @ ls 2>/dev/null) && [ -n "$ls" ] && printf '%s' "$ls" | jq -e 'type == "array"' >/dev/null 2>&1 \
-    || die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
-  now_pid=$(printf '%s' "$ls" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
 
-  if [ -z "$now_pid" ]; then
+  if [ -z "$NOW_PID" ]; then
     node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1 \
       || die "window $id is gone but handover $hid could not be marked retired"
-    sed -i "/^$id /d" "$STATE" 2>/dev/null
-    claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+    _tab_ledger_release_gone "$id"
     note "window $id was already gone — nothing to close (handover retired, claims released)"
     return 0
   fi
@@ -262,27 +296,19 @@ tab_ledger_retire() {
   # taken. A row with no pid cannot prove anything, so it refuses too.
   [ -n "$want_pid" ] \
     || die "the handover for window $id recorded no pid, so the window cannot be shown to be the displaced seat. Refusing." 21
-  if [ "$want_pid" != "$now_pid" ]; then
+  if [ "$want_pid" != "$NOW_PID" ]; then
     die "window $id is NOT the seat that was displaced — id reused.
-        handover recorded pid $want_pid, that id now belongs to pid $now_pid. Refusing." 21
+        handover recorded pid $want_pid, that id now belongs to pid $NOW_PID. Refusing." 21
   fi
   # The session in the window must be the displaced one.
   . "$bin/../lib/claude-session.sh"
-  have_sid=$(claude_session_json "$id" "$ls" | jq -r '.sessionId // empty' 2>/dev/null)
+  have_sid=$(claude_session_json "$id" "$LS" | jq -r '.sessionId // empty' 2>/dev/null)
   [ "$have_sid" = "$want_sid" ] \
     || die "window $id holds session '${have_sid:-<none>}', not the displaced session '$want_sid'. Refusing." 21
-  st=$("$bin/tab-state.sh" "$id" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
-  [ "$st" = "state=idle" ] \
-    || die "window $id is not idle (${st:-state=unknown}) — the displaced seat may be mid-turn; retry when it is idle." 23
+  _tab_ledger_require_idle "$id" "the displaced seat may be mid-turn"
 
-  if kitty @ close-window --match "id:$id" 2>/dev/null; then
-    note "retired window $id (role handed over to $taker)"
-  else
-    die "close-window FAILED for $id — the window may still be open; go look"
-  fi
+  _tab_ledger_close_window "$id" "retired window $id (role handed over to $taker)"
   node "$bin/seat-handover.mjs" retired "$hid" >/dev/null 2>&1 || note "could not mark handover $hid retired"
-  sed -i "/^$id /d" "$STATE" 2>/dev/null
-  claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -297,27 +323,23 @@ tab_ledger_retire() {
 #   23  the seat is not idle (busy, or its state cannot be proven)
 #   24  no finished proof: no Claude Code session in the window, no marker since
 #       it started, it holds a seat role, or it shows activity after the marker
+#   25  the session holds a live resource lease (a device or a runner lane)
 # 1 is a usage or store error and 2 is no kitty remote control. A window that is
 # already gone is not a refusal: its claims are released and the exit is 0.
 tab_ledger_close_finished() {
-  local id="${1:-}" bin verdict ls now_pid rec sid started st
+  local id="${1:-}" bin verdict rec sid started
   bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+  TAB_LEDGER_BIN="$bin"
   [ -n "$id" ] || die "--close needs a window id"
-  case "$id" in *[!0-9]*|"") die "--close takes a numeric window id, got: $id" ;; esac
-  [ "$id" != "${KITTY_WINDOW_ID:-}" ] \
-    || die "window $id is this session's own window — refusing to close it." 22
-  kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
-  ls=$(kitty @ ls 2>/dev/null) && [ -n "$ls" ] && printf '%s' "$ls" | jq -e 'type == "array"' >/dev/null 2>&1 \
-    || die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
-  now_pid=$(printf '%s' "$ls" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
-  if [ -z "$now_pid" ]; then
-    sed -i "/^$id /d" "$STATE" 2>/dev/null
-    claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+  _tab_ledger_numeric_id --close "$id"
+  _tab_ledger_target --close "$id"
+  if [ -z "$NOW_PID" ]; then
+    _tab_ledger_release_gone "$id"
     note "window $id was already gone — nothing to close (claims released)"
     return 0
   fi
   . "$bin/../lib/claude-session.sh"
-  rec=$(claude_session_json "$id" "$ls") \
+  rec=$(claude_session_json "$id" "$LS") \
     || die "window $id runs no Claude Code session, so nothing shows that its seat finished. Refusing." 24
   sid=$(printf '%s' "$rec" | jq -r '.sessionId // empty')
   started=$(printf '%s' "$rec" | jq -r '.startedAt // empty')
@@ -326,6 +348,7 @@ tab_ledger_close_finished() {
     || die "could not read the switchboard store — nothing closed"
   if [ "$(printf '%s' "$verdict" | jq -r .finished)" != true ]; then
     case "$(printf '%s' "$verdict" | jq -r '.reason // "no-marker"')" in
+      holds-lease) die "window $id (session $sid) holds a resource lease (a device or a runner lane); it would stay held by a dead session until its TTL ran out. Release it first. Refusing." 25 ;;
       holds-role) die "window $id (session $sid) holds a seat role; role mail would go to a dead window. Hand the role over first. Refusing." 24 ;;
       later-mail) die "window $id (session $sid) has mail to or from it newer than its LOKA-DONE marker, so it is working again. Refusing." 24 ;;
       later-turn) die "window $id (session $sid) has a prompt in its transcript newer than its LOKA-DONE marker, so it is working again. Refusing." 24 ;;
@@ -334,16 +357,7 @@ tab_ledger_close_finished() {
         The marker is one message whose whole text is \"LOKA-DONE $sid\", sent by that session; free text saying \"loka done\" is not proof." 24 ;;
     esac
   fi
-  st=$("$bin/tab-state.sh" "$id" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
-  [ "$st" = "state=idle" ] \
-    || die "window $id is not idle (${st:-state=unknown}) — the seat is still working after its LOKA-DONE marker; retry when it is idle." 23
-
-  if kitty @ close-window --match "id:$id" 2>/dev/null; then
-    note "closed finished window $id (session $sid sent its LOKA-DONE marker)"
-  else
-    die "close-window FAILED for $id — the window may still be open; go look"
-  fi
-  sed -i "/^$id /d" "$STATE" 2>/dev/null
-  claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
+  _tab_ledger_require_idle "$id" "the seat is still working after its LOKA-DONE marker"
+  _tab_ledger_close_window "$id" "closed finished window $id (session $sid sent its LOKA-DONE marker)"
   return 0
 }

@@ -9,6 +9,7 @@
 //         no-marker     no LOKA-DONE row from this session since <since-ms>
 //                       (a withdrawn row does not count)
 //         holds-role    the session holds a role in seat_roles
+//         holds-lease   the session holds a live resource lease (lib/resource-leases.mjs)
 //         later-mail    a message row from or to the session is newer than the marker
 //         later-turn    the transcript has a prompt newer than the marker
 //         no-transcript the transcript cannot be read, so activity cannot be ruled out
@@ -29,6 +30,7 @@
 import fs from 'node:fs';
 import { sanitizeSessionId } from '../lib/agent-mailbox.mjs';
 import { readRolesDb, rolesForSession } from '../lib/seat-roles.mjs';
+import { heldBy } from '../lib/resource-leases.mjs';
 
 export const lokaMarker = (sessionId) => `LOKA-DONE ${sessionId}`;
 
@@ -56,6 +58,7 @@ const promptAfter = (transcript, afterMs) => {
 
 export const finishedVerdict = (db, { sessionId, sinceMs = 0, transcript = null }) => {
   if (rolesForSession(db, sessionId).length) return { finished: false, reason: 'holds-role' };
+  if (heldBy(db, { sessionId }).length) return { finished: false, reason: 'holds-lease' };
   const sid = sanitizeSessionId(sessionId);
   const suffix = `__${sid}`;
   const sinceIso = new Date(Number(sinceMs)).toISOString();
