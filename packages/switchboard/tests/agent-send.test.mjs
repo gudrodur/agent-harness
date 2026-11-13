@@ -143,6 +143,8 @@ const childEnv = (extra = {}) => isolatedEnv({
   AGENT_MAILBOX_PRESENCE_FILE: presFile,
   AGENT_MAILBOX_KITTY: kittyStub,
   AGENT_SEND_KITTY_SEND: fallbackStub,
+  // The assertions below read the step-by-step trace; the quiet default has its own tests.
+  AGENT_SEND_VERBOSE: '1',
   ...extra,
 });
 
@@ -308,6 +310,24 @@ test('an idle recipient caps the ack wait instead of blocking the full default (
   assert.match(stderr, /ack wait capped at 5s/);
   assert.match(stderr, /kitty-send exit 10 for 991001: typed, not proven submitted/);
   assert.ok(elapsed < 30_000, `idle recipient must not wait the full default (took ${elapsed}ms)`);
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a typed message must not be queued a second time');
+});
+
+// kitty-send exit 16 (a slash command still in the composer after its extra
+// Enters) is typed, not proven submitted: like 10 it passes through, is never
+// re-queued, and its own chatter is held because agent-send prints the verdict.
+test('kitty-send exit 16 passes through with one verdict line and no kitty-send chatter', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const chatter = path.join(binDir, 'chatter-16');
+  fs.writeFileSync(chatter, '#!/usr/bin/env bash\necho "kitty-send: raw chatter line" >&2\nexit 16\n', { mode: 0o755 });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--text', 'parked steer'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: chatter }),
+  );
+  assert.equal(code, 16, stderr);
+  assert.match(stderr, /kitty-send exit 16 for 991001: .*typed, not proven submitted/);
+  assert.doesNotMatch(stderr, /raw chatter line/);
   assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a typed message must not be queued a second time');
 });
 
@@ -2037,6 +2057,267 @@ test('a window with no session record and no matching beacon pid records no hand
   assert.equal((await handovers(fx.db)).length, 0);
 });
 
+// Quiet default output. A send to a busy recipient that ends queued (exit 3)
+// used to print about six lines (queued, withdrew, kitty-send fallback, "sent
+// nothing", re-queued) and read like a failure. The default is now one line,
+// the final verdict; --verbose or AGENT_SEND_VERBOSE brings the trace back.
+const quiet = (extra = {}) => ({ AGENT_SEND_VERBOSE: '', ...extra });
+const nonEmptyLines = (s) => s.split('\n').filter(Boolean);
+
+test('a busy recipient that ends queued prints one verdict line by default', async () => {
+  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' }));
+  assert.equal(code, 3, stderr);
+  const lines = nonEmptyLines(stderr);
+  assert.equal(lines.length, 1, `one line, got:\n${stderr}`);
+  assert.match(lines[0], /^agent-send: queued for 991001 \(not typed: idle wait ran out\), delivered at its next tool call.*\(id \S+; exit 3: pending, do not resend/);
+  assert.doesNotMatch(stderr, /falling back|withdrew|sent nothing/);
+  for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
+});
+
+test('--verbose and AGENT_SEND_VERBOSE bring the step-by-step trace back', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const viaEnv = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_VERBOSE: '1' });
+  assert.match(viaEnv.stderr, /withdrew the mailbox row/);
+  assert.match(viaEnv.stderr, /falling back to kitty-send/);
+  assert.ok(nonEmptyLines(viaEnv.stderr).length >= 4, viaEnv.stderr);
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'flag', '--deadline', '1', '--verbose'], childEnv(quiet()));
+  assert.equal(code, 3);
+  assert.match(stderr, /queued \S+ for .*withdraw with --cancel --id/);
+});
+
+test('an error stays visible in the quiet default', async () => {
+  const { code, stderr } = await runSend(['--to', '991001'], childEnv(quiet()));
+  assert.equal(code, 1);
+  assert.match(stderr, /pass --text LINE or --file/);
+});
+
+// --queue waited for the recipient's drain for as long as 120 s. Its unbounded
+// wait is documented and relied on (an idle seat is typed into), so the fast
+// path is a new flag instead.
+test('--no-wait returns as soon as the row is written: exit 3, no ack wait, no kitty-send', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const t0 = Date.now();
+  const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'fire and forget', '--queue', '--no-wait'], childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2' })));
+  assert.equal(code, 3, stderr);
+  assert.ok(Date.now() - t0 < 3000, 'no ack wait');
+  assert.ok(!fs.existsSync(fallbackArgv), 'kitty-send was not run');
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1);
+  assert.equal(left[0].text, 'fire and forget');
+  assert.equal(left[0].priority, 'queue');
+  assert.equal(nonEmptyLines(stderr).length, 1, stderr);
+  assert.match(stderr, new RegExp(`queued for ${KEY_S1}.*id ${left[0].id}; exit 3`));
+});
+
+test('--queue without --no-wait still waits for the drain (documented contract)', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const t0 = Date.now();
+  const { code } = await runSend(['--to', KEY_S1, '--text', 'wait', '--queue', '--deadline', '2'], childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2' })));
+  assert.ok(Date.now() - t0 >= 1800, 'the queue wait ran to its deadline');
+  assert.equal(code, 3);
+  for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
+});
+
+// Mail for a role nobody holds exits 3 and nobody notices. With
+// AGENT_SEND_NOTICE_ROLE set, the notice role gets one short row saying so.
+test('a send to a role with no live holder also notifies the configured notice role', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(['--to', 'role:unheld-role', '--text', 'ci fault'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(code, 3, stderr);
+  const own = readUnacked('role:unheld-role', { dir: mboxDir });
+  assert.equal(own.length, 1);
+  assert.equal(own[0].text, 'ci fault');
+  const notice = readUnacked('role:watch-role', { dir: mboxDir });
+  assert.equal(notice.length, 1, 'one notice');
+  assert.match(notice[0].text, /Mail for role unheld-role has no reader/);
+  assert.match(notice[0].text, new RegExp(own[0].id));
+  // A repeat collapses into one notice through the topic.
+  await runSend(['--to', 'role:unheld-role', '--text', 'again'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 1, 'repeats do not pile up');
+});
+
+test('no notice without AGENT_SEND_NOTICE_ROLE, and none for the notice role itself', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  await runSend(['--to', 'role:unheld-role', '--text', 'x'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: '' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 0, 'unset: no notice');
+  const self = await runSend(['--to', 'role:watch-role', '--text', 'y'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(self.code, 3);
+  const rows = readUnacked('role:watch-role', { dir: mboxDir });
+  assert.equal(rows.length, 1, 'only the message itself, no notice to itself');
+  assert.equal(rows[0].text, 'y');
+});
+
+test('--no-wait with --now, --stop or --idle-when is refused with exit 2 and writes nothing', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  for (const flags of [['--now'], ['--stop'], ['--idle-when', 'x']]) {
+    const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'x', '--no-wait', ...flags], childEnv(quiet()));
+    assert.equal(code, 2, `${flags}: ${stderr}`);
+    assert.match(stderr, /--no-wait.*cannot interrupt/);
+  }
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 0);
+});
+
+test('a kitty-send exit 1 reason survives the re-queue in the quiet default', async () => {
+  const failStub = path.join(binDir, 'kitty-send-exit1.sh');
+  fs.writeFileSync(failStub, '#!/usr/bin/env bash\necho "kitty-send: no such window for the reason test" >&2\nexit 1\n', { mode: 0o755 });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: failStub }));
+  assert.equal(code, 3, stderr);
+  assert.match(stderr, /no such window for the reason test/);
+  assert.match(stderr, /queued for 991001/);
+  for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
+});
+
+test('a long role name keeps its own notice topic', async () => {
+  const a = `${'r'.repeat(55)}-a`;
+  const b = `${'r'.repeat(55)}-b`;
+  for (const r of [a, b, 'watch-role']) fs.rmSync(mailboxPath(`role:${r}`, { dir: mboxDir }), { force: true });
+  for (const r of [a, b]) await runSend(['--to', `role:${r}`, '--text', 'x'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 2, 'one notice per role');
+});
+
+// ---- review round 3 (supervisor findings on f32fecc) ---------------------------
+
+const exitStub = (name, code, noise = null) => {
+  const f = path.join(binDir, `kitty-send-${name}.sh`);
+  fs.writeFileSync(f, `#!/usr/bin/env bash\n${noise ? `echo ${JSON.stringify(noise)} >&2\n` : ''}exit ${code}\n`, { mode: 0o755 });
+  return f;
+};
+const clearKey = (key) => { for (const r of readUnacked(key, { dir: mboxDir })) cancelQueued({ key, id: r.id, dir: mboxDir }); };
+
+// A quiet --queue send waits unbounded; a caller killed during the wait must
+// still know the row id to --cancel.
+test('--queue prints the queued id line at once, not only when it exits', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const child = spawn('node', [SEND, '--to', KEY_S1, '--text', 'id early', '--queue', '--deadline', '3'], { env: childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2' })) });
+  let stderr = '';
+  let closed = false;
+  child.stderr.on('data', (d) => { stderr += d; });
+  const done = new Promise((resolve) => child.on('close', () => { closed = true; resolve(); }));
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.equal(closed, false, 'still waiting');
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1);
+  assert.match(stderr, new RegExp(`queued for ${KEY_S1}.*id ${left[0].id}.*--cancel --id ${left[0].id}`));
+  await done;
+  clearKey(KEY_S1);
+});
+
+// A re-queue after kitty-send sent nothing must keep the reason, and must not
+// promise a tool-call delivery to a seat that sits on a dialog or a draft.
+for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds unsubmitted text/], [11, /screen unreadable or composer not clear/]]) {
+  test(`a re-queue after kitty-send exit ${st} names the reason and does not promise a tool-call delivery`, async () => {
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`exit${st}`, st) }));
+    assert.equal(code, 3, stderr);
+    assert.match(stderr, reason);
+    assert.doesNotMatch(stderr, /next tool call/);
+    assert.equal(nonEmptyLines(stderr).length, 1, stderr);
+    clearKey(KEY_S1);
+  });
+}
+
+// --no-wait only writes a row. Against an idle seat (or no consumer) it used
+// to fall into the kitty fallback and type, then block on the proof.
+const IDLE_BEACON = () => {
+  const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  return [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }];
+};
+
+test('--no-wait to an idle seat only queues: nothing is typed', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: IDLE_BEACON() }));
+    fs.rmSync(fallbackArgv, { force: true });
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { code, stderr } = await runSend(['--to', '991001', '--text', 'wake later', '--no-wait'], childEnv(quiet({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_PROC_DIR: procDir })));
+    assert.equal(code, 3, stderr);
+    assert.ok(!fs.existsSync(fallbackArgv), 'kitty-send was not run');
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1);
+    assert.match(stderr, /queued for 991001/);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+    clearKey(KEY_S1);
+  }
+});
+
+test('--no-wait to a seat with no mailbox key fails: nothing typed, nothing queued', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  const { code, stderr } = await runSend(['--to', '991002', '--text', 'x', '--no-wait'], childEnv(quiet()));
+  assert.equal(code, 1, stderr);
+  assert.ok(!fs.existsSync(fallbackArgv), 'kitty-send was not run');
+  assert.match(stderr, /--no-wait.*nothing is queued/);
+});
+
+test('--no-wait with --deadline is refused with exit 2: the deadline would be ignored', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(['--to', KEY_S1, '--text', 'x', '--no-wait', '--deadline', '5'], childEnv(quiet()));
+  assert.equal(code, 2, stderr);
+  assert.match(stderr, /--no-wait.*--deadline/);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 0);
+});
+
+// The no-reader notice is the switchboard's, not the original sender's, and
+// reading it does not make the next send raise a new one inside the window.
+test('the no-reader notice comes from a switchboard label, not the original sender', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  await runSend(['--to', 'role:unheld-role', '--text', 'ci fault'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' })));
+  const [notice] = readUnacked('role:watch-role', { dir: mboxDir });
+  assert.equal(notice.from, 'switchboard');
+  assert.match(notice.text, /row \S+ \(from \S+\) waits/);
+});
+
+test('a notice already read is not raised again inside the notice window', async () => {
+  fs.rmSync(mailboxPath('role:unheld-role', { dir: mboxDir }), { force: true });
+  fs.rmSync(mailboxPath('role:watch-role', { dir: mboxDir }), { force: true });
+  const env = childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role' }));
+  await runSend(['--to', 'role:unheld-role', '--text', 'one'], env);
+  const [first] = readUnacked('role:watch-role', { dir: mboxDir });
+  ack({ key: 'role:watch-role', id: first.id, dir: mboxDir });
+  await runSend(['--to', 'role:unheld-role', '--text', 'two'], env);
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 0, 'read once, not raised again');
+  await runSend(['--to', 'role:unheld-role', '--text', 'three'], childEnv(quiet({ AGENT_SEND_NOTICE_ROLE: 'watch-role', AGENT_SEND_NOTICE_WINDOW_MIN: '0' })));
+  assert.equal(readUnacked('role:watch-role', { dir: mboxDir }).length, 1, 'a zero window raises one every time');
+});
+
+// kitty-send's own stderr is trace in the quiet default: agent-send's line is
+// the verdict, and EVERY exit prints exactly one. Failures it cannot explain
+// itself still pass through.
+for (const [st, verdictRe] of [[0, /delivered/], [3, /typed.*not proven|unproven/], [8, /steering queue/], [10, /not proven submitted/]]) {
+  test(`busy path, kitty-send exit ${st}: one verdict line, kitty-send chatter not replayed`, async () => {
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`noise${st}`, st, 'kitty-send: chatty detail') }));
+    assert.doesNotMatch(stderr, /chatty detail/);
+    const lines = nonEmptyLines(stderr);
+    assert.equal(lines.length, 1, stderr);
+    assert.match(lines[0], verdictRe);
+    clearKey(KEY_S1);
+  });
+}
+
+// The direct kitty fallback (a window with no mailbox consumer) owes the same
+// single verdict line on every outcome kitty-send can end with.
+for (const [st, code, verdictRe] of [[0, 0, /delivered/], [3, 3, /typed.*not proven|unproven/]]) {
+  test(`kitty fallback to a window with no consumer, kitty-send exit ${st}: one verdict line`, async () => {
+    const { code: got, stderr } = await runSend(['--to', '991002', '--text', 'direct'], childEnv(quiet({ AGENT_SEND_KITTY_SEND: exitStub(`direct${st}`, st, 'kitty-send: chatty detail') })));
+    assert.equal(got, code, stderr);
+    assert.doesNotMatch(stderr, /chatty detail/);
+    const lines = nonEmptyLines(stderr);
+    assert.equal(lines.length, 1, stderr);
+    assert.match(lines[0], verdictRe);
+  });
+}
+
 // Output larger than the 64 KiB pipe buffer must arrive whole: a write
 // followed by process.exit() drops whatever the pipe has not yet taken. The
 // reader here is deliberately slow to start, so the child hits a full pipe.
@@ -2059,4 +2340,57 @@ test('--who --json into a slow pipe delivers the whole document, not 64 KiB', as
       { sessionId: 's3', cwd: '/repo/b' },
     ]);
   }
+});
+
+// --queue --deadline holds the row when the proof refuses: the line must key its
+// wording on WHY, as the kitty-status path does. A draft or a dialog takes
+// nothing at a tool call.
+for (const [name, screen, why] of [
+  ['a draft', ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n'), /composer/],
+  ['a dialog', ['● Done.', 'Do you want to proceed?', 'Enter to select · Esc to cancel'].join('\n'), /dialog/],
+]) {
+  test(`--queue --deadline held on ${name}: the quiet line does not promise a tool-call delivery`, async () => {
+    const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue', '--deadline', '2'], { title: '✳ claude: idle seat', screen, envExtra: quiet(), killAfterMs: 15_000 });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    assert.doesNotMatch(stderr, /next tool call/);
+    assert.match(stderr, why);
+    assert.match(stderr, /exit 3/);
+  });
+}
+
+// An idle seat with a mailbox consumer, stuck on a dialog: the parked row is not
+// delivered "at its next prompt"; someone has to clear the dialog first.
+test('--queue to an idle seat on a dialog: the re-queue line says the dialog must clear first', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: IDLE_BEACON() }));
+    const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue'], {
+      title: '✳ claude: idle seat', screen: ['● Done.', 'Enter to select · Esc to cancel'].join('\n'),
+      envExtra: quiet({ AGENT_MAILBOX_PROC_DIR: procDir }),
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(code, 3, stderr);
+    assert.doesNotMatch(stderr, /next prompt|next tool call/);
+    assert.match(stderr, /dialog/);
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+    clearKey(KEY_S1);
+  }
+});
+
+// --help must describe what the code does.
+test('--help lists exit 2 and does not claim --no-wait falls back to kitty', async () => {
+  const child = spawn('node', [SEND, '--help'], { env: childEnv() });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  await new Promise((resolve) => child.on('close', resolve));
+  assert.match(out, /^\s+2\s+--no-wait/m);
+  assert.doesNotMatch(out, /kitty path runs as usual/);
+  assert.match(out, /no mailbox[^]*?exit 1|exit 1[^]*?no mailbox/i);
 });

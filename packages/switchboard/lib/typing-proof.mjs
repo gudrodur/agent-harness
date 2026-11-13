@@ -48,6 +48,13 @@ export const DIALOG_RE = /Enter to select|Esc to cancel|↑\/↓ to navigate|Ent
 // Bottom rows only: an answered dialog stays in the scrollback in full.
 const DIALOG_ROWS = 15;
 const RULE_RE = /^\s*[─━]{5,}\s*$/;
+// Claude Code prints a session's custom title inside the composer's TOP rule
+// (`───── example seat title ─`). That rule is rule characters, a label set off
+// by a space, and usually more rule characters; a title that runs to the edge
+// or is cut off has none after it, and a narrow split gives it as few as three
+// leading ones. A bare top rule still needs five. Only the top rule is read this
+// way; the bottom rule stays strict, so a draft line cannot widen what ends the box.
+const TOP_RULE_RE = /^\s*(?:[─━]{5,}|[─━]{3,}\s\S.*)\s*$/;
 const PROMPT_RE = /^[❯>](\s|$)/;
 
 const verdict = (kind, reason = null) => ({ kind, reason });
@@ -59,19 +66,28 @@ const composerBox = (lines) => {
   const bottom = lines.findLastIndex((l) => RULE_RE.test(l));
   if (bottom < 0) return { error: 'no composer box on the screen (no closing rule)' };
   const at = lines.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
-  if (at < 1 || !RULE_RE.test(lines[at - 1])) return { error: 'no composer box on the screen (no prompt line under a top rule)' };
+  if (at < 1 || !TOP_RULE_RE.test(lines[at - 1])) return { error: 'no composer box on the screen (no prompt line under a top rule)' };
   return { rows: [lines[at].replace(/^[❯>]/, ''), ...lines.slice(at + 1, bottom)] };
 };
 
+// The visible screen as right-trimmed lines, or null when it cannot be read.
+const readScreenLines = (winId) => {
+  const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
+  try {
+    return execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }).split('\n').map((l) => l.trimEnd());
+  } catch { return null; }
+};
+
 // Does the composer still hold `text` (whitespace ignored)? true / false, or
-// null when the box cannot be found or the screen cannot be read: "could not
+// null when the box cannot be found, a dialog is open or the screen cannot be read: "could not
 // tell" is never "empty". Used by kitty-send to re-press Enter on a slash
 // command whose trailing \r the composer swallowed.
 export const composerHolds = (winId, text) => {
-  const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
-  let screen;
-  try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return null; }
-  const box = composerBox(screen.split('\n').map((l) => l.trimEnd()));
+  const lines = readScreenLines(winId);
+  if (lines == null) return null;
+  // A dialog on screen: the next Enter would answer it, so never "holds".
+  if (lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l))) return null;
+  const box = composerBox(lines);
   if (box.error != null) return null;
   const want = text.replace(/\s+/g, '');
   return want !== '' && box.rows.join('').replace(/\s+/g, '').includes(want);
@@ -103,9 +119,8 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
     try { record = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${proc.pid}.json`), 'utf-8')); } catch { record = null; }
     if (DIALOG_STATUSES.has(record?.status)) return verdict(DIALOG, `session record status ${record.status}: a permission prompt, question or stuck turn is waiting on the human`);
   }
-  let screen;
-  try { screen = execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }); } catch { return verdict(REFUSED, 'screen could not be read'); }
-  const lines = screen.split('\n').map((l) => l.trimEnd());
+  const lines = readScreenLines(winId);
+  if (lines == null) return verdict(REFUSED, 'screen could not be read');
   if (lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l))) return verdict(DIALOG, 'a dialog is open on the screen');
   if (dialogOnly) return verdict(PROVEN);
 

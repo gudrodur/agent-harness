@@ -25,6 +25,7 @@ const childEnv = (extra = {}) =>
     AGENT_SWITCHBOARD_DB: dbPath,
     AGENT_MAILBOX_KITTY: kittyStub,
     AGENT_SEND_KITTY_SEND: kittySendStub,
+    AGENT_SEND_VERBOSE: '1',
     AGENT_MAILBOX_PROC_DIR: procDir,
     ...extra,
   });

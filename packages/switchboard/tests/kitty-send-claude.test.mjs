@@ -90,7 +90,7 @@ before(async () => {
     '    elif [ -f "$state/screen_dyn" ]; then',
     '      # a live composer: typed text sits in the box until a lone \\r submits it, then the command shows its effect',
     '      rule=$(cat "$state/rule")',
-    '      if [ -f "$state/composer" ]; then printf \'%s\\n\' "● Done." "" "$rule" "❯ $(cat "$state/composer")" "$rule" "  ⏵⏵ bypass permissions on · 1 shell"',
+    '      if [ -f "$state/composer" ]; then printf \'%s\\n\' "● Done." "" "$rule" "❯ $(cat "$state/composer")" "$rule" "  ⏵⏵ bypass permissions on · 1 shell"; [ -f "$state/dialog_after_send" ] && echo "  Enter to select · Esc to cancel"',
     '      elif [ -f "$state/sent" ]; then printf \'%s\\n\' "● Done." "● Renamed." "" "$rule" "❯ " "$rule" "  ⏵⏵ bypass permissions on · 1 shell"',
     '      else printf \'%s\\n\' "● Done." "" "$rule" "❯ " "$rule" "  ⏵⏵ bypass permissions on · 1 shell"; fi',
     '    elif [ -f "$state/screen" ]; then cat "$state/screen"',
@@ -110,7 +110,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_dyn', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_dyn', 'dialog_after_send', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -412,4 +412,48 @@ test('a slash command no Enter can submit exits 16 after the bounded tries, neve
   assert.equal(r.code, 16, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), ['burst', 'enter', 'enter', 'enter'], 'three extra Enters at most');
   assert.match(r.err, /typed, not proven submitted/);
+});
+
+// A bad KITTY_SEND_SLASH_ENTER_TRIES must not turn the bounded loop into an
+// unbounded one (a non-numeric value makes the numeric comparison always false):
+// anything but a non-negative integer falls back to the default of 3.
+for (const bad of ['abc', '-1', '2x', '']) {
+  test(`KITTY_SEND_SLASH_ENTER_TRIES="${bad}" falls back to 3 tries, then exit 16`, async () => {
+    await live('never');
+    const r = await runScript(['--to', WID, '--text', '/rename x', '--wait-idle', '4', '--timeout', '8'], { KITTY_SEND_SLASH_ENTER_TRIES: bad });
+    assert.equal(r.code, 16, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), ['burst', 'enter', 'enter', 'enter']);
+  });
+}
+
+// The retry presses Enter only when it is safe and needed.
+test('a slash command whose first \\r submits gets no extra Enter', async () => {
+  await live('burst');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--wait-idle', '4', '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst']);
+});
+
+test('no extra Enter while a dialog footer is on the screen (an Enter would answer it)', async () => {
+  await live('never');
+  await put('dialog_after_send', '');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--now', '--timeout', '3']);
+  assert.notEqual(r.code, 16, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst']);
+});
+
+test('no extra Enter once the title shows a running turn (the command was submitted)', async () => {
+  await live('never');
+  await put('title', '⠋ Claude Code');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--now', '--timeout', '3']);
+  assert.notEqual(r.code, 16, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst']);
+});
+
+test('a tab that is not Claude Code gets no extra Enter', async () => {
+  await live('never');
+  await put('nonclaude', '');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--now', '--timeout', '3']);
+  assert.notEqual(r.code, 16, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst']);
 });

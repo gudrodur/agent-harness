@@ -790,6 +790,9 @@ CLAUDE_ENTER_AFTER="${KITTY_SEND_CLAUDE_ENTER_AFTER:-3}"
 # that \r, leaving the command text in the box. Extra lone Enters pressed while
 # the composer still holds it, at most this many; then exit 16.
 SLASH_ENTER_TRIES="${KITTY_SEND_SLASH_ENTER_TRIES:-3}"
+# Anything but a non-negative integer (a typo would make the numeric bound below
+# never trip) falls back to the default.
+case "$SLASH_ENTER_TRIES" in ''|*[!0-9]*) SLASH_ENTER_TRIES=3 ;; esac
 
 # Proof to look for. Default to the tail of the message: distinctive enough to be
 # this send, and short enough not to be diluted.
@@ -1080,19 +1083,22 @@ done
 # box, and the screen CHANGED (the echo), which the proofs above take for the
 # command's effect. So after the loop, while the composer still holds the typed
 # text, press Enter again, at most SLASH_ENTER_TRIES times; text that survives
-# them is exit 16. "Could not tell" (no node, no box on the screen, an unreadable
-# screen) changes nothing: the verdict below stands.
+# them is exit 16. Claude Code tabs only. "Could not tell" (no node, no box on the
+# screen, an unreadable screen, a dialog footer, a busy title) presses nothing: the verdict below stands.
 slash_composer_rc() { # 0 clear, 2 still holds the text, anything else: could not tell
   local rc=0
   command -v node >/dev/null 2>&1 && [ -f "$TYPING_PROOF" ] || return 127
   printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$WID" --mode composer --stdin >/dev/null 2>&1 || rc=$?
   return "$rc"
 }
-if [ "$SLASH_SEND" = 1 ] && [ -n "$(win_pid "$WID")" ]; then
+if [ "$SLASH_SEND" = 1 ] && [ "$CLAUDE_TAB" = 1 ] && [ -n "$(win_pid "$WID")" ]; then
   _slash_tries=0
   while :; do
     _src=0; slash_composer_rc || _src=$?
-    [ "$_src" = 2 ] || break
+    [ "$_src" = 2 ] || break  # clear, a dialog is open, or could not tell: no Enter
+    # A spinner in the title means the command was submitted and a turn runs:
+    # another Enter could queue it a second time.
+    if title_busy "$(win_title "$WID" 2>/dev/null || true)"; then break; fi
     if [ "$_slash_tries" -ge "$SLASH_ENTER_TRIES" ]; then
       note "typed the slash command into window $WID, but its composer still holds the text after $SLASH_ENTER_TRIES extra Enter(s): typed, not proven submitted. Look at the window before resending (exit 16)."
       exit 16
