@@ -1333,3 +1333,119 @@ test('an idle recipient is unchanged by the budget: no --timeout forwarded', asy
   const { argv } = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_IDLE_WAIT_S: '0.5' }, 'claude: idle seat');
   assert.ok(argv && !argv.includes('--timeout'), `argv: ${argv}`);
 });
+
+// --queue to a seat with a mailbox consumer. A Claude Code seat drains only at
+// its next tool call, its next prompt or its Stop, so an IDLE seat never acks a
+// queued row: the sender used to wait for that ack forever while the row sat in
+// the mailbox (one seat missed three messages for about 35 minutes). Now an
+// idle recipient window gets the row typed in through kitty-send --wait-idle
+// (sent only to an idle window with no dialog), and a busy one keeps the row
+// queued for its own drain. The kitty stub reads the window title from a file
+// the test rewrites, so a recipient can go idle mid-wait.
+const queueSend = (args, { title, envExtra = {}, killAfterMs = 20_000, whileRunning = null } = {}) => {
+  const titleFile = path.join(binDir, 'queue-title');
+  const titleKitty = path.join(binDir, 'kitty-queue-title-stub');
+  fs.writeFileSync(titleFile, title);
+  fs.writeFileSync(titleKitty, [
+    '#!/usr/bin/env bash',
+    `node -e 'process.stdout.write(JSON.stringify([{tabs:[{windows:[{id:991001,title:require("fs").readFileSync(process.argv[1],"utf-8"),cwd:"/repo/a"}]}]}]))' ${JSON.stringify(titleFile)}`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  let side = null;
+  const env = childEnv({
+    CLAUDE_CODE_SESSION_ID: 's2', AGENT_MAILBOX_KITTY: titleKitty, AGENT_SEND_KITTY_SEND: realRulesStub, AGENT_SEND_IDLE_WAIT_S: '0', ...envExtra,
+  });
+  const run = new Promise((resolve) => {
+    const child = spawn('node', [SEND, ...args, '--text', 'queued for an idle seat'], { env });
+    let stderr = '';
+    let killed = false;
+    child.stderr.on('data', (d) => { stderr += d; });
+    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, killAfterMs);
+    const ctl = { setTitle: (t) => fs.writeFileSync(titleFile, t), rowId: () => stderr.match(/queued (\S+) for /)?.[1] ?? null };
+    side = whileRunning?.(ctl);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const argv = fs.existsSync(fallbackArgv) ? fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean) : null;
+      resolve({ code, killed, stderr, argv });
+    });
+  });
+  // The side task's own assertions fail the test, not an unhandled rejection.
+  return run.then(async (r) => { await side; return r; });
+};
+const typedRows = () => {
+  const p = mailboxPath(KEY_S1, { dir: mboxDir });
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.via === 'typed') : [];
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('--queue to an idle recipient is typed in at once and exits 0, not left waiting for a drain', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat' });
+  assert.equal(killed, false, `the sender waited forever on an idle seat: ${stderr}`);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv, `kitty-send ran: ${stderr}`);
+  assert.ok(argv.includes('--wait-idle'), `typed only once idle: ${argv}`);
+  assert.ok(!argv.includes('--queue') && !argv.includes('--now'), `argv: ${argv}`);
+  // No double delivery: the mailbox copy is withdrawn, so no later drain shows
+  // it, and the typed copy is recorded as an acked row.
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  assert.equal(typedRows().length, 1);
+});
+
+test('--queue to a busy recipient stays queued and is acked by its drain, never typed', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: '⠇ claude: working',
+    whileRunning: async (ctl) => {
+      let id = null;
+      for (let i = 0; i < 100 && id == null; i += 1) { await sleep(50); id = ctl.rowId(); }
+      await sleep(2500); // longer than one idle poll: a busy seat is left alone
+      assert.equal(fs.existsSync(fallbackArgv), false, 'nothing typed into a busy window');
+      assert.ok(readUnacked(KEY_S1, { dir: mboxDir }).some((r) => r.id === id), 'the row is still queued');
+      ack({ key: KEY_S1, id, deliveredAs: 'tool', dir: mboxDir }); // the seat's tool-boundary drain
+    },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 0, stderr);
+  assert.equal(argv, null, 'kitty-send never ran');
+  assert.equal(typedRows().length, 0);
+});
+
+test('--queue to a busy recipient that goes idle without draining is typed in then', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: '⠇ claude: working',
+    whileRunning: async (ctl) => { await sleep(2500); ctl.setTitle('✳ claude: idle seat'); },
+  });
+  assert.equal(killed, false, `the sender waited forever after the seat went idle: ${stderr}`);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  assert.equal(typedRows().length, 1, 'one delivery, recorded once');
+});
+
+test('--queue to an idle recipient whose drain acks inside the idle wait is not typed a second time', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: 'claude: idle seat',
+    envExtra: { AGENT_SEND_IDLE_WAIT_S: '4' },
+    whileRunning: async (ctl) => {
+      let id = null;
+      for (let i = 0; i < 100 && id == null; i += 1) { await sleep(50); id = ctl.rowId(); }
+      ack({ key: KEY_S1, id, deliveredAs: 'stop', dir: mboxDir }); // the Stop drain of a turn that just ended
+    },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 0, stderr);
+  assert.equal(argv, null, 'an acked row is never typed');
+  assert.equal(typedRows().length, 0);
+});
+
+test('--queue --deadline still bounds the wait for a busy recipient', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue', '--deadline', '1'], {
+    title: '⠇ claude: working',
+    envExtra: { KITTY_SEND_STUB_EXIT: '5' },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 3, stderr);
+  assert.equal(argv[argv.indexOf('--wait-idle') + 1], '1', `argv: ${argv}`);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 're-queued for the drain');
+});

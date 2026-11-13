@@ -95,7 +95,15 @@ const usage = () => `Usage:
                 submits at once to an idle recipient, a busy one keeps kitty-send's mid-turn guard)
   --stop        priority stop: interrupts the consumer's current run
   --idle-when   priority idle (REGEX is the consumer's parked proof)
-  --queue       priority queue; the ack wait below is unbounded unless --deadline caps it
+  --queue       priority queue: deliver without interrupting the recipient's turn.
+                A recipient whose window is idle when you send, or goes idle
+                later without taking the row, gets it typed in once it has
+                been idle AGENT_SEND_IDLE_WAIT_S (default 5 s); exit 0. A
+                recipient mid-turn keeps the row queued and takes it at its
+                next tool call or when the turn ends. So --queue is safe to
+                send to an idle seat. The wait is unbounded unless --deadline
+                caps it, and a recipient with no kitty window to read waits
+                for its own drain
   --deadline N  seconds to wait for the ack row (default 120; a busy recipient
                 is bounded by AGENT_SEND_BUDGET_S instead, see docs/configuration.md)
   --topic SLUG  one delivery per topic: an earlier unacked message to the same
@@ -182,6 +190,9 @@ const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_S
 // send is already queued, 7 mid-turn without --now/--queue/--wait-idle, 9
 // the composer already held a paste chip that is not kitty-send's own.
 const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9]);
+// How often a --queue sender re-reads the recipient window's title while it
+// waits for the drain (one `kitty @ ls` per poll).
+const QUEUE_POLL_MS = 2000;
 const KITTY_NOTHING_REASON = {
   1: 'usage or precondition error',
   4: 'selection dialog open',
@@ -418,7 +429,8 @@ const main = (argv) => {
   // resolveRecipient (below): a Claude Code recipient that is idle falls back
   // at once (AGENT_SEND_IDLE_WAIT_S, default 5 s, so one late-arriving
   // ack still lands), a busy one waits AGENT_SEND_BUSY_WAIT_S inside AGENT_SEND_BUDGET_S, and an explicit --deadline
-  // always wins. --queue stays unbounded unless --deadline caps it.
+  // always wins. --queue stays unbounded unless --deadline caps it, but its
+  // wait ends early once the recipient window shows idle (waitQueued below).
   const defaultWaitMs = priority === 'queue' ? null : 120_000;
   let deadlineMs = deadline != null ? Number(deadline) * 1000 : defaultWaitMs;
 
@@ -461,9 +473,11 @@ const main = (argv) => {
     } else args.push('--text', sendText);
     if (priority === 'idle') args.push('--idle-when', idleWhen);
     if (priority === 'queue') {
-      // The withdraw path runs under --queue only after --deadline bounded the
-      // ack wait (without it the wait is unbounded and never falls through),
-      // so the 120 s is a guard for a future caller, not a reachable default.
+      // The withdraw path runs under --queue when --deadline ran out or the
+      // recipient window showed idle with the row undrained. Without --deadline
+      // kitty-send waits up to 120 s for idle and no dialog; it found the window
+      // idle moments ago, so it normally types at once, and a window that went
+      // busy again gets the row back in the mailbox (exit 5, re-queued).
       if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : '120');
       else args.push('--queue');
     }
@@ -599,7 +613,38 @@ const main = (argv) => {
       }
     }
   }
-  const ok = waitForAck({ key: recipient.key, id: row.id, deadlineMs });
+  // --queue waits for the recipient's own drain, and a Claude Code seat drains
+  // only at its next tool call, its next prompt or its Stop, none of which an
+  // IDLE seat makes: the ack never came and the sender waited forever (a seat
+  // missed three messages for about 35 minutes, 2026-11-07). So the queue wait
+  // watches the recipient's window. Busy (spinner in the title, or a title
+  // that cannot be read) keeps the row queued for the drain. Idle for
+  // AGENT_SEND_IDLE_WAIT_S on end (default 5 s, so the Stop drain of a turn
+  // that just ended acks first) ends the wait, whether idle at send time or
+  // later, and the row goes the withdraw-and-type way below, under kitty-send
+  // --wait-idle, which types only into an idle window with no dialog and no
+  // unsubmitted composer text. --deadline still caps the whole wait.
+  const waitQueued = () => {
+    const rwin = recipient.windowId ?? recipient.beaconWindowId ?? null;
+    const capS = Number(process.env.AGENT_SEND_IDLE_WAIT_S ?? 5);
+    const capMs = (Number.isFinite(capS) && capS >= 0 ? capS : 5) * 1000;
+    const endMs = deadlineMs == null ? null : Date.now() + deadlineMs;
+    let idleSince = null;
+    for (;;) {
+      if (rwin != null && windowIsIdle(rwin)) {
+        idleSince ??= Date.now();
+        if (Date.now() - idleSince >= capMs) {
+          process.stderr.write(`agent-send: idle recipient ${to}: queued row ${row.id} not drained after ${capMs / 1000}s idle, typing it into window ${rwin}\n`);
+          return false;
+        }
+      } else idleSince = null;
+      const left = endMs == null ? QUEUE_POLL_MS : endMs - Date.now();
+      const untilIdleCap = idleSince == null ? QUEUE_POLL_MS : idleSince + capMs - Date.now();
+      if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(QUEUE_POLL_MS, left, untilIdleCap)) })) return true;
+      if (endMs != null && Date.now() >= endMs) return false;
+    }
+  };
+  const ok = priority === 'queue' ? waitQueued() : waitForAck({ key: recipient.key, id: row.id, deadlineMs });
   if (ok) {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox}\n`);
     process.exit(0);
@@ -636,7 +681,16 @@ const main = (argv) => {
   // (atomic against a concurrent drain), so a late drain cannot deliver the
   // mailbox copy on top of the kitty copy; the kitty text carries an act-once
   // note for the one race left, a drain that read the row just before.
-  cancelQueued({ key: recipient.key, id: row.id });
+  // The withdraw decides: a drain that acked the row since the re-read above
+  // has delivered it, so typing it too would deliver it twice.
+  const withdrawal = cancelQueued({ key: recipient.key, id: row.id });
+  if (!withdrawal.withdrawn) {
+    if (withdrawal.state === 'delivered') {
+      process.stderr.write(`agent-send: acked ${row.id} in ${mbox} (drained just before the fallback; nothing typed)\n`);
+      process.exit(0);
+    }
+    die(`row ${row.id} was ${withdrawal.state ?? 'not found'} before the fallback (withdrawn by --cancel?); nothing was typed and nothing is queued`);
+  }
   process.stderr.write(`agent-send: queued, recipient busy/parked for ${row.id} in ${mbox}; withdrew the mailbox row, next: kitty-send to ${target} (its exit 8 means pending in the steering queue until the tool boundary, not lost)\n`);
   const status = runKittySend(
     `queued, recipient busy/parked for ${row.id}`,

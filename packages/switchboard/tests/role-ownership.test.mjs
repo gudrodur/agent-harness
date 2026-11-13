@@ -218,3 +218,23 @@ test("the nudge's command, run in a clean shell, claims the role in the store th
   assert.equal(holder?.session_id, 'nudge-run', `claim went elsewhere: ${r.stderr}`);
   assert.ok(!fs.existsSync(path.join(elsewhere, 'agent-switchboard', 'state.db')), 'the default store was opened');
 });
+
+// --queue to a role whose holder is LIVE and idle (a fresh beacon with the
+// consumer flag, an idle window title): the holder drains only at its next tool
+// call, prompt or Stop, none of which an idle seat makes, so the row is typed
+// into the holder's window and acked as a typed delivery instead of waiting.
+test('--queue to a role whose live holder is idle is typed into the holder window at once', async () => {
+  const { claimRole } = await roles();
+  beacon('queue-holder', '/r/holder', { windowId: 420 });
+  await withDb((db) => claimRole(db, { role: 'queue-role', sessionId: 'queue-holder', cwd: '/r/holder', windowId: 420 }));
+  fs.rmSync(argvFile, { force: true });
+  const r = spawnSync('node', [SEND, '--to', 'role:queue-role', '--queue', '--text', 'queued for the role'], {
+    encoding: 'utf-8', env: childEnv({ AGENT_SEND_IDLE_WAIT_S: '0' }), timeout: 15_000,
+  });
+  assert.equal(r.signal, null, `the sender waited forever on an idle holder: ${r.stderr}`);
+  assert.equal(r.status, 0, r.stderr);
+  const argv = fs.readFileSync(argvFile, 'utf-8').split('\n');
+  assert.ok(argv.includes('420') && argv.includes('--wait-idle'), `argv: ${argv}`);
+  const key = recipientKey({ cwd: '/r/holder', sessionId: 'queue-holder' });
+  assert.deepEqual(readUnacked(key, {}), [], 'the withdrawn mailbox copy is never drained on top of the typed one');
+});
