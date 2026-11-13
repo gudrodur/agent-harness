@@ -35,6 +35,13 @@ claude_state_of() { # $1 = window id; busy|idle|unknown
     busy|waiting|blocked) printf 'busy' ;; idle|shell) printf 'idle' ;; *) printf 'unknown' ;;
   esac
 }
+# True when the newest user/assistant row of transcript $1 is an assistant row
+# whose stop_reason is end_turn: the turn ended. Rows of other types (system
+# notes, summaries) are skipped; a half-written last line is skipped by fromjson?.
+claude_last_row_is_end_turn() { # $1 = transcript path
+  [ "$(tail -n 200 "$1" 2>/dev/null | jq -R -r 'fromjson? | select(.type == "user" or .type == "assistant")
+    | if .type == "assistant" and .message.stop_reason == "end_turn" then "end" else "other" end' 2>/dev/null | tail -n 1)" = end ]
+}
 claude_transcript_of() { # $1 = session json
   local sid cwd
   sid=$(printf '%s' "$1" | jq -r '.sessionId')

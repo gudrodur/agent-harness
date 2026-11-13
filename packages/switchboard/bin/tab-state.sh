@@ -7,7 +7,9 @@
 #
 # A Claude Code tab: when the window's foreground process is `claude`,
 # <config>/sessions/<pid>.json decides: its status busy|idle is the state
-# (anything else is unknown with reason=claude-status-<value>), session= is
+# (status shell, a finished turn with a background shell still running, is idle
+# when the transcript's newest user/assistant row is an assistant end_turn;
+# anything else is unknown with reason=claude-status-<value>), session= is
 # the transcript path, lines= its line count, age= the seconds since
 # statusUpdatedAt, source=claude. A record whose startedAt predates the window
 # is unknown reason=session-older-than-window. tool= is "-" and jobs are
@@ -153,6 +155,13 @@ read_claude_state() {
   st=$(printf '%s' "$cj" | jq -r '.status // ""' 2>/dev/null)
   case "$st" in
     busy|idle) STATE="$st" ;;
+    # A finished turn with a background shell or monitor still running (a
+    # standing watcher every seat arms). It is at the prompt only when the
+    # transcript's newest user/assistant row is an assistant end_turn: a turn
+    # still running also keeps shells, and a task notification is a user row.
+    # Without that proof it stays unknown, as before.
+    shell) if [ -f "$SESSION" ] && claude_last_row_is_end_turn "$SESSION"; then STATE=idle
+           else STATE=unknown; REASON="claude-status-shell"; fi ;;
     *) STATE=unknown; REASON="claude-status-${st:-none}" ;;
   esac
   return 0
