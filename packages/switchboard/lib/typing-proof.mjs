@@ -74,13 +74,18 @@ const sessionRecordOf = (proc) => {
     ?? path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'sessions');
   try { return JSON.parse(fs.readFileSync(path.join(sessionsDir, `${proc.pid}.json`), 'utf-8')); } catch { return null; }
 };
-// The busy decision for a window (`kitty @ ls` record), the same order as
-// kitty-send.sh's target_busy: Claude Code's session record first (busy is
+// The busy decision for a window (`kitty @ ls` record), following the order of
+// kitty-send.sh's target_busy for the two signals it shares with it (it also
+// reads the tab-state script and the --idle-when screen proof, which this does
+// not): Claude Code's session record first (busy is
 // busy, idle and shell are idle), the title spinner only when there is no
 // usable record. The title alone is not enough: a renamed Claude Code seat
 // never shows a spinner while it works. A seat waiting on a dialog (record
 // status waiting or blocked) is not "working" here: that is the DIALOG verdict,
 // which refuses typing in every mode and carries its own reason.
+// No staleness bound: a record that says busy is busy however old its
+// statusUpdatedAt is, so a crashed seat's stale record keeps its window busy
+// (the row then waits for its drain) until the record changes.
 export const windowIsBusy = (win) => {
   const proc = claudeProcOf(win);
   const status = proc != null ? sessionRecordOf(proc)?.status : null;

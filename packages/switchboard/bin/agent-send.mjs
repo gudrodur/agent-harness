@@ -123,10 +123,10 @@ const usage = () => `Usage:
   agent-send.mjs --who [--json]
 
   --now         priority now (default when no mode is given: a bare send types and
-                submits at once to an idle recipient; a busy one (session record, else title spinner)
-                is never typed into: the row stays queued for its next tool call)
-  --stop        priority stop: the mailbox row is delivered at the consumer's next tool call;
-                a window that is busy (session record, else title spinner) is never typed into
+                submits at once to an idle recipient; a busy one (session record, else title spinner;
+                --idle-when outranks both) is never typed into: the row stays queued for its next tool call)
+  --stop        priority stop: an alias of --now. On a busy seat nothing is interrupted: the row
+                is queued, and a one-line notice says so (a busy window is never typed into)
   --idle-when   priority idle (REGEX is the consumer's parked proof)
   --queue       priority queue: deliver without interrupting the recipient's turn.
                 A recipient proven idle (Claude Code tab, session status idle or shell,
@@ -637,8 +637,9 @@ const main = (argv) => {
   // pre-mailbox path supervisors steer tabs with. The MCP cannot type
   // into a window, so send_message keeps those as errors.
   const senderSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? null;
-  // Busy is read the way kitty-send.sh's target_busy reads it (lib/typing-proof.mjs
-  // windowIsBusy): Claude Code's session record first, the title spinner only
+  // Busy follows kitty-send.sh's target_busy for the session record and the
+  // title spinner (lib/typing-proof.mjs windowIsBusy), not its tab-state or
+  // --idle-when screen signals: Claude Code's session record first, the title spinner only
   // when there is no record. A renamed Claude Code seat shows no spinner while
   // it works, so the title alone would let --now type mid-turn.
   // Idle = the window exists and is not busy. Unreadable kitty or an unknown
@@ -658,6 +659,11 @@ const main = (argv) => {
       ? wins.filter((w) => w.id === Number(target))
       : wins.filter((w) => (w.title ?? '').toLowerCase().includes(String(target).toLowerCase()));
     return hit.some(recordIsBusy);
+  };
+  // --stop is an alias of --now for a busy seat: nothing is interrupted, the row
+  // is queued. Said once, on stderr, whatever the verbosity.
+  const stopNotice = () => {
+    if (mode === 'stop') process.stderr.write('agent-send: --stop on a busy seat queues like --now; nothing is interrupted\n');
   };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
@@ -804,7 +810,10 @@ const main = (argv) => {
     // picks it up (exit 3), whatever the send mode (--now and --stop included).
     // A --queue send with no mailbox is the detached waiter's, which types only
     // once the seat is idle.
-    if ((queueKey != null || priority !== 'queue') && windowIsBusy(t)) {
+    // --idle-when is the caller's own parked proof (a seat that spins while it
+    // waits for input) and outranks every busy signal, as in kitty-send.sh.
+    if ((queueKey != null || priority !== 'queue') && priority !== 'idle' && windowIsBusy(t)) {
+      stopNotice();
       if (queueKey != null) requeueForSeat(`recipient window ${t} is busy, not typed`, null, 'recipient busy, not typed', null, 'at its next tool call or when its turn ends');
       noQueueDie(`window ${t} is busy, so nothing was typed`);
     }
@@ -1067,7 +1076,8 @@ const main = (argv) => {
   // still shows the busy marker is never typed into, whatever the send mode:
   // the text would land in the middle of a turn and discard the tool result in
   // flight. The row stays queued for the tool-boundary drain.
-  if (windowIsBusy(target)) {
+  if (priority !== 'idle' && windowIsBusy(target)) {
+    stopNotice();
     pendingLine(row.id, `agent-send: queued, recipient busy for ${row.id} in ${mbox}; window ${target} is busy, so nothing is typed and the row stays queued for the recipient's next tool call or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`, ' (recipient busy, not typed)', null, null, 'at its next tool call or when its turn ends');
     if (rcDown()) peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
     process.exit(3);

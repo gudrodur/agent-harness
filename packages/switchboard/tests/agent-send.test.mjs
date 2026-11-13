@@ -1800,6 +1800,37 @@ test('a renamed seat whose record says idle is still typed into (the record outr
   assert.ok(argv?.includes('--now'), `argv: ${argv}`);
 });
 
+// --idle-when is the caller's own parked proof (a seat that spins while it
+// waits for input); it outranks every busy signal, so it is never guarded.
+test('--idle-when to a spinner-title seat still runs kitty-send (the caller proof outranks the busy marker)', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--idle-when', 'parked'], {
+    title: '\u2807 claude: working',
+    status: 'busy',
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+  });
+  assert.equal(killed, false, stderr);
+  assert.ok(argv?.includes('--idle-when'), `kitty-send did not run: ${argv} / ${stderr}`);
+  assert.equal(code, 0, stderr);
+});
+
+test('--stop to a busy seat says on stderr that it queues like --now and interrupts nothing', async () => {
+  const { stderr } = await queueSend(['--to', '991001', '--stop'], {
+    title: '\u2807 claude: working',
+    status: 'busy',
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+  });
+  assert.match(stderr, /--stop on a busy seat queues like --now; nothing is interrupted/);
+});
+
+test('--now to a busy seat prints no --stop notice', async () => {
+  const { stderr } = await queueSend(['--to', '991001', '--now'], {
+    title: '\u2807 claude: working',
+    status: 'busy',
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+  });
+  assert.doesNotMatch(stderr, /--stop on a busy seat/);
+});
+
 test('a window addressed by a title substring is guarded like one addressed by id', async () => {
   const { code, argv, stderr } = await bareSendArgv(['--now'], '\u2807 claude: working', { AGENT_SEND_BUDGET_S: '4' }, 'claude: working');
   assert.equal(argv, null, `argv: ${argv}`);
