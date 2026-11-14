@@ -65,7 +65,7 @@ import {
   ack,
   appendMessage,
   cancelQueued,
-  findRow,
+  followRow,
   listSeats,
   liveRoleHolder,
   mailboxPath,
@@ -167,7 +167,8 @@ const usage = () => `Usage:
                 anyway.
   --status      ask what became of a queued row: one stdout line, pending (since
                 <ts>, <recipient>), delivered (at <ts>, <how>) or withdrawn (at
-                <ts>). Exit 0 delivered, 3 pending, 13 withdrawn, 14 no such
+                <ts>); a row the sender withdrew and replaced (re-queue, typed
+                fallback) answers with its replacement's state. Exit 0 delivered, 3 pending, 13 withdrawn, 14 no such
                 row. A send whose ack wait ended without an ack prints
                 "pending: row <id>; check with agent-send --status --id <id>"
   --read        print this session's unacked inbox rows, including the queues of
@@ -197,7 +198,7 @@ const usage = () => `Usage:
                 store it read; the exit code stays 0
 
   --file is a POINTER to a COPY: the recipient is sent "read <path>, a note
-                written for you" plus "Message id: <id>", and the path names a
+                written for you" plus "Message id: <id>" and "Source: <path>", and the path names a
                 copy of your file in the switchboard notes dir (named by that
                 id, pruned after 14 days), so deleting or losing your scratch
                 file after the send cannot dangle it. A relative PATH resolves
@@ -318,20 +319,26 @@ const fileNote = (file) =>
 // sender's session has ended.
 const NOTE_RETENTION_DAYS = 14;
 const notesDir = () => process.env.AGENT_SWITCHBOARD_NOTES_DIR ?? path.join(switchboardDir(), 'notes');
-const writeNote = (text, id) => {
+const writeNote = (content, id) => {
   const dir = notesDir();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const cutoff = Date.now() - NOTE_RETENTION_DAYS * 24 * 3600 * 1000;
   for (const name of fs.readdirSync(dir)) {
     const p = path.join(dir, name);
     try {
-      if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true });
+      if (fs.statSync(p).mtimeMs >= cutoff) continue;
+      // A copy whose row (or the row that replaced it) is still queued is still
+      // owed to a reader: keep it however old it is.
+      if (name.endsWith('.md') && followRow({ id: name.slice(0, -'.md'.length) }).state === 'queued') continue;
+      fs.rmSync(p, { force: true });
     } catch {
       // Another sender pruned it first.
     }
   }
   const note = path.join(dir, `${id ?? randomUUID()}.md`);
-  fs.writeFileSync(note, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 });
+  // A --file copy is the file's own bytes. A text note gets a closing newline.
+  const bytes = typeof content === 'string' ? (content.endsWith('\n') ? content : `${content}\n`) : content;
+  fs.writeFileSync(note, bytes, { mode: 0o600 });
   return note;
 };
 
@@ -512,6 +519,10 @@ const main = (argv) => {
       return exitAfterStdout(0);
     } else die(`unknown argument: ${a} (try --help)`);
   }
+  if (statusQuery) {
+    if (rowId == null) die('--status needs --id <row-id>');
+    if (to != null || text != null || file != null || mode != null || cancel || read || who || asSession != null || claimRoleName != null || releaseRoleName != null || takeOver) die('--status takes only --id');
+  }
   // Inbox read: print this session's unacked rows and ack them, the pull path
   // for a session whose hook prompt has not delivered them yet (host-agent
   // sessions get theirs injected at the next prompt).
@@ -605,25 +616,23 @@ const main = (argv) => {
   // Status: ask later what became of a row. The exit code is the verdict, the
   // same codes --cancel uses (0 delivered, 3 pending, 13 withdrawn, 14 no row).
   if (statusQuery) {
-    if (rowId == null) die('--status needs --id <row-id>');
-    if (text != null || file != null || mode != null || cancel) die('--status takes only --id');
-    const found = findRow({ id: rowId });
+    const found = followRow({ id: rowId });
+    // The row may have been withdrawn and replaced: say which row answers.
+    const via = found.id !== rowId ? `; ${rowId} was withdrawn and replaced by ${found.id}` : '';
     if (found.state === 'queued') {
-      process.stdout.write(`pending (since ${found.ts}, ${found.key})\n`);
-      exitAfterStdout(3);
-      return;
+      process.stdout.write(`pending (since ${found.ts}, ${found.key}${via})\n`);
+      return exitAfterStdout(3);
     }
     if (found.state === 'delivered') {
-      process.stdout.write(`delivered (at ${found.ackTs}, ${found.deliveredAs})\n`);
-      exitAfterStdout(0);
-      return;
+      process.stdout.write(`delivered (at ${found.ackTs}, ${found.deliveredAs}${via})\n`);
+      return exitAfterStdout(0);
     }
     if (found.state === 'withdrawn') {
-      process.stdout.write(`withdrawn (at ${found.withdrawTs})\n`);
-      exitAfterStdout(13);
-      return;
+      process.stdout.write(`withdrawn (at ${found.withdrawTs}${via})\n`);
+      return exitAfterStdout(13);
     }
-    die(`no row ${rowId}`, 14);
+    const where = mailboxPath('x');
+    die(`no row ${rowId} in ${where.endsWith('x.jsonl') ? path.dirname(where) : where}`, 14);
   }
   // Cancel: withdraw one queued row so a later drain cannot deliver it.
   if (cancel) {
@@ -641,23 +650,33 @@ const main = (argv) => {
   if (text != null && file != null) die('pass one of --text or --file, not both');
   // The first mailbox row of a --file send takes this id, so the pointer can
   // name the message and the durable copy is filed under it (see takeRowId).
+  // The copy itself is written only when something is about to be sent, so a
+  // refused send leaves none.
   let pendingRowId = null;
+  let copyBytes = null;
   if (file != null) {
     // A relative path means the caller's cwd, not the recipient's: resolve it here.
-    file = path.resolve(file);
+    const source = path.resolve(file);
     try {
-      fs.accessSync(file, fs.constants.R_OK);
-      if (!fs.statSync(file).isFile()) throw new Error('not a file');
+      fs.accessSync(source, fs.constants.R_OK);
+      if (!fs.statSync(source).isFile()) throw new Error('not a file');
+      copyBytes = fs.readFileSync(source);
     } catch {
-      die(`no such file: ${file}`);
+      die(`no such file: ${source}`);
     }
     // The pointer must outlive the sender's scratch dir (a reboot clears it), so
     // the recipient is pointed at a copy in the switchboard notes dir.
     pendingRowId = randomUUID();
-    file = writeNote(fs.readFileSync(file, 'utf-8'), pendingRowId);
-    text = `${fileNote(file)} Message id: ${pendingRowId}.`;
+    file = path.join(notesDir(), `${pendingRowId}.md`);
+    text = `${fileNote(file)} Message id: ${pendingRowId}. Source: ${source}.`;
   }
+  const ensureCopy = () => {
+    if (copyBytes == null) return;
+    writeNote(copyBytes, path.basename(file, '.md'));
+    copyBytes = null;
+  };
   const takeRowId = () => {
+    ensureCopy();
     const id = pendingRowId ?? undefined;
     pendingRowId = null;
     return id;
@@ -730,8 +749,10 @@ const main = (argv) => {
   const runKittySend = (why, target, sendText, noteId = null, { requeue = false, timeoutS = null, holdQueue = false, midTurnHeld = false } = {}) => {
     trace(`agent-send: ${why}, falling back to kitty-send\n`);
     const args = ['--to', String(target)];
-    if (file != null) args.push('--file', file);
-    else if (sendText.includes('\n')) {
+    if (file != null) {
+      ensureCopy();
+      args.push('--file', file);
+    } else if (sendText.includes('\n')) {
       const note = writeNote(sendText, noteId);
       trace(`agent-send: multi-line text written to ${note} for kitty-send --file\n`);
       args.push('--file', note);
@@ -775,7 +796,7 @@ const main = (argv) => {
     // started is not one). Best-effort: a failed record never fails the send.
     if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
       try {
-        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId() });
+        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId(), replaces: noteId ?? undefined });
       } catch {
         // see above
       }
@@ -1218,7 +1239,7 @@ const main = (argv) => {
   // idle wait ran out, a send already queued, mid-turn without --now). The row
   // is withdrawn, so without this the message is gone: put it back.
   if (KITTY_SENT_NOTHING.has(status)) {
-    const again = appendMessage({ to: recipient.key, from, priority, text, topic, id: takeRowId() });
+    const again = appendMessage({ to: recipient.key, from, priority, text, topic, id: takeRowId(), replaces: row.id });
     pendingLine(again.id, `agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, ${whenDelivered(status, "at the recipient's next tool call, next prompt or when its current turn ends")} (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`, ` (not typed: ${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'})`, status);
     if (rcDown(status)) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);

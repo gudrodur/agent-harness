@@ -761,7 +761,7 @@ export const formatInboxLines = (found) =>
 
 export const TOPIC_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-export const appendMessage = ({ to, from, priority, text, topic, via, id, now = Date.now(), dir } = {}) => {
+export const appendMessage = ({ to, from, priority, text, topic, via, id, replaces, now = Date.now(), dir } = {}) => {
   if (!PRIORITIES.includes(priority)) throw new Error(`priority must be one of ${PRIORITIES.join('|')}, got '${priority}'`);
   if (topic != null && !TOPIC_RE.test(topic)) throw new Error(`topic must match ${TOPIC_RE}, got '${topic}'`);
   const row = {
@@ -773,6 +773,9 @@ export const appendMessage = ({ to, from, priority, text, topic, via, id, now = 
     text,
   };
   if (via != null) row.via = via;
+  // The row this one stands in for after the sender withdrew it (a re-queue or
+  // the typed fallback), so --status on the old id can follow to the live row.
+  if (replaces != null) row.replaces = replaces;
   if (topic != null) {
     row.topic = topic;
     // Withdraw every earlier unacked row of this topic for this recipient, from
@@ -931,6 +934,45 @@ export const findRow = ({ id, dir } = {}) => {
   return classifyRows(id, fileEntries(id, dir));
 };
 
+// What became of a row for a caller that asks later (--status): the row's own
+// state, and when it was withdrawn and replaced (a re-queue or the typed
+// fallback names the row it replaces), the state of its live successor with
+// that row's id. Reads only: with the store backing the mailbox and no store
+// file yet, nothing is opened, so asking never creates one.
+export const followRow = ({ id, dir } = {}) => {
+  const db = useMailboxDb(dir);
+  if (db && !fs.existsSync(defaultStorePath())) return classifyRows(id, []);
+  const find = (rid) => (db ? withMailboxDb((store) => classifyRows(rid, dbEntries(store, rid))) : classifyRows(rid, fileEntries(rid, dir)));
+  const successor = (rid) => {
+    if (db) {
+      return withMailboxDb((store) => store
+        .all("SELECT row_json FROM mailbox_rows WHERE kind = 'message' AND instr(row_json, ?) > 0 ORDER BY rowid", `"replaces":${JSON.stringify(rid)}`)
+        .map((r) => JSON.parse(r.row_json))
+        .find((r) => r.replaces === rid)?.id ?? null);
+    }
+    let files = [];
+    try {
+      files = fs.readdirSync(resolveMailboxDir(dir)).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      return null;
+    }
+    for (const f of files) {
+      const hit = readRows(f.slice(0, -'.jsonl'.length), { dir }).find((r) => r && r.replaces === rid);
+      if (hit) return hit.id;
+    }
+    return null;
+  };
+  let cur = id;
+  let found = find(cur);
+  for (let hops = 0; found.state === 'withdrawn' && hops < 8; hops += 1) {
+    const next = successor(cur);
+    if (next == null) break;
+    cur = next;
+    found = find(cur);
+  }
+  return { ...found, id: cur };
+};
+
 // Withdraw a queued row by id: {withdraw: id, ts}. The id is looked up and the
 // withdraw is written under the row's REAL recipient key, never the caller's —
 // a role-addressed send stores its row under the holder's session key, and a
@@ -975,8 +1017,8 @@ export const cancelQueued = ({ key, id, now = Date.now(), dir } = {}) => {
 // A delivery that bypassed the mailbox (agent-send's typed kitty fallback)
 // still leaves a message row, acked at once, so the store sees every delivery
 // and a later same-topic send can find it.
-export const recordTypedDelivery = ({ to, from, priority, text, topic, id, now = Date.now(), dir } = {}) => {
-  const row = appendMessage({ to, from, priority, text, topic, via: 'typed', id, now, dir });
+export const recordTypedDelivery = ({ to, from, priority, text, topic, id, replaces, now = Date.now(), dir } = {}) => {
+  const row = appendMessage({ to, from, priority, text, topic, via: 'typed', id, replaces, now, dir });
   ack({ key: to, id: row.id, deliveredAs: 'typed', now, dir });
   return row;
 };

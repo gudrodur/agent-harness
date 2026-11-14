@@ -2797,3 +2797,143 @@ test('--file is copied into the notes dir and the pointer names the copy and the
     fs.rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+// A row the sender withdrew and replaced (a re-queue, or the typed fallback)
+// must still answer --status for the id the pointer names.
+const msgIdOf = (text) => text.match(/Message id: ([0-9a-f-]{36})\./)[1];
+
+test('--status on a --file id follows a re-queue to the live row', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-chain-'));
+  try {
+    const src = path.join(scratch, 'brief.md');
+    fs.writeFileSync(src, 'chain\n');
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    const { code, stderr } = await runSend(
+      ['--to', '991001', '--queue', '--deadline', '1', '--file', src],
+      childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '5', AGENT_SWITCHBOARD_NOTES_DIR: path.join(scratch, 'notes'), ...provenKitty(991001, '/repo/a') }),
+    );
+    assert.equal(code, 3, stderr);
+    const [live] = readUnacked(KEY_S1, { dir: mboxDir });
+    const named = msgIdOf(live.text);
+    assert.notEqual(named, live.id, 'the live row is the re-queued one');
+    let r = runStatus(['--id', named]);
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.match(r.stdout, new RegExp(`^pending \\(since \\S+, ${KEY_S1}; ${named} was withdrawn and replaced by ${live.id}\\)`));
+    ack({ key: KEY_S1, id: live.id, deliveredAs: 'prompt', dir: mboxDir });
+    r = runStatus(['--id', named]);
+    assert.equal(r.code, 0, r.stdout);
+    assert.match(r.stdout, /^delivered \(at \S+, prompt; /);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('--status on a --file id follows the typed fallback to its delivery record', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-typed-'));
+  try {
+    const src = path.join(scratch, 'brief.md');
+    fs.writeFileSync(src, 'typed\n');
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    fs.rmSync(fallbackArgv, { force: true });
+    const { code, stderr } = await runSend(
+      ['--to', '991001', '--file', src, '--deadline', '1'],
+      childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '0', AGENT_SWITCHBOARD_NOTES_DIR: path.join(scratch, 'notes') }),
+    );
+    assert.equal(code, 0, stderr);
+    const argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
+    const named = path.basename(argv[argv.indexOf('--file') + 1], '.md');
+    const r = runStatus(['--id', named]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^delivered \(at \S+, typed; /);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('--file copies the bytes (binary, non-UTF-8, no added newline) and the pointer keeps the source path', () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-bytes-'));
+  const notes = path.join(scratch, 'notes');
+  try {
+    const src = path.join(scratch, 'blob.bin');
+    const bytes = Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x41, 0xc3]);
+    fs.writeFileSync(src, bytes);
+    const r = fileSend(['--file', src], scratch, notes);
+    assert.equal(r.status, 3, r.stderr);
+    const [row] = readUnacked(KEY_S1, { dir: mboxDir });
+    assert.ok(fs.readFileSync(path.join(notes, `${row.id}.md`)).equals(bytes));
+    assert.ok(row.text.includes(`Source: ${src}.`), row.text);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('a refused --file send leaves no copy; a directory or unreadable file is refused', () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-refused-'));
+  const notes = path.join(scratch, 'notes');
+  try {
+    const src = path.join(scratch, 'brief.md');
+    fs.writeFileSync(src, 'x\n');
+    const bad = fileSend(['--file', src, '--deadline', '5'], scratch, notes);
+    assert.equal(bad.status, 2, bad.stderr);
+    assert.ok(!fs.existsSync(notes) || fs.readdirSync(notes).length === 0, 'no copy after a refused send');
+    const dirRes = fileSend(['--file', scratch], scratch, notes);
+    assert.equal(dirRes.status, 1);
+    assert.match(dirRes.stderr, /no such file/);
+    if (process.getuid?.() !== 0) {
+      fs.chmodSync(src, 0o000);
+      const unreadable = fileSend(['--file', src], scratch, notes);
+      assert.equal(unreadable.status, 1);
+      assert.match(unreadable.stderr, /no such file/);
+      fs.chmodSync(src, 0o600);
+    }
+    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('the note cleanup keeps an old copy whose row is still queued and drops an orphan', () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-prune-'));
+  const notes = path.join(scratch, 'notes');
+  try {
+    fs.mkdirSync(notes);
+    const queued = appendMessage({ to: KEY_S1, from: 'x', priority: 'now', text: 'q', dir: mboxDir });
+    const kept = path.join(notes, `${queued.id}.md`);
+    const orphan = path.join(notes, 'orphan.md');
+    const past = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    for (const f of [kept, orphan]) {
+      fs.writeFileSync(f, 'old');
+      fs.utimesSync(f, past, past);
+    }
+    fs.writeFileSync(path.join(scratch, 'brief.md'), 'new\n');
+    const r = spawnSync('node', [SEND, '--to', KEY_S1, '--no-wait', '--file', 'brief.md'], {
+      cwd: scratch, encoding: 'utf-8', env: childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SWITCHBOARD_NOTES_DIR: notes }),
+    });
+    assert.equal(r.status, 3, r.stderr);
+    assert.ok(fs.existsSync(kept), 'queued row keeps its copy');
+    assert.ok(!fs.existsSync(orphan), 'an orphan past retention is pruned');
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('--status refuses stray flags, reads without creating the store, and names where it looked', () => {
+  for (const extra of [['--to', KEY_S1], ['--claim-role', 'r'], ['--text', 'x'], ['--read']]) {
+    const r = runStatus(['--id', 'x', ...extra]);
+    assert.equal(r.code, 1, `${extra}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /--status takes only --id/);
+  }
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-nodb-'));
+  try {
+    const db = path.join(scratch, 'state.db');
+    const env = childEnv({ AGENT_SWITCHBOARD_DB: db });
+    delete env.AGENT_MAILBOX_DIR;
+    const r = spawnSync('node', [SEND, '--status', '--id', 'nope'], { encoding: 'utf-8', env, timeout: 30_000 });
+    assert.equal(r.status, 14, r.stderr);
+    assert.ok(r.stderr.includes(db), r.stderr);
+    assert.ok(!fs.existsSync(db), 'asking must not create the store');
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+  assert.ok(runStatus(['--id', 'nope']).stderr.includes(mboxDir), 'file mode names the mailbox dir');
+});
