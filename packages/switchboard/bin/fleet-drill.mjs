@@ -49,7 +49,9 @@
 // FLEET_DRILL_STORE_DIR (required: AGENT_SWITCHBOARD_DIR for every child).
 // Binaries: FLEET_DRILL_CLAUDE_TAB, _AGENT_SEND, _KITTY_SEND, _TAB_STATE,
 // _TYPING_PROOF, _EXPORT, _KITTY, _GH. Merge stage: FLEET_DRILL_SANDBOX,
-// FLEET_DRILL_MERGE_CMD.
+// FLEET_DRILL_MERGE_CMD. Debugging: FLEET_DRILL_DUMP_DIR keeps every permission dialog
+// screen the drill sees (private paths and names may be in it: mode 0600, never
+// commit one unscrubbed).
 // HELP-END
 
 import fs from 'node:fs';
@@ -191,15 +193,15 @@ const screenText = () => run(B.kitty, ['@', 'get-text', '--match', `id:${wid}`],
 // The permission dialog, parsed from the screen. Only what sits below the last
 // "Bash command" header is the dialog: above it is the echo of the setup prompt the
 // drill typed, which names the same command whatever the model then proposes.
-// Two layouts are known:
-//   ruled    (recorded from a real seat, tests/fixtures/permission-dialog-ruled.txt):
-//            header, description, a dashed rule, the command line(s), a dashed rule,
-//            the rule that asked, "Do you want to proceed?".
-//   unruled  (recorded elsewhere; tests/fixtures/permission-dialog-unruled.txt is built from that description, not a capture here): header, blank, the command, its description, blank,
-//            "Do you want to proceed?". The command and a description are then told
-//            apart only by the tool-call line above the header, `Bash(<command>)`.
-// Dashed rules are the broken `╌`; a solid `─` is the dialog's own border and the
-// seat's status line, never the frame of the command.
+// One layout is recorded from a real seat (tests/fixtures/permission-dialog-ruled.txt):
+// the header, a description, a dashed rule, the command line(s), a dashed rule, the
+// rule that asked, "Do you want to proceed?". Exactly two dashed `╌` rules frame the
+// command; a solid `─` is the dialog's own border and the seat's status line.
+// Any other layout (none or more than two dashed rules, such as an unruled dialog
+// that shows the command and its description with nothing between them) is REFUSED,
+// never guessed at: without a frame a second command line and a description cannot
+// be told apart, and approving the wrong one runs it. Record the layout first
+// (FLEET_DRILL_DUMP_DIR), then teach the parser from the capture.
 const parseDialog = (screen) => {
   const lines = screen.split('\n');
   let at = -1;
@@ -211,45 +213,35 @@ const parseDialog = (screen) => {
   const body = below.slice(0, ask);
   const rules = [];
   body.forEach((l, i) => { if (/^\s*╌{3,}\s*$/.test(l)) rules.push(i); });
-  if (rules.length >= 2) {
-    const [open, close] = rules.slice(-2);
-    return { seen: true, layout: 'ruled', block: body.slice(open + 1, close).map((l) => l.trim()).filter(Boolean).join('\n') };
-  }
-  const first = body.findIndex((l) => l.trim());
-  const group = [];
-  for (let i = first < 0 ? body.length : first; i < body.length && body[i].trim(); i++) group.push(body[i].trim());
-  let call = null;
-  for (let i = at - 1; i >= 0; i--) {
-    const m = /^\s*[●⏺]\s*(Bash\(.*\))\s*$/.exec(lines[i]);
-    if (m) { call = m[1]; break; }
-  }
-  return { seen: true, layout: 'unruled', group, call };
+  if (rules.length !== 2) return { seen: true, layout: 'unrecorded' };
+  return { seen: true, layout: 'ruled', block: body.slice(rules[0] + 1, rules[1]).map((l) => l.trim()).filter(Boolean).join('\n') };
 };
-// True when the dialog proposes exactly `command`: the whole ruled block, or in the
-// unruled layout the first line, with at most one description line after it, and the
-// tool-call line above the header naming the same single-line command.
-const proposes = (d, command) => {
-  if (!d.seen) return false;
-  if (d.layout === 'ruled') return d.block === command;
-  return d.group.length >= 1 && d.group.length <= 2 && d.group[0] === command && d.call === `Bash(${command})`;
-};
-// Set when a dialog was on screen but its command did not match (a wrapped command
-// on a narrow window shows up here), so a failure can say so.
+// True when the dialog proposes exactly `command`: the whole ruled block.
+const proposes = (d, command) => d.seen && d.layout === 'ruled' && d.block === command;
+// Set per state when a dialog was on screen but not approved, so a failure says why.
 let unmatchedDialog = false;
-const dialogNote = () => (unmatchedDialog ? ' (a permission dialog was on screen but its command did not match: a wrapped command or another proposal)' : '');
+let unrecordedDialog = false;
+const dialogNote = () => {
+  if (unrecordedDialog) return ' (a permission dialog was on screen in a layout not recorded: refused; capture one with FLEET_DRILL_DUMP_DIR and teach the parser from it)';
+  if (unmatchedDialog) return ' (a permission dialog was on screen but its command did not match: a wrapped command or another proposal)';
+  return '';
+};
+const resetDialogNotes = () => { unmatchedDialog = false; unrecordedDialog = false; };
 let dumps = 0;
 // Approves the prompt on screen only when its dialog proposes exactly `command`,
 // this drill's own, and the seat is still waiting at the moment of the keypress.
 const approveIfShowing = (command) => {
   const screen = screenText();
-  // Debug aid: keep every screen that shows a permission dialog (the layouts to test against).
-  if (process.env.FLEET_DRILL_DUMP_DIR && parseDialog(screen).seen) {
-    fs.mkdirSync(process.env.FLEET_DRILL_DUMP_DIR, { recursive: true });
-    fs.writeFileSync(path.join(process.env.FLEET_DRILL_DUMP_DIR, `dialog-${String(dumps++).padStart(2, '0')}.txt`), screen);
-  }
   const d = parseDialog(screen);
+  // Debug aid: keep every screen that shows a permission dialog (the layouts to test
+  // against). A screen can hold private paths and names: scrub before committing one.
+  if (process.env.FLEET_DRILL_DUMP_DIR && d.seen) {
+    fs.mkdirSync(process.env.FLEET_DRILL_DUMP_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(process.env.FLEET_DRILL_DUMP_DIR, `dialog-${String(dumps++).padStart(2, '0')}.txt`), screen, { mode: 0o600 });
+  }
   if (!proposes(d, command)) {
-    if (d.seen) unmatchedDialog = true;
+    if (d.layout === 'unrecorded') unrecordedDialog = true;
+    else if (d.seen) unmatchedDialog = true;
     return false;
   }
   if (!isWaiting()) return false;
@@ -347,7 +339,7 @@ const checks = {
   },
 
   async busy() {
-    unmatchedDialog = false;
+    resetDialogNotes();
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the setup');
     const tok = token();
     // A timer in node, not `sleep N`: Claude Code refuses a foreground sleep and
@@ -380,7 +372,7 @@ const checks = {
   },
 
   async permission() {
-    unmatchedDialog = false;
+    resetDialogNotes();
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the setup');
     const tok = token();
     const cmd = `touch fleet-drill-${tok}`;

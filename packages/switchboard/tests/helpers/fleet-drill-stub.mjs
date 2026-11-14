@@ -137,11 +137,13 @@ if (role === 'claude-tab') {
   // whatever the model then proposes), then the dialog with its own command.
   const echo = `❯ ${text}`;
   // The dialog screens are fixtures: ruled is a real seat's screen (captured by a live
-  // drill run, command and echo replaced by placeholders); unruled is the other recorded
-  // layout, without dashed rules. STUB_LAYOUT picks one.
+  // drill run, command and echo replaced by placeholders); the others (unruled,
+  // unruled-bare, threerules, solid) are layouts the drill must refuse. STUB_LAYOUT picks one.
   const fixture = fs.readFileSync(new URL(`../fixtures/permission-dialog-${process.env.STUB_LAYOUT || 'ruled'}.txt`, import.meta.url), 'utf8');
-  // STUB_WRAP: a narrow window wraps the command over two lines inside the dialog.
-  const wrap = (c) => (process.env.STUB_WRAP ? `${c.slice(0, 20)}\n ${c.slice(20)}` : c);
+  // STUB_WRAP: a narrow window wraps the command over two lines inside the dialog
+  // (STUB_WRAP=node: only the busy timer's, so a later state is unaffected).
+  const wrapIt = (c) => process.env.STUB_WRAP === '1' || (process.env.STUB_WRAP === 'node' && c.startsWith('node'));
+  const wrap = (c) => (wrapIt(c) ? `${c.slice(0, 20)}\n ${c.slice(20)}` : c);
   const dialog = (proposed) => fixture
     .replace(/^ \{\{CMD\}\}$/m, () => ` ${wrap(proposed)}`)
     .replaceAll('{{ECHO}}', () => echo)
@@ -168,7 +170,7 @@ if (role === 'claude-tab') {
     const cmd = /touch \S+/.exec(text)[0];
     const screen = other === 'write' ? `${echo}\n● Write(notes.txt)\n Create file\n  notes.txt\n Do you want to create notes.txt?\n ❯ 1. Yes\n   2. No\n`
       : dialog(other === 'bash' ? `${cmd} && rm -rf x` : other === 'multi' ? `${cmd}\n  rm -rf x` : cmd);
-    save({ ...s, status: 'waiting', approveTo: false, screen });
+    save({ ...s, status: 'waiting', approveTo: false, screen: process.env.STUB_PERM_NO_SCREEN ? `${echo}\n` : screen });
   } else if (text.includes('gh pr create')) {
     writeJson('pr.json', { open: true });
   }
