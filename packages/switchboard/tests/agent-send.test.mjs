@@ -313,6 +313,24 @@ test('an idle recipient caps the ack wait instead of blocking the full default (
   assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a typed message must not be queued a second time');
 });
 
+// kitty-send exit 16 (a slash command still in the composer after its extra
+// Enters) is typed, not proven submitted: like 10 it passes through, is never
+// re-queued, and its own chatter is held because agent-send prints the verdict.
+test('kitty-send exit 16 passes through with one verdict line and no kitty-send chatter', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const chatter = path.join(binDir, 'chatter-16');
+  fs.writeFileSync(chatter, '#!/usr/bin/env bash\necho "kitty-send: raw chatter line" >&2\nexit 16\n', { mode: 0o755 });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--text', 'parked steer'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: chatter, AGENT_SEND_VERBOSE: '' }),
+  );
+  assert.equal(code, 16, stderr);
+  assert.match(stderr, /kitty-send exit 16 for 991001: .*typed, not proven submitted/);
+  assert.doesNotMatch(stderr, /raw chatter line/);
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a typed message must not be queued a second time');
+});
+
 // First path, the quoted moment: `--to 39 --now --deadline 60` withdrew the
 // row, then kitty-send refused `--now --deadline` with exit 1 and nothing was
 // delivered. The deadline bounded agent-send's ack wait; it is not forwarded
@@ -1817,6 +1835,9 @@ test('--idle-when to a spinner-title seat still runs kitty-send (the caller proo
   });
   assert.equal(killed, false, stderr);
   assert.ok(argv?.includes('--idle-when'), `kitty-send did not run: ${argv} / ${stderr}`);
+  // Without the skip the guard would hold it: --queue is added and a "holds" line printed.
+  assert.ok(!argv.includes('--queue'), `the busy guard held an --idle-when send: ${argv}`);
+  assert.doesNotMatch(stderr, /holds the message/);
   assert.equal(code, 0, stderr);
 });
 
@@ -1840,6 +1861,36 @@ test('--stop to a busy seat with no mailbox is held and carries the notice in it
 test('--idle-when to a spinner-title seat with no mailbox still runs kitty-send (typed-fallback guard)', async () => {
   const { argv, stderr } = await bareSendArgv(['--idle-when', 'parked'], '\u2807 claude: waiting for input', { AGENT_SEND_BUDGET_S: '4' });
   assert.ok(argv?.includes('--idle-when'), `kitty-send did not run: ${argv} / ${stderr}`);
+  assert.ok(!argv.includes('--queue'), `the busy guard held an --idle-when send: ${argv}`);
+  assert.doesNotMatch(stderr, /holds the message/);
+});
+
+// The real kitty-send prints two note lines on stderr for a --queue run unless
+// it is given --quiet. This stub does the same, so the hold's one-line verdict
+// is checked against what the real script prints.
+const noisyHoldStub = (exitCode = 0) => {
+  const stub = path.join(binDir, `kitty-send-noisy-${exitCode}.sh`);
+  fs.writeFileSync(stub, [
+    '#!/usr/bin/env bash',
+    `printf '%s\\n' "$@" > ${JSON.stringify(fallbackArgv)}`,
+    'quiet=0; for a in "$@"; do [ "$a" = --quiet ] && quiet=1; done',
+    '[ "$quiet" = 1 ] || { echo "kitty-send: note one" >&2; echo "kitty-send: note two" >&2; }',
+    `exit ${exitCode}`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return stub;
+};
+test('the hold passes --quiet to kitty-send, so its notes never add lines to the one verdict', async () => {
+  const r = await bareSendArgv([], '\u2807 claude: working', { ...holdEnv(), AGENT_SEND_KITTY_SEND: noisyHoldStub(0) });
+  assertHeld(r);
+  assert.ok(r.argv.includes('--quiet'), `argv: ${r.argv}`);
+});
+
+test('a hold that kitty-send refuses with exit 6 says an earlier message is already held, not "send again"', async () => {
+  const { code, stderr } = await bareSendArgv([], '\u2807 claude: working', { ...holdEnv(), AGENT_SEND_KITTY_SEND: noisyHoldStub(6) });
+  assert.notEqual(code, 0, stderr);
+  assert.match(stderr, /an earlier message is already held for that window/);
+  assert.doesNotMatch(stderr, /send again/);
 });
 
 test('--now to a busy seat prints no --stop notice', async () => {

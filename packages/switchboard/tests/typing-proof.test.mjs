@@ -239,3 +239,21 @@ test('CLI: a window that is not there is refused', () => {
   assert.equal(r.code, 2);
   assert.match(r.err, /window not found/);
 });
+
+// --mode composer: does the composer still hold a text? Exit 0 no, 2 yes, 3 could not tell.
+const composerCli = (screen, text = '/rename x') => {
+  seat({ screen });
+  return spawnSync(process.execPath, [CLI, '--window', String(WIN), '--mode', 'composer', '--stdin'], { input: text, encoding: 'utf-8', env: process.env }).status;
+};
+const boxWith = (line, top = RULE) => ['● Done.', top, line, RULE, '  ⏵⏵ bypass permissions on · 1 shell'].join('\n');
+
+test('--mode composer: 0 for an empty box, 2 while it holds the text, also under a titled top rule', () => {
+  assert.equal(composerCli(EMPTY), 0);
+  assert.equal(composerCli(boxWith('❯ /rename x')), 2);
+  assert.equal(composerCli(boxWith('❯ /rename x', LABELLED_RULE)), 2);
+});
+
+test('--mode composer: 3 (could not tell) with no box on the screen, and with a dialog open', () => {
+  assert.equal(composerCli('just text'), 3);
+  assert.equal(composerCli([boxWith('❯ /rename x'), 'Enter to select · Esc to cancel'].join('\n')), 3);
+});

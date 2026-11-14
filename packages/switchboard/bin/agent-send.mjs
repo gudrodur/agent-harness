@@ -124,7 +124,8 @@ const usage = () => `Usage:
 
   --now         priority now (default when no mode is given: a bare send types and
                 submits at once to an idle recipient; a busy one (session record, else title spinner;
-                --idle-when outranks both) is never typed into: the row stays queued for its next tool call)
+                --idle-when outranks both) is never typed into: the row stays queued for its next
+                tool call, or with no mailbox kitty-send --queue holds it for the next idle point)
   --stop        priority stop: an alias of --now. On a busy seat nothing is interrupted: the row
                 is queued, and a one-line notice says so (a busy window is never typed into)
   --idle-when   priority idle (REGEX is the consumer's parked proof)
@@ -211,6 +212,8 @@ const usage = () => `Usage:
         lost; do not resend
     10  typed but not proven submitted (kitty-send reached the window, no
         session row proves submission): look at the window, never resend blind
+    16  typed, not proven submitted: a slash command still sits in the composer
+        after kitty-send's extra Enters; look at the window, never resend blind
     1 4 5 6 7 9   failed, nothing sent and nothing queued (reached only when
         there is no mailbox to fall back to; a withdrawn row is re-queued and
         exits 3 instead): 1 usage or precondition, 4 selection dialog open,
@@ -244,6 +247,9 @@ const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_S
 // typed. Exit 3 is the opposite: sent, delivery not proven.
 // 12: kitty remote control did not answer (a timeout or an unreachable socket).
 const KITTY_RC_DOWN = 12;
+// 16: a slash command typed into a Claude Code tab still sits in its composer
+// after kitty-send's bounded extra Enters. Typed, not proven submitted, like 10.
+const KITTY_TYPED_UNSUBMITTED = 16;
 const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN]);
 // kitty-send's 11 and 12 are not agent-send's own 11 (--claim-role refused) and
 // 12 (--release-role refused): both leave as 1, "nothing sent".
@@ -697,11 +703,13 @@ const main = (argv) => {
     // --deadline goes along only without --now: kitty-send refuses the pair
     // (exit 1, "mutually exclusive"), and here --deadline bounded agent-send's
     // own ack wait, not a kitty-send idle wait.
-    const bareToIdle = mode == null && /^\d+$/.test(String(target)) && windowIsIdle(target);
+    const bareToIdle = !holdQueue && mode == null && /^\d+$/.test(String(target)) && windowIsIdle(target);
     // A hold (the seat is busy) never forwards --now or --deadline: kitty-send
     // --queue types at the seat's next idle point and nothing mid-turn.
     if (!holdQueue && (mode === 'now' || mode === 'stop' || bareToIdle)) args.push('--now');
     else if (deadline != null && !holdQueue && !(requeue && priority === 'queue')) args.push('--deadline', deadline);
+    // The hold prints its own one verdict line; kitty-send's notes would add two more.
+    if (holdQueue) args.push('--quiet');
     if (timeoutS != null) args.push('--timeout', String(timeoutS));
     // A foreground run that the caller re-queues on "sent nothing" has its
     // stderr held: the caller's one verdict line replaces it. Any other result
@@ -713,10 +721,10 @@ const main = (argv) => {
     // which the generic re-queue line cannot know: always pass it on.
     // On 0, 3, 8 and 10 agent-send prints its own single verdict line (below), so
     // kitty-send's chatter is trace; a failure it cannot explain still shows.
-    if (holdErr && r.stderr?.length && ![0, 3, 8, 10].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11)) process.stderr.write(r.stderr);
+    if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
-    if (typedKey != null && [0, 8, 10].includes(r.status) && !args.includes('--queue')) {
+    if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
       try {
         recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic });
       } catch {
@@ -728,6 +736,9 @@ const main = (argv) => {
     // through (NOT re-queued: the composer may already hold it).
     if (r.status === 10) {
       process.stderr.write(`agent-send: kitty-send exit 10 for ${args[1]}: typed, not proven submitted (reached the window, no session row proves submission); look at the window before resending, never resend blind\n`);
+    }
+    if (r.status === KITTY_TYPED_UNSUBMITTED) {
+      process.stderr.write(`agent-send: kitty-send exit 16 for ${args[1]}: the slash command is typed but still sits unsubmitted in the composer after the extra Enters; typed, not proven submitted: look at the window before resending, never resend blind\n`);
     }
     // kitty-send exit 8: sent under --now while mid-turn and still mid-turn at
     // the deadline — pending in the target's steering queue until the tool
@@ -743,7 +754,12 @@ const main = (argv) => {
     }
     // A fallback that sent NOTHING must say so with the reason and where the
     // verdict lives: without this an exit 9 reads like delivery.
-    if (KITTY_SENT_NOTHING.has(r.status) && !requeue) {
+    if (holdQueue && r.status === 6) {
+      // An earlier message is still held for this window, so this one was not
+      // added; the earlier hold is pending, and a resend would hit 6 again.
+      const qlog = kittyQueueLog(target);
+      process.stderr.write(`agent-send: kitty-send exit 6 for ${args[1]}: an earlier message is already held for that window, so this one was not added; the earlier one is still pending, wait for it${qlog ? ` (kitty queue log: ${qlog})` : ''}\n`);
+    } else if (KITTY_SENT_NOTHING.has(r.status) && !requeue) {
       const qlog = kittyQueueLog(target);
       process.stderr.write(
         `agent-send: kitty-send exit ${r.status} for ${args[1]}: nothing was sent (${KITTY_NOTHING_REASON[r.status] ?? 'see kitty-send.sh'}) and nothing is queued: this is a failure, the message did not go; check the tab, then send again` +
@@ -1122,7 +1138,7 @@ const main = (argv) => {
     if (rcDown(status)) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);
   }
-  if (status === 3 || status === 10) {
+  if (status === 3 || status === 10 || status === KITTY_TYPED_UNSUBMITTED) {
     trace(`agent-send: kitty-send typed into window ${target} but delivery is unproven (exit ${status}) for ${row.id}; NOT re-queued (a duplicate is worse): look at the window before resending\n`);
   }
   if (status == null) {
