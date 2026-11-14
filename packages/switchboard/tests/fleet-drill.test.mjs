@@ -161,9 +161,9 @@ test('the drill refuses to run without FLEET_DRILL_STORE_DIR', () => {
 });
 
 test('busy approves a permission prompt only when the screen shows its own command', () => {
-  const ok = drill(['--states', 'busy'], { extra: { STUB_PERMISSION_FIRST: '1' } });
+  const ok = drill(['--states', 'busy']);
   assert.equal(ok.status, 0, ok.stderr + JSON.stringify(ok.lines));
-  const other = drill(['--states', 'busy'], { extra: { STUB_PERMISSION_FIRST: '1', STUB_SCREEN_MISMATCH: '1', FLEET_DRILL_SETUP_S: '1' } });
+  const other = drill(['--states', 'busy'], { extra: { STUB_SCREEN_MISMATCH: '1', FLEET_DRILL_SETUP_S: '1' } });
   assert.equal(other.status, 1);
   assert.equal(other.byState.busy.ok, false);
 });
@@ -239,11 +239,56 @@ test('the seat folder pins a prompting permission mode, so a permission prompt c
   const settings = JSON.parse(fs.readFileSync(path.join(r.state, 'launch-settings.json'), 'utf8'));
   assert.equal(settings.permissions.defaultMode, 'default');
   assert.ok(settings.permissions.ask.some((rule) => /touch/.test(rule)), JSON.stringify(settings));
-  assert.ok(settings.permissions.allow.some((rule) => /node -e/.test(rule)), 'the busy timer must not prompt');
+  assert.deepEqual(settings.permissions.allow, [], 'no blanket allow rule for the busy timer');
 });
 
-test('permission: a send onto a prompt is queued (exit 3), not typed; refusing the prompt lets it deliver', () => {
+test('permission: a send onto a prompt is queued (exit 3), not typed; approving the prompt lets it deliver', () => {
   const r = drill(['--states', 'permission'], { extra: { FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
   assert.equal(r.byState.permission.ok, true, JSON.stringify(r.lines));
-  assert.equal(r.byState.permission.deliveredAs, 'prompt');
+  assert.equal(r.byState.permission.deliveredAs, 'tool');
+});
+
+const stubSeat = (state) => JSON.parse(fs.readFileSync(path.join(state, 'seat.json'), 'utf8'));
+
+test('permission never approves a dialog other than its own command, though the echo names it (and refuses it)', () => {
+  for (const other of ['write', 'bash']) {
+    const r = drill(['--states', 'permission'], { extra: { STUB_DIALOG_OTHER: other, FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+    assert.equal(r.byState.permission.ok, false, `${other}: ${JSON.stringify(r.lines)}`);
+    assert.match(r.byState.permission.reason, /not approved/);
+    assert.equal(stubSeat(r.state).status, 'idle', `${other}: the dialog is refused on the failure path`);
+    const rows = JSON.parse(fs.readFileSync(path.join(r.state, 'store.json'), 'utf8'));
+    assert.equal(rows.filter((x) => x.ack).length, 0, `${other}: nothing was delivered by an approval`);
+  }
+});
+
+test('busy is not reached while the seat only composes the tool call: it waits for the dialog and approves', () => {
+  const r = drill(['--states', 'busy'], { extra: { STUB_THINK: '1' } });
+  assert.equal(r.byState.busy.ok, true, JSON.stringify(r.lines));
+});
+
+test('a queued send acked as typed is not a pass', () => {
+  const r = drill(['--states', 'permission'], { extra: { STUB_QUEUED_ACK: 'typed', FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+  assert.equal(r.byState.permission.ok, false, JSON.stringify(r.lines));
+  assert.match(r.byState.permission.reason, /only a consumer label/);
+});
+
+test('the merge state pre-allows git and gh in the seat settings; other runs allow nothing', () => {
+  const r = drill(['--states', 'merge'], { extra: { FLEET_DRILL_SANDBOX: 'o/sandbox', FLEET_DRILL_MERGE_CMD: path.join(root, 'bin', 'merge'), FLEET_DRILL_LIMIT_MERGE_S: '2' } });
+  const settings = JSON.parse(fs.readFileSync(path.join(r.state, 'launch-settings.json'), 'utf8'));
+  assert.deepEqual(settings.permissions.allow, ['Bash(git:*)', 'Bash(gh:*)']);
+});
+
+test('SIGHUP closes the seat like SIGTERM', async () => {
+  const { spawn } = await import('node:child_process');
+  const state = fs.mkdtempSync(path.join(root, 'state-'));
+  const env = isolatedEnv({ STUB_DIR: state, STUB_NEVER_BUSY: '1', FLEET_DRILL_STORE_DIR: path.join(state, 'store'), FLEET_DRILL_POLL_MS: '20', FLEET_DRILL_SETUP_S: '30', FLEET_DRILL_CWD_ROOT: root,
+    ...Object.fromEntries(Object.entries(ROLES).filter(([k]) => k !== 'FLEET_DRILL_MERGE_CMD').map(([k, r]) => [k, path.join(root, 'bin', r)])) });
+  const child = spawn('node', [SCRIPT, '--states', 'busy'], { env, stdio: 'ignore' });
+  const exited = new Promise((res) => child.on('exit', (code, sig) => res({ code, sig })));
+  for (let i = 0; i < 200 && !fs.existsSync(path.join(state, 'seat.json')); i++) await new Promise((r) => setTimeout(r, 50));
+  await new Promise((r) => setTimeout(r, 500));
+  child.kill('SIGHUP');
+  const { code } = await exited;
+  assert.equal(code, 129);
+  assert.equal(seatOpen(state), false);
 });

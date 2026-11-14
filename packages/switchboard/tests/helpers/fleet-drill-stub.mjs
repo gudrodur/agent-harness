@@ -27,7 +27,11 @@ const WID = 7001;
 const transcript = P('transcript.jsonl');
 const seat = () => {
   const s = readJson('seat.json', { open: false, status: 'idle' });
-  if (s.status === 'busy' && Date.now() >= s.busyUntil) s.status = 'idle';
+  if (s.status === 'busy' && Date.now() >= s.busyUntil) {
+    // The model composing a tool call reads busy, then the dialog appears.
+    if (s.thenDialog) Object.assign(s, { status: 'waiting', approveTo: true, screen: s.thenDialog, thenDialog: null });
+    else s.status = 'idle';
+  }
   return s;
 };
 const save = (s) => writeJson('seat.json', s);
@@ -87,7 +91,7 @@ if (role === 'claude-tab') {
       if (keys !== '\\r') process.exit(0);
       const rows = readJson('store.json', []);
       const pending = rows.filter((r) => r.id && r.queuedForDialog && !rows.some((a) => a.ack === r.id));
-      for (const m of pending) rows.push({ recipient: 'k', ack: m.id, ts: new Date().toISOString(), deliveredAs: 'prompt' });
+      for (const m of pending) rows.push({ recipient: 'k', ack: m.id, ts: new Date().toISOString(), deliveredAs: process.env.STUB_QUEUED_ACK ?? 'tool' });
       writeJson('store.json', rows);
     }
   }
@@ -128,19 +132,25 @@ if (role === 'claude-tab') {
   needValue('--to', '--text', '--wait-idle');
   const text = flag('--text') ?? '';
   const s = seat();
-  // The real harness refuses a foreground `sleep N`, so the drill's long tool call is a node timer.
-  if (/\bsleep \d/.test(text)) process.exit(1);
   const m = /DRILL-'\+6\*7\+'-(\w+)/.exec(text);
+  // What Claude Code draws: the echo of the typed prompt (it names the command
+  // whatever the model then proposes), then the dialog with its own command.
+  const echo = `❯ ${text}`;
+  const dialog = (proposed) => `${echo}\n● Bash(${proposed})\n ────\n Bash command\n  run it\n ╌╌╌╌\n  ${proposed}\n ╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n`;
+  const other = process.env.STUB_DIALOG_OTHER; // a different dialog under the same echo
   if (m && process.env.STUB_NEVER_BUSY) {
     // typed, nothing happens
-  } else if (m && process.env.STUB_PERMISSION_FIRST) {
-    save({ ...s, status: 'waiting', approveTo: true, screen: process.env.STUB_SCREEN_MISMATCH ? 'rm -rf /' : `Bash(node -e "setTimeout(()=>console.log('DRILL-'+6*7+'-${m[1]}'),45000)")` });
-    fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (m) {
-    save({ ...s, status: 'busy', busyUntil: Date.now() + 4000 });
+    // Default permission mode: the timer prompts, approval (Enter) starts it.
+    const screen = process.env.STUB_SCREEN_MISMATCH ? dialog('rm -rf /') : dialog(/node -e .*/.exec(text)[0]);
+    if (process.env.STUB_THINK) save({ ...s, status: 'busy', busyUntil: Date.now() + 1500, thenDialog: screen, screen: '' });
+    else save({ ...s, status: 'waiting', approveTo: true, screen });
     fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (text.includes('touch ')) {
-    save({ ...s, status: 'waiting', screen: `Bash(${/touch \S+/.exec(text)?.[0] ?? ''})` });
+    const cmd = /touch \S+/.exec(text)[0];
+    const screen = other === 'write' ? `${echo}\n● Write(notes.txt)\n Create file\n  notes.txt\n Do you want to create notes.txt?\n ❯ 1. Yes\n   2. No\n`
+      : dialog(other === 'bash' ? `${cmd} && rm -rf x` : cmd);
+    save({ ...s, status: 'waiting', approveTo: false, screen });
   } else if (text.includes('gh pr create')) {
     writeJson('pr.json', { open: true });
   }

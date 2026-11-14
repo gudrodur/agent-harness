@@ -18,15 +18,15 @@ node bin/fleet-drill.mjs --states idle,busy
 
 A state passes on an ack row with a `deliveredAs` value; when `agent-send` exited non-zero it passes only if a consumer (`prompt`, `tool`, `stop`, `mcp`) wrote the label, not the `typed` fallback.
 
-The seat is started with a short confining brief: one action per message, and never approve a permission itself. The `busy` setup approves only a prompt whose screen shows its own timer command; the `permission` state approves only its own `touch` prompt, after the send. Refusing the prompt with Escape is no way to test delivery: the seat goes idle and the queued message is never delivered (a gap in agent-send's dialog queue, deliberately not asserted here). The seat window is always closed at the end, on a pass, a failure or a signal.
+The seat is started with a short confining brief: one action per message, and never approve a permission itself. The `busy` setup approves only a prompt whose screen shows its own timer command; the `permission` state approves only its own `touch` prompt, after the send, and only when the dialog (below the echo of its setup prompt) proposes exactly that command; any failure presses Escape. Refusing the prompt with Escape is no way to test delivery: the seat goes idle and the queued message stays unacked until the seat's next prompt (a gap in agent-send's dialog queue, deliberately not asserted here). The seat window is always closed at the end, on a pass, a failure or a signal.
 
 The seat starts with the drill's private store pinned (`AGENT_SWITCHBOARD_DIR` and `AGENT_SWITCHBOARD_DB`): `claude-tab.sh` passes any such pin on to the seat with kitty's `--env`, because kitty starts the tab from its own environment, not the launcher's.
 
 The first turn of the seat reads its brief, and that turn counts against `FLEET_DRILL_READY_S` (180 s by default, ample for a haiku greeting; raise it on a slow machine).
 
-The `merge` state needs the seat's tools (`git`, `gh`, a push) pre-allowed in its Claude Code settings; the drill approves nothing there, so an unapproved tool call leaves it waiting until the limit and the state fails.
+The `merge` state needs the seat's tools pre-allowed, as the drill approves nothing there: it writes `Bash(git:*)` and `Bash(gh:*)` into the seat's folder settings when `merge` runs (a push is a `git` command). Any other tool call prompts and leaves the state waiting until the limit.
 
-The drill writes `.claude/settings.local.json` into the throwaway folder, pinning `defaultMode: default` and an `ask` rule for its own `touch fleet-drill-*` command and an `allow` rule for the busy state's `node -e` timer: a seat otherwise inherits the user's mode, and in bypass mode no permission prompt can ever appear.
+The drill writes `.claude/settings.local.json` into the throwaway folder, pinning `defaultMode: default` and an `ask` rule for its own `touch fleet-drill-*` command and nothing allowed for the busy timer (the drill approves that prompt itself), and, only when the `merge` state runs, `Bash(git:*)` and `Bash(gh:*)`: a seat otherwise inherits the user's mode, and in bypass mode no permission prompt can ever appear.
 
 The seat needs the mailbox hooks in its Claude Code config, and the throwaway folder must be one Claude Code trusts (`FLEET_DRILL_CWD_ROOT` points it at a folder under a trusted tree).
 
