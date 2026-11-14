@@ -168,7 +168,8 @@ const usage = () => `Usage:
   --status      ask what became of a queued row: one stdout line, pending (since
                 <ts>, <recipient>), delivered (at <ts>, <how>) or withdrawn (at
                 <ts>); a row the sender withdrew and replaced (re-queue, typed
-                fallback) answers with its replacement's state. Exit 0 delivered, 3 pending, 13 withdrawn, 14 no such
+                fallback) answers with its replacement's state; typed but unproven
+                reads "typed, delivery unproven" (exit 3, do not resend). Exit 0 delivered, 3 pending, 13 withdrawn, 14 no such
                 row. A send whose ack wait ended without an ack prints
                 "pending: row <id>; check with agent-send --status --id <id>"
   --read        print this session's unacked inbox rows, including the queues of
@@ -200,7 +201,8 @@ const usage = () => `Usage:
   --file is a POINTER to a COPY: the recipient is sent "read <path>, a note
                 written for you" plus "Message id: <id>" and "Source: <path>", and the path names a
                 copy of your file in the switchboard notes dir (named by that
-                id, pruned after 14 days), so deleting or losing your scratch
+                id; kept while its row or a replacement is queued, else pruned
+                after 14 days), so deleting or losing your scratch
                 file after the send cannot dangle it. A relative PATH resolves
                 against your cwd and must exist and be readable. An ack proves
                 the row was queued and taken, never that the recipient has read
@@ -463,6 +465,7 @@ const main = (argv) => {
   let deadline = null;
   let topic = null;
   let topicWindow = 60;
+  let topicWindowSet = false;
   let forceTopic = false;
   let read = false;
   let cancel = false;
@@ -496,6 +499,7 @@ const main = (argv) => {
     else if (a === '--no-wait') noWait = true;
     else if (a === '--verbose') verbose = true;
     else if (a === '--topic-window') {
+      topicWindowSet = true;
       topicWindow = Number(need('--topic-window'));
       if (!Number.isFinite(topicWindow) || topicWindow < 0) die('--topic-window needs a number of minutes, 0 or more');
     }
@@ -521,7 +525,7 @@ const main = (argv) => {
   }
   if (statusQuery) {
     if (rowId == null) die('--status needs --id <row-id>');
-    if (to != null || text != null || file != null || mode != null || cancel || read || who || asSession != null || claimRoleName != null || releaseRoleName != null || takeOver || deadline != null || noWait || topic != null || forceTopic || idleWhen != null || json) die('--status takes only --id (and --verbose)');
+    if (to != null || text != null || file != null || mode != null || cancel || read || who || asSession != null || claimRoleName != null || releaseRoleName != null || takeOver || deadline != null || noWait || topic != null || forceTopic || topicWindowSet || idleWhen != null || json) die('--status takes only --id (and --verbose)');
   }
   // Inbox read: print this session's unacked rows and ack them, the pull path
   // for a session whose hook prompt has not delivered them yet (host-agent
@@ -628,6 +632,10 @@ const main = (argv) => {
       process.stdout.write(`pending (since ${found.ts}, ${found.key}${via})\n`);
       return exitAfterStdout(3);
     }
+    if (found.state === 'delivered' && found.deliveredAs === 'typedUnproven') {
+      process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
+      return exitAfterStdout(3);
+    }
     if (found.state === 'delivered') {
       process.stdout.write(`delivered (at ${found.ackTs}, ${found.deliveredAs}${via})\n`);
       return exitAfterStdout(0);
@@ -645,11 +653,16 @@ const main = (argv) => {
     if (text != null || file != null || mode != null) die('--cancel takes only --id and optionally --to');
     // A row the sender withdrew and replaced is cancelled through its live
     // replacement: the id a pointer names is the original's.
-    const target = followRow({ id: rowId }).id;
-    const res = cancelQueued({ key: to, id: target });
-    if (target !== rowId) process.stderr.write(`agent-send: ${rowId} was withdrawn and replaced by ${target}; cancelling ${target}\n`);
+    let target = rowId;
+    let res;
+    try {
+      target = followRow({ id: rowId }).id;
+      res = cancelQueued({ key: to, id: target });
+    } catch (e) {
+      die(`could not read the store ${mailboxPath('x')}: ${String(e?.message ?? e).split('\n')[0]}`);
+    }
     if (res.withdrawn) {
-      process.stderr.write(`agent-send: withdrew ${rowId} (recipient ${res.key})${res.keyCorrected ? ` — --to named ${to}, the row's own recipient was used` : ''}\n`);
+      process.stderr.write(`agent-send: withdrew ${target} (recipient ${res.key})${target !== rowId ? ` — ${rowId}, the id you passed, had been replaced by it` : ''}${res.keyCorrected ? ` — --to named ${to}, the row's own recipient was used` : ''}\n`);
       process.exit(0);
     }
     if (res.state === 'delivered') die(`not withdrawn: ${rowId} was already delivered at ${res.ackTs} as ${res.deliveredAs}`, 13);
@@ -803,9 +816,9 @@ const main = (argv) => {
     if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11) && !(r.status === 7 && midTurnHeld)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
-    if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
+    if (typedKey != null && [0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
       try {
-        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId(), replaces: noteId ?? undefined });
+        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId(), replaces: noteId ?? undefined, unproven: r.status === 3 });
       } catch {
         // see above
       }

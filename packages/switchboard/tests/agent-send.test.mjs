@@ -220,7 +220,7 @@ test('readUnacked returns only messages without an ack row', () => {
 });
 
 test('DELIVERED_AS is the closed delivery-label set', () => {
-  assert.deepEqual([...DELIVERED_AS], ['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed']);
+  assert.deepEqual([...DELIVERED_AS], ['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed', 'typedUnproven']);
 });
 test('ack stays fail-open on an unknown label: the message still clears', () => {
   const key = '-repo-a__failopen';
@@ -2920,7 +2920,7 @@ test('the note cleanup keeps an old copy whose row is still queued and drops an 
 });
 
 test('--status refuses stray flags, reads without creating the store, and names where it looked', () => {
-  for (const extra of [['--to', KEY_S1], ['--claim-role', 'r'], ['--text', 'x'], ['--read'], ['--deadline', '1'], ['--no-wait'], ['--queue'], ['--topic', 'tt'], ['--force-topic'], ['--json'], ['--take-over'], ['--idle-when', 'x']]) {
+  for (const extra of [['--to', KEY_S1], ['--claim-role', 'r'], ['--text', 'x'], ['--read'], ['--deadline', '1'], ['--no-wait'], ['--queue'], ['--topic', 'tt'], ['--force-topic'], ['--json'], ['--take-over'], ['--idle-when', 'x'], ['--topic-window', '5']]) {
     const r = runStatus(['--id', 'x', ...extra]);
     assert.equal(r.code, 1, `${extra}: ${r.stdout}${r.stderr}`);
     assert.match(r.stderr, /--status takes only --id/);
@@ -2998,7 +2998,7 @@ test('--cancel on a replaced id withdraws the live replacement', () => {
   assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
 });
 
-test('a --file typed unproven (kitty-send exit 3) leaves no successor: --status says withdrawn', async () => {
+test('a --file typed unproven (kitty-send exit 3) is recorded as unproven: --status says typed, not withdrawn', async () => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-unproven-'));
   try {
     const src = path.join(scratch, 'brief.md');
@@ -3013,9 +3013,10 @@ test('a --file typed unproven (kitty-send exit 3) leaves no successor: --status 
     const argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
     const named = path.basename(argv[argv.indexOf('--file') + 1], '.md');
     const r = runStatus(['--id', named]);
-    assert.equal(r.code, 13, r.stdout + r.stderr);
-    assert.doesNotMatch(r.stdout, /replaced by/);
-    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.match(r.stdout, /^typed, delivery unproven \(at \S+; /);
+    assert.doesNotMatch(r.stdout, /withdrawn \(/);
+    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'no mailbox copy left to deliver twice');
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
@@ -3048,6 +3049,28 @@ test('--status on a corrupt store prints one error line, not a stack trace', () 
     assert.equal(lines.length, 1, r.stderr);
     assert.match(lines[0], /^agent-send: could not read the store /);
     assert.ok(lines[0].includes(db));
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('--cancel names the row it withdrew and prints one line for a corrupt store', () => {
+  const { x, y } = replacedPair();
+  const r = spawnSync('node', [SEND, '--cancel', '--id', x.id], { encoding: 'utf-8', env: childEnv(), timeout: 30_000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, new RegExp(`withdrew ${y.id} `));
+  assert.ok(r.stderr.includes(`${x.id}, the id you passed`), r.stderr);
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-corrupt-cancel-'));
+  try {
+    const db = path.join(scratch, 'state.db');
+    fs.writeFileSync(db, 'this is not a sqlite database'.repeat(50));
+    const env = childEnv({ AGENT_SWITCHBOARD_DB: db });
+    delete env.AGENT_MAILBOX_DIR;
+    const c = spawnSync('node', [SEND, '--cancel', '--id', 'x'], { encoding: 'utf-8', env, timeout: 30_000 });
+    assert.equal(c.status, 1, c.stderr);
+    const lines = c.stderr.split('\n').filter((l) => l.trim());
+    assert.equal(lines.length, 1, c.stderr);
+    assert.match(lines[0], /^agent-send: could not read the store /);
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

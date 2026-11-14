@@ -123,15 +123,15 @@ A window id dies with its window; a **seat role** names the seat itself, and `--
 # 10 and 16 mean typed but not proven (look at the window before resending); any other code is kitty-send.sh's.
 agent-send.mjs --to <window-id|title-substring|mailbox-key|role:name> (--text TEXT | --file PATH) [--now | --stop | --idle-when REGEX | --queue] [--deadline N] [--no-wait] [--verbose]
 agent-send.mjs --read [--as <session-id>]   # print and ack this session's inbox rows (incl. held roles' queues)
-agent-send.mjs --status --id <r>               # what became of a row: one stdout line, pending (since <ts>, <recipient>) / delivered (at <ts>, <how>) / withdrawn (at <ts>); exit 0 delivered, 3 pending, 13 withdrawn, 14 no such row. A send whose ack wait ended without an ack prints `pending: row <id>; check with agent-send --status --id <id>` and keeps exit 3
-agent-send.mjs --cancel --id <r> [--to <key>] # withdraw one queued row; the id alone is enough, the row's own recipient is used (exit 13: already delivered or withdrawn, 14: no such row)
+agent-send.mjs --status --id <r>               # what became of a row: one stdout line, pending (since <ts>, <recipient>) / delivered (at <ts>, <how>) / typed, delivery unproven / withdrawn (at <ts>); follows a row the sender withdrew and replaced (re-queue, typed fallback) to its replacement. Exit 0 delivered, 3 pending or typed-unproven (do not resend), 13 withdrawn, 14 no such row. It takes only --id (and --verbose). A send whose ack wait ended without an ack prints `pending: row <id>; check with agent-send --status --id <id>` and keeps exit 3
+agent-send.mjs --cancel --id <r> [--to <key>] # withdraw one queued row; the id alone is enough, the row's own recipient is used, and a replaced id withdraws its live replacement (exit 13: already delivered or withdrawn, 14: no such row)
 agent-send.mjs --to role:<name> --text TEXT # address a seat role; it survives a seat change
 agent-send.mjs --claim-role <name> [--take-over]  # hold a role; exit 11 if a live seat holds it
 agent-send.mjs --release-role <name>              # give up a role this session holds; exit 12 if another holds it
 agent-send.mjs --who [--json]               # live seats: window, session, cwd, repo, branch, roles, title
 # A multi-line --text reaches a mailbox consumer whole; on the kitty fallback it becomes a --file note
 # under ~/.local/state/agent-switchboard/notes/. --file PATH (relative resolves against your cwd) is copied there too,
-# so the pointer survives the sender's scratch dir and carries "Message id: <id>". The process title hides the text from `pkill -f`.
+# so the pointer survives the sender's scratch dir and carries "Message id: <id>" and "Source: <path>"; the copy is kept while its row or a replacement is queued, else pruned after 14 days. The process title hides the text from `pkill -f`.
 
 # Open a titled tab with its brief and confirm it started (exit 2 means no terminal remote control): --model is required, and a session on another model closes the tab (exit 3).
 # Both launchers share --list (the tabs this machine launched) and --close <window-id> (refuses a window it did not launch).

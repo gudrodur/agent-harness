@@ -52,7 +52,7 @@ export const PRIORITIES = ['now', 'stop', 'idle', 'queue'];
 // no remaining consumer writes them). ack() stays fail-open: an unknown
 // label is still written, so a new consumer can never lose a message by
 // naming a label this list does not know yet.
-export const DELIVERED_AS = Object.freeze(['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed']);
+export const DELIVERED_AS = Object.freeze(['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed', 'typedUnproven']);
 
 // SQLite backend (steps 1-2): an explicit {dir} override always means JSONL
 // files (the path every existing test exercises). Without one, an explicit
@@ -1019,9 +1019,12 @@ export const cancelQueued = ({ key, id, now = Date.now(), dir } = {}) => {
 // A delivery that bypassed the mailbox (agent-send's typed kitty fallback)
 // still leaves a message row, acked at once, so the store sees every delivery
 // and a later same-topic send can find it.
-export const recordTypedDelivery = ({ to, from, priority, text, topic, id, replaces, now = Date.now(), dir } = {}) => {
+export const recordTypedDelivery = ({ to, from, priority, text, topic, id, replaces, unproven = false, now = Date.now(), dir } = {}) => {
   const row = appendMessage({ to, from, priority, text, topic, via: 'typed', id, replaces, now, dir });
-  ack({ key: to, id: row.id, deliveredAs: 'typed', now, dir });
+  // unproven: typed, but kitty-send could not show it landed. The row is closed
+  // all the same (a mailbox copy would deliver it twice); the marker keeps
+  // --status from calling it delivered.
+  ack({ key: to, id: row.id, deliveredAs: unproven ? 'typedUnproven' : 'typed', now, dir });
   return row;
 };
 
