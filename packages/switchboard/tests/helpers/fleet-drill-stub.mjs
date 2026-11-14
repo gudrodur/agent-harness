@@ -142,14 +142,22 @@ if (role === 'claude-tab') {
     // typed, nothing happens
   } else if (m) {
     // Default permission mode: the timer prompts, approval (Enter) starts it.
-    const screen = process.env.STUB_SCREEN_MISMATCH ? dialog('rm -rf /') : dialog(/node -e .*/.exec(text)[0]);
+    const nodeCmd = /node -e .*/.exec(text)[0];
+    const screen = process.env.STUB_SCREEN_MISMATCH ? dialog('rm -rf /')
+      : process.env.STUB_SCREEN_MULTI ? dialog(`${nodeCmd}\n  rm -rf x`) : dialog(nodeCmd);
+    if (process.env.STUB_AUTORUN) {
+      // No dialog: the tool_use row is in the transcript, the call has no result yet.
+      save({ ...s, status: 'busy', busyUntil: Date.now() + 1500, screen: '' });
+      fs.writeFileSync(transcript, `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', input: { command: `DRILL-${m[1]}` } }] } })}\n`);
+      process.exit(0);
+    }
     if (process.env.STUB_THINK) save({ ...s, status: 'busy', busyUntil: Date.now() + 1500, thenDialog: screen, screen: '' });
     else save({ ...s, status: 'waiting', approveTo: true, screen });
     fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (text.includes('touch ')) {
     const cmd = /touch \S+/.exec(text)[0];
     const screen = other === 'write' ? `${echo}\n● Write(notes.txt)\n Create file\n  notes.txt\n Do you want to create notes.txt?\n ❯ 1. Yes\n   2. No\n`
-      : dialog(other === 'bash' ? `${cmd} && rm -rf x` : cmd);
+      : dialog(other === 'bash' ? `${cmd} && rm -rf x` : other === 'multi' ? `${cmd}\n  rm -rf x` : cmd);
     save({ ...s, status: 'waiting', approveTo: false, screen });
   } else if (text.includes('gh pr create')) {
     writeJson('pr.json', { open: true });

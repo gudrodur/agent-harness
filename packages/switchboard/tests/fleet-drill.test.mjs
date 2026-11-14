@@ -168,6 +168,30 @@ test('busy approves a permission prompt only when the screen shows its own comma
   assert.equal(other.byState.busy.ok, false);
 });
 
+test('busy never approves a multi-line proposal that starts with its command', () => {
+  const r = drill(['--states', 'busy'], { extra: { STUB_SCREEN_MULTI: '1', FLEET_DRILL_SETUP_S: '1' } });
+  assert.equal(r.byState.busy.ok, false, JSON.stringify(r.lines));
+  assert.equal(stubSeat(r.state).status, 'idle', 'the unapproved dialog is refused');
+});
+
+test('busy needs the drill to approve its own prompt: a tool_use row with no dialog is no proof the timer runs', () => {
+  const r = drill(['--states', 'busy'], { extra: { STUB_AUTORUN: '1', FLEET_DRILL_SETUP_S: '1' } });
+  assert.equal(r.byState.busy.ok, false, JSON.stringify(r.lines));
+  assert.match(r.byState.busy.reason, /never went busy/);
+});
+
+test('any failed state leaves no dialog open for the next one (busy mismatch, then permission)', () => {
+  const r = drill(['--states', 'busy'], { extra: { STUB_SCREEN_MISMATCH: '1', FLEET_DRILL_SETUP_S: '1' } });
+  assert.equal(r.byState.busy.ok, false);
+  assert.notEqual(stubSeat(r.state).status, 'waiting', 'Escape was pressed after the failed state');
+});
+
+test('the seat settings make the busy timer ask whatever allow rules say', () => {
+  const r = drill(['--states', 'busy']);
+  const settings = JSON.parse(fs.readFileSync(path.join(r.state, 'launch-settings.json'), 'utf8'));
+  assert.ok(settings.permissions.ask.some((rule) => /node -e/.test(rule)), JSON.stringify(settings));
+});
+
 test('a typed ack after a non-zero send exit is not a pass; a consumer label is', () => {
   const idle = drill(['--states', 'idle'], { extra: { STUB_SEND_EXIT: '3' } });
   assert.equal(idle.byState.idle.ok, true, JSON.stringify(idle.lines));
@@ -251,7 +275,7 @@ test('permission: a send onto a prompt is queued (exit 3), not typed; approving 
 const stubSeat = (state) => JSON.parse(fs.readFileSync(path.join(state, 'seat.json'), 'utf8'));
 
 test('permission never approves a dialog other than its own command, though the echo names it (and refuses it)', () => {
-  for (const other of ['write', 'bash']) {
+  for (const other of ['write', 'bash', 'multi']) {
     const r = drill(['--states', 'permission'], { extra: { STUB_DIALOG_OTHER: other, FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
     assert.equal(r.byState.permission.ok, false, `${other}: ${JSON.stringify(r.lines)}`);
     assert.match(r.byState.permission.reason, /not approved/);

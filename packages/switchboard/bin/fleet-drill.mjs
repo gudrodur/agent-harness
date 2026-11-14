@@ -199,9 +199,21 @@ const dialogText = (screen) => {
 };
 // Approves the prompt on screen only when its dialog proposes exactly `command`,
 // this drill's own, and the seat is still waiting at the moment of the keypress.
+// The dialog frames the proposal between two dashed rules, just above the question.
+// The whole block must equal the command: a multi-line proposal that merely starts
+// with it (`touch x` then `rm -rf y`) is not this drill's command.
+const proposalBlock = (dialog) => {
+  const ask = dialog.findIndex((l) => /Do you want to proceed/.test(l));
+  if (ask < 0) return null;
+  const rules = [];
+  dialog.slice(0, ask).forEach((l, i) => { if (/^\s*[╌─-]{3,}\s*$/.test(l)) rules.push(i); });
+  if (rules.length < 2) return null;
+  const [open, close] = rules.slice(-2);
+  return dialog.slice(open + 1, close).map((l) => l.trim()).filter(Boolean).join('\n');
+};
 const approveIfShowing = (command) => {
   const dialog = dialogText(screenText());
-  if (!dialog || !dialog.some((l) => l.trim() === command) || !dialog.some((l) => /Do you want to proceed/.test(l))) return false;
+  if (!dialog || proposalBlock(dialog) !== command) return false;
   if (!isWaiting()) return false;
   sendKeys('\\r');
   return true;
@@ -220,7 +232,7 @@ const startSeat = async () => {
   // The merge state's tools are pre-allowed, as the drill approves nothing there.
   const allow = states.includes('merge') ? ['Bash(git:*)', 'Bash(gh:*)'] : [];
   fs.mkdirSync(path.join(cwd, '.claude'));
-  fs.writeFileSync(path.join(cwd, '.claude', 'settings.local.json'), `${JSON.stringify({ permissions: { defaultMode: 'default', allow, ask: ['Bash(touch fleet-drill-*)'] } }, null, 2)}\n`);
+  fs.writeFileSync(path.join(cwd, '.claude', 'settings.local.json'), `${JSON.stringify({ permissions: { defaultMode: 'default', allow, ask: ['Bash(touch fleet-drill-*)', 'Bash(node -e:*)'] } }, null, 2)}\n`);
   const r = run(B.claudeTab, ['--seat', '--title', 'fleet-drill', '--model', process.env.FLEET_DRILL_MODEL || 'haiku', '--cwd', cwd, '--brief', brief], { timeoutS: 200 });
   const m = /^WINDOW_ID=(\d+)/m.exec(r.stdout ?? '');
   if (m) wid = Number(m[1]);
@@ -305,14 +317,15 @@ const checks = {
     prompt(`Use the Bash tool, in the foreground (not run_in_background), to run exactly this command, then reply done: ${cmd}`);
     // The seat reads busy while the model is still composing the tool call, before
     // any dialog: busy alone does not mean the timer runs. It does once the drill
-    // approved its own prompt, or the transcript holds the call with no dialog open.
+    // approved its own prompt. The seat settings make that prompt certain (an ask
+    // rule beats any allow), so no weaker evidence, such as a tool_use row that the
+    // dialog may not be drawn for yet, counts as the timer running.
     let approved = false;
     const reached = await waitFor(() => {
       if (isWaiting() && approveIfShowing(cmd)) approved = true; // only this drill's own command
-      const st = seatState();
-      return st.state === 'busy' && (approved || (transcriptHasToolUse(st.session, tok) && !isWaiting()));
+      return approved && seatState().state === 'busy';
     }, SETUP_S());
-    if (!reached) return fail('seat never went busy for the timer tool call');
+    if (!reached) return fail('seat never went busy for the timer tool call after the drill approved its prompt');
     const session = seatState().session;
     const { sent, ack } = await sendAndAck('busy', `fleet-drill busy ${token()}: reply with the single word ok.`);
     if (!accepted(sent, ack)) return rejectReason('busy', sent, ack);
@@ -329,13 +342,8 @@ const checks = {
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the setup');
     const tok = token();
     const cmd = `touch fleet-drill-${tok}`;
-    // Any failure leaves the dialog open: refuse it, so the next state starts clean.
-    const done = (res) => {
-      if (!res.ok && isWaiting()) sendKeys('\\x1b');
-      return res;
-    };
     prompt(`Use the Bash tool to run exactly this command, then reply done: ${cmd}`);
-    if (!(await waitFor(isWaiting, SETUP_S()))) return done(fail('seat never showed a permission prompt'));
+    if (!(await waitFor(isWaiting, SETUP_S()))) return fail('seat never showed a permission prompt');
     const text = `fleet-drill permission ${token()}: reply with the single word ok.`;
     const since = Date.now();
     const sent = run(B.agentSend, ['--to', String(wid), '--text', text], { timeoutS: limitS('permission') });
@@ -346,20 +354,20 @@ const checks = {
     // queued row stays unacked until the seat's next prompt (a gap in agent-send's
     // dialog queue, deliberately not asserted here).
     const queued = sent.status === 3 && /selection dialog/.test(sent.stderr ?? '');
-    if (screenText().includes(text.slice(0, 40))) return done(fail('the message was typed into the permission prompt instead of being queued'));
-    if (!approveIfShowing(cmd)) return done(fail(`the permission dialog does not propose exactly "${cmd}": not approved`));
+    if (screenText().includes(text.slice(0, 40))) return fail('the message was typed into the permission prompt instead of being queued');
+    if (!approveIfShowing(cmd)) return fail(`the permission dialog does not propose exactly "${cmd}": not approved`);
     const ack = await waitFor(() => findAck(text, since), Math.max(1, limitS('permission') - (Date.now() - since) / 1000));
     await waitFor(isIdle, SETTLE_S());
     if (!ack?.deliveredAs) {
       const screen = screenText().split('\n').filter((l) => l.trim()).slice(-4).join(' | ').slice(0, 300);
-      return done(fail(`${noAck('permission', sent).reason}; after the prompt was approved the seat is ${seatState().state}, screen: ${screen}`));
+      return fail(`${noAck('permission', sent).reason}; after the prompt was approved the seat is ${seatState().state}, screen: ${screen}`);
     }
     if (queued) {
       return CONSUMER_LABELS.includes(ack.deliveredAs)
         ? pass(ack.deliveredAs, 'queued while the prompt was open, delivered after it was approved')
-        : done(fail(`queued behind the prompt but acked ${ack.deliveredAs}: only a consumer label (${CONSUMER_LABELS.join(', ')}) counts`, ack.deliveredAs));
+        : fail(`queued behind the prompt but acked ${ack.deliveredAs}: only a consumer label (${CONSUMER_LABELS.join(', ')}) counts`, ack.deliveredAs);
     }
-    return accepted(sent, ack) ? pass(ack.deliveredAs) : done(rejectReason('permission', sent, ack));
+    return accepted(sent, ack) ? pass(ack.deliveredAs) : rejectReason('permission', sent, ack);
   },
 
   async merge() {
@@ -399,12 +407,6 @@ const checks = {
   },
 };
 
-const transcriptHasToolUse = (file, marker) => {
-  try {
-    return fs.readFileSync(file, 'utf8').split('\n').some((line) => line.includes(marker) && line.includes('"tool_use"'));
-  } catch { return false; }
-};
-
 const transcriptHasToolResult = (file, marker) => {
   try {
     for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
@@ -439,6 +441,9 @@ try {
       const t0 = Date.now();
       let res;
       try { res = await checks[state](); } catch (e) { res = fail(`drill error: ${e?.message ?? e}`); }
+      // A failed state may leave a dialog open (a mismatch, a timeout, a throw):
+      // refuse it, or the next state starts inside it and cascades.
+      if (!res.ok) { try { if (isWaiting()) sendKeys('\\x1b'); } catch { /* best effort */ } }
       const line = { state, ok: res.ok, ms: Date.now() - t0, deliveredAs: res.deliveredAs ?? null, reason: res.reason };
       results.push(line);
       process.stdout.write(`${JSON.stringify(line)}\n`);
