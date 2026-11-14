@@ -13,7 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { openStore } from '../lib/store.mjs';
-import { ack, appendMessage, cancelQueued, findRow, readUnacked, recipientKey } from '../lib/agent-mailbox.mjs';
+import { ack, appendMessage, cancelQueued, findRow, followRow, readUnacked, recipientKey } from '../lib/agent-mailbox.mjs';
 
 const SEND = fileURLToPath(new URL('../bin/agent-send.mjs', import.meta.url));
 let tmp, dbPath;
@@ -89,4 +89,30 @@ test('library: cancelQueued corrects the key in store mode; topic supersede stil
   const second = appendMessage({ to: key, priority: 'now', text: 'two', topic: 't' });
   assert.deepEqual(readUnacked(key).map((r) => r.id), [second.id]);
   assert.equal(findRow({ id: first.id }).state, 'withdrawn');
+});
+
+test('followRow in store mode follows a withdrawn row to the row that replaced it', () => {
+  const key = recipientKey({ cwd: '/repo/proj', sessionId: 'holder-chain' });
+  const first = appendMessage({ to: key, priority: 'now', text: 'x' });
+  cancelQueued({ key, id: first.id });
+  const second = appendMessage({ to: key, priority: 'now', text: 'x', replaces: first.id });
+  let got = followRow({ id: first.id });
+  assert.equal(got.id, second.id);
+  assert.equal(got.state, 'queued');
+  ack({ key, id: second.id, deliveredAs: 'prompt' });
+  got = followRow({ id: first.id });
+  assert.equal(got.state, 'delivered');
+  assert.equal(followRow({ id: 'nope' }).state, 'missing');
+});
+
+test('followRow in store mode follows a replacement after the withdrawn row was pruned', () => {
+  const key = recipientKey({ cwd: '/repo/proj', sessionId: 'holder-pruned' });
+  const first = appendMessage({ to: key, priority: 'now', text: 'x' });
+  cancelQueued({ key, id: first.id });
+  const second = appendMessage({ to: key, priority: 'now', text: 'x', replaces: first.id });
+  const s = openStore(dbPath);
+  try { s.run('DELETE FROM mailbox_rows WHERE msg_id = ?', first.id); } finally { s.close(); }
+  const got = followRow({ id: first.id });
+  assert.equal(got.id, second.id);
+  assert.equal(got.state, 'queued');
 });

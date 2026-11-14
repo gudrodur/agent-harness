@@ -6,12 +6,12 @@
 |---|---|
 | 0 | Acked, or proven by the terminal fallback. |
 | 2 | A refused flag pair: `--no-wait` with `--now`, `--stop`, `--idle-when` or `--deadline`. Nothing was written or sent. |
-| 3 | Not delivered yet (queued, or no proof): do not resend. Queued for a role with no live holder also exits 3, and `--no-wait` exits 3 as soon as the row is written. |
-| 10 | Typed but not proven submitted: look at the window before resending. |
+| 3 | Not delivered yet (queued, or no proof): do not resend; `--status --id <id>` asks later (when an ack wait ended without an ack the sender prints that command). `--status` itself exits 3 for a pending row. Queued for a role with no live holder also exits 3, and `--no-wait` exits 3 as soon as the row is written. |
+| 10 | Typed but not proven submitted: look at the window before resending. `--status` also exits 10 for a typed send whose delivery was unproven (kitty-send exit 3, or killed by a signal). |
 | 11 | `--claim-role`: a live seat holds the role; the claim changed nothing (`--take-over` takes it). |
 | 12 | `--release-role`: another session holds the role. |
-| 13 | `--cancel`: the row was already delivered or withdrawn. |
-| 14 | `--cancel`: no such row. |
+| 13 | `--cancel`: the row was already delivered or withdrawn. `--status`: the row was withdrawn. |
+| 14 | `--cancel` or `--status`: no such row. |
 | 15 | `--topic`: the topic was already delivered to the recipient within `--topic-window`; this message was suppressed and nothing was sent (`--force-topic` sends anyway). |
 | 16 | Typed, not proven submitted: kitty-send's code 16, passed through (never re-queued). |
 | other | `bin/kitty-send.sh`'s code, below, except its 11 and 12, which agent-send reports as 1 because its own 11 and 12 mean a refused role claim or release. |

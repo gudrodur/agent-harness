@@ -23,7 +23,7 @@
 // into, and a busy one is held (a mailbox row, else kitty-send --queue). The
 // sender prunes stale mailboxes before resolving. --read prints and acks this
 // session's unacked rows (the inbox-read entry a session without a hook prompt calls); --cancel
-// withdraws one queued row by id.
+// withdraws one queued row by id; --status reports what became of one.
 //
 // A slash command cannot travel this way. A mailbox row reaches the
 // recipient as a user message, so "/collab" arrives as the literal text
@@ -65,6 +65,7 @@ import {
   ack,
   appendMessage,
   cancelQueued,
+  followRow,
   listSeats,
   liveRoleHolder,
   mailboxPath,
@@ -115,10 +116,11 @@ const warnNoLiveSeats = (seats = listSeats()) => {
   process.stderr.write(`agent-send: no live seats in ${presenceSource()}; that answers for this store only, and AGENT_SWITCHBOARD_DB selects another\n`);
 };
 const usage = () => `Usage:
-  agent-send.mjs --to <window-id|title-substring|mailbox-key> (--text LINE | --file /abs/path)
+  agent-send.mjs --to <window-id|title-substring|mailbox-key> (--text LINE | --file PATH)
                  [--now | --stop | --idle-when REGEX | --queue] [--deadline N] [--no-wait] [--verbose] [--topic SLUG [--topic-window MIN] [--force-topic]]
   agent-send.mjs --read [--as <session-id>]
   agent-send.mjs --cancel --id <row-id> [--to <mailbox-key>]
+  agent-send.mjs --status --id <row-id>
   agent-send.mjs --claim-role <name> [--take-over] [--as <session-id>]
   agent-send.mjs --release-role <name> [--as <session-id>]
   agent-send.mjs --who [--json]
@@ -163,6 +165,14 @@ const usage = () => `Usage:
                 exits 15 (suppressed, nothing sent; not 0, which means this
                 message was delivered). --force-topic or a zero --topic-window sends
                 anyway.
+  --status      ask what became of a queued row: one stdout line, pending (since
+                <ts>, <recipient>), delivered (at <ts>, <how>) or withdrawn (at
+                <ts>); a row the sender withdrew and replaced (re-queue, typed
+                fallback) answers with its replacement's state; typed but unproven
+                reads "typed, delivery unproven" (exit 10, look at the window before resending;
+                a kitty-send that exited 3 or died by a signal lands here). Exit 0 delivered, 3 pending, 10 typed unproven, 13 withdrawn, 14 no such
+                row. A send whose ack wait ended without an ack prints
+                "pending: row <id>; check with agent-send --status --id <id>"
   --read        print this session's unacked inbox rows, including the queues of
                 the roles it holds, and ack them (inbox read;
                 the session is CLAUDE_CODE_SESSION_ID unless --as names it)
@@ -189,16 +199,18 @@ const usage = () => `Usage:
                 --json prints it for machines. With no rows, stderr names the
                 store it read; the exit code stays 0
 
-  --file is a POINTER, not a payload: the recipient is sent "read <path>, a note
-                written for you" and reads whatever is on disk whenever the
-                message reaches it. An ack proves the row was queued and taken,
-                never that the file is still readable — a sender that deletes its
-                scratch file after the ack delivers a dangling pointer. For a
-                short message, --text carries it inline. A multi-line --text
-                reaches a mailbox consumer whole; on the kitty fallback, which
-                types one line, it is written to a note in the switchboard
-                state dir and sent as --file. For anything longer, leave the
-                file in place until the recipient confirms it has the message.
+  --file is a POINTER to a COPY: the recipient is sent "read <path>, a note
+                written for you" plus "Message id: <id>" and "Source: <path>", and the path names a
+                copy of your file in the switchboard notes dir (named by that
+                id; kept while its row or a replacement is queued, else pruned
+                after 14 days), so deleting or losing your scratch
+                file after the send cannot dangle it. A relative PATH resolves
+                against your cwd and must exist and be readable. An ack proves
+                the row was queued and taken, never that the recipient has read
+                the note. For a short message, --text carries it inline. A
+                multi-line --text reaches a mailbox consumer whole; on the kitty
+                fallback, which types one line, it is written to a note in the
+                same dir and sent as --file.
 
   Exit: the code is the delivery verdict.
     0   delivered: acked in the mailbox, or kitty-send proved the text landed
@@ -229,8 +241,9 @@ const usage = () => `Usage:
     2   --no-wait refused: it cannot take --deadline, --now, --stop or --idle-when
     11  --claim-role refused: the role's holder is live (nothing changed)
     12  --release-role refused: another session holds the role (nothing changed)
-    13  --cancel found the row already delivered or already withdrawn (nothing written)
-    14  --cancel found no row with that id (nothing written)
+    13  --cancel found the row already delivered or already withdrawn (nothing written);
+        --status: the row was withdrawn
+    14  --cancel or --status found no row with that id (nothing written)
     15  --topic suppressed the send: the topic was already delivered to the
         recipient within --topic-window, so THIS message was not sent (benign
         when the earlier delivery is what you wanted; --force-topic sends anyway)
@@ -309,20 +322,26 @@ const fileNote = (file) =>
 // sender's session has ended.
 const NOTE_RETENTION_DAYS = 14;
 const notesDir = () => process.env.AGENT_SWITCHBOARD_NOTES_DIR ?? path.join(switchboardDir(), 'notes');
-const writeNote = (text, id) => {
+const writeNote = (content, id) => {
   const dir = notesDir();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const cutoff = Date.now() - NOTE_RETENTION_DAYS * 24 * 3600 * 1000;
   for (const name of fs.readdirSync(dir)) {
     const p = path.join(dir, name);
     try {
-      if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true });
+      if (fs.statSync(p).mtimeMs >= cutoff) continue;
+      // A copy whose row (or the row that replaced it) is still queued is still
+      // owed to a reader: keep it however old it is.
+      if (name.endsWith('.md') && followRow({ id: name.slice(0, -'.md'.length) }).state === 'queued') continue;
+      fs.rmSync(p, { force: true });
     } catch {
       // Another sender pruned it first.
     }
   }
   const note = path.join(dir, `${id ?? randomUUID()}.md`);
-  fs.writeFileSync(note, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 });
+  // A --file copy is the file's own bytes. A text note gets a closing newline.
+  const bytes = typeof content === 'string' ? (content.endsWith('\n') ? content : `${content}\n`) : content;
+  fs.writeFileSync(note, bytes, { mode: 0o600 });
   return note;
 };
 
@@ -447,9 +466,11 @@ const main = (argv) => {
   let deadline = null;
   let topic = null;
   let topicWindow = 60;
+  let topicWindowSet = false;
   let forceTopic = false;
   let read = false;
   let cancel = false;
+  let statusQuery = false;
   let asSession = null;
   let rowId = null;
   let claimRoleName = null;
@@ -479,6 +500,7 @@ const main = (argv) => {
     else if (a === '--no-wait') noWait = true;
     else if (a === '--verbose') verbose = true;
     else if (a === '--topic-window') {
+      topicWindowSet = true;
       topicWindow = Number(need('--topic-window'));
       if (!Number.isFinite(topicWindow) || topicWindow < 0) die('--topic-window needs a number of minutes, 0 or more');
     }
@@ -489,6 +511,7 @@ const main = (argv) => {
     }
     else if (a === '--read') read = true;
     else if (a === '--cancel') cancel = true;
+    else if (a === '--status') statusQuery = true;
     else if (a === '--as') asSession = need('--as');
     else if (a === '--id') rowId = need('--id');
     else if (a === '--claim-role') claimRoleName = need('--claim-role');
@@ -500,6 +523,10 @@ const main = (argv) => {
       process.stdout.write(usage());
       return exitAfterStdout(0);
     } else die(`unknown argument: ${a} (try --help)`);
+  }
+  if (statusQuery) {
+    if (rowId == null) die('--status needs --id <row-id>');
+    if (to != null || text != null || file != null || mode != null || cancel || read || who || asSession != null || claimRoleName != null || releaseRoleName != null || takeOver || deadline != null || noWait || topic != null || forceTopic || topicWindowSet || idleWhen != null || json) die('--status takes only --id (and --verbose)');
   }
   // Inbox read: print this session's unacked rows and ack them, the pull path
   // for a session whose hook prompt has not delivered them yet (host-agent
@@ -591,13 +618,52 @@ const main = (argv) => {
     warnNoLiveSeats();
     process.exit(0);
   }
+  // Status: ask later what became of a row. The exit code is the verdict, the
+  // same codes --cancel uses (0 delivered, 3 pending, 13 withdrawn, 14 no row).
+  if (statusQuery) {
+    let found;
+    try {
+      found = followRow({ id: rowId });
+    } catch (e) {
+      die(`could not read the store ${mailboxPath('x')}: ${String(e?.message ?? e).split('\n')[0]}`);
+    }
+    // The row may have been withdrawn and replaced: say which row answers.
+    const via = found.id !== rowId ? `; ${rowId} was withdrawn and replaced by ${found.id}` : '';
+    if (found.state === 'queued') {
+      process.stdout.write(`pending (since ${found.ts}, ${found.key}${via})\n`);
+      return exitAfterStdout(3);
+    }
+    if (found.state === 'delivered' && found.deliveredAs === 'typedUnproven') {
+      process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
+      return exitAfterStdout(10);
+    }
+    if (found.state === 'delivered') {
+      process.stdout.write(`delivered (at ${found.ackTs}, ${found.deliveredAs}${via})\n`);
+      return exitAfterStdout(0);
+    }
+    if (found.state === 'withdrawn') {
+      process.stdout.write(`withdrawn (at ${found.withdrawTs}${via})\n`);
+      return exitAfterStdout(13);
+    }
+    const where = mailboxPath('x');
+    die(`no row ${rowId} in ${where.endsWith('x.jsonl') ? path.dirname(where) : where}`, 14);
+  }
   // Cancel: withdraw one queued row so a later drain cannot deliver it.
   if (cancel) {
     if (rowId == null) die('--cancel needs --id <row-id> (--to is optional)');
     if (text != null || file != null || mode != null) die('--cancel takes only --id and optionally --to');
-    const res = cancelQueued({ key: to, id: rowId });
+    // A row the sender withdrew and replaced is cancelled through its live
+    // replacement: the id a pointer names is the original's.
+    let target = rowId;
+    let res;
+    try {
+      target = followRow({ id: rowId }).id;
+      res = cancelQueued({ key: to, id: target });
+    } catch (e) {
+      die(`could not read the store ${mailboxPath('x')}: ${String(e?.message ?? e).split('\n')[0]}`);
+    }
     if (res.withdrawn) {
-      process.stderr.write(`agent-send: withdrew ${rowId} (recipient ${res.key})${res.keyCorrected ? ` — --to named ${to}, the row's own recipient was used` : ''}\n`);
+      process.stderr.write(`agent-send: withdrew ${target} (recipient ${res.key})${target !== rowId ? ` — ${rowId}, the id you passed, had been replaced by it` : ''}${res.keyCorrected ? ` — --to named ${to}, the row's own recipient was used` : ''}\n`);
       process.exit(0);
     }
     if (res.state === 'delivered') die(`not withdrawn: ${rowId} was already delivered at ${res.ackTs} as ${res.deliveredAs}`, 13);
@@ -605,12 +671,40 @@ const main = (argv) => {
     die(`not withdrawn: no row ${rowId}`, 14);
   }
   if (text != null && file != null) die('pass one of --text or --file, not both');
+  // The first mailbox row of a --file send takes this id, so the pointer can
+  // name the message and the durable copy is filed under it (see takeRowId).
+  // The copy itself is written only when something is about to be sent, so a
+  // refused send leaves none.
+  let pendingRowId = null;
+  let copyBytes = null;
   if (file != null) {
-    if (!path.isAbsolute(file)) die('--file must be an absolute path');
-    if (!fs.existsSync(file)) die(`no such file: ${file}`);
-    text = fileNote(file);
+    // A relative path means the caller's cwd, not the recipient's: resolve it here.
+    const source = path.resolve(file);
+    try {
+      fs.accessSync(source, fs.constants.R_OK);
+      if (!fs.statSync(source).isFile()) throw new Error('not a file');
+      copyBytes = fs.readFileSync(source);
+    } catch {
+      die(`no such file: ${source}`);
+    }
+    // The pointer must outlive the sender's scratch dir (a reboot clears it), so
+    // the recipient is pointed at a copy in the switchboard notes dir.
+    pendingRowId = randomUUID();
+    file = path.join(notesDir(), `${pendingRowId}.md`);
+    text = `${fileNote(file)} Message id: ${pendingRowId}. Source: ${source}.`;
   }
-  if (text == null || text === '') die('pass --text LINE or --file /abs/path');
+  const ensureCopy = () => {
+    if (copyBytes == null) return;
+    writeNote(copyBytes, path.basename(file, '.md'));
+    copyBytes = null;
+  };
+  const takeRowId = () => {
+    ensureCopy();
+    const id = pendingRowId ?? undefined;
+    pendingRowId = null;
+    return id;
+  };
+  if (text == null || text === '') die('pass --text LINE or --file PATH');
   if (deadline != null && !/^\d+$/.test(deadline)) die('--deadline must be a number of seconds');
   const priority = mode ?? 'now';
   // --no-wait only leaves a mailbox row; --now, --stop and --idle-when promise an
@@ -678,8 +772,10 @@ const main = (argv) => {
   const runKittySend = (why, target, sendText, noteId = null, { requeue = false, timeoutS = null, holdQueue = false, midTurnHeld = false } = {}) => {
     trace(`agent-send: ${why}, falling back to kitty-send\n`);
     const args = ['--to', String(target)];
-    if (file != null) args.push('--file', file);
-    else if (sendText.includes('\n')) {
+    if (file != null) {
+      ensureCopy();
+      args.push('--file', file);
+    } else if (sendText.includes('\n')) {
       const note = writeNote(sendText, noteId);
       trace(`agent-send: multi-line text written to ${note} for kitty-send --file\n`);
       args.push('--file', note);
@@ -721,9 +817,9 @@ const main = (argv) => {
     if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11) && !(r.status === 7 && midTurnHeld)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
-    if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
+    if (typedKey != null && ([0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) || (r.status == null && r.signal != null)) && !args.includes('--queue')) {
       try {
-        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic });
+        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId(), replaces: noteId ?? undefined, unproven: r.status === 3 || r.status == null });
       } catch {
         // see above
       }
@@ -797,7 +893,7 @@ const main = (argv) => {
     // --no-wait only writes a mailbox row: never type, never wait on a proof.
     if (noWait) {
       if (queueKey == null) die(`${why}; --no-wait only queues, there is no mailbox to queue in, so nothing was sent and nothing is queued`);
-      const nrow = appendMessage({ to: queueKey, from: recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null }), priority, text, topic });
+      const nrow = appendMessage({ to: queueKey, from: recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null }), priority, text, topic, id: takeRowId() });
       verdict(
         `agent-send: queued for ${to} (${why}), delivered at its next prompt (id ${nrow.id}; exit 3: pending, do not resend; --cancel --id ${nrow.id} withdraws)\n`,
         `agent-send: ${why}; --no-wait: queued ${nrow.id} for ${queueKey} in ${mailboxPath(queueKey)}, nothing typed (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${nrow.id})\n`,
@@ -810,7 +906,7 @@ const main = (argv) => {
     const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null, when = 'at its next prompt') => {
       if (queueKey == null) return false;
       const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
-      const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
+      const qrow = appendMessage({ to: queueKey, from, priority, text, topic, id: takeRowId() });
       verdict(
         `agent-send: queued for ${to}${detail ? ` (${detail})` : ''}, ${whenDelivered(kittyStatus, when, proofWhy)} (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
         `agent-send: ${reason}; queued ${qrow.id} for ${queueKey} in ${mailboxPath(queueKey)}; the seat receives it ${when} (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`,
@@ -954,7 +1050,7 @@ const main = (argv) => {
   dupCheck(recipient.key);
   if (recipient.queuedForRole) {
     const qfrom = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
-    const qrow = appendMessage({ to: recipient.key, from: qfrom, priority, text, topic });
+    const qrow = appendMessage({ to: recipient.key, from: qfrom, priority, text, topic, id: takeRowId() });
     process.stderr.write(`agent-send: queued for role ${recipient.role}; no live holder${recipient.holderSessionId ? ` (last holder ${recipient.holderSessionId} is gone)` : ''}. Row ${qrow.id} in ${mailboxPath(recipient.key)}; the next session that claims the role receives it (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
     noticeUnreadRole(recipient.role, qrow.id, qfrom);
     if (rcDown()) peerChannelHint({ sessionId: recipient.holderSessionId ?? null, queuedId: qrow.id });
@@ -966,14 +1062,24 @@ const main = (argv) => {
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
   }
   const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
-  const row = appendMessage({ to: recipient.key, from, priority, text, topic });
+  const row = appendMessage({ to: recipient.key, from, priority, text, topic, id: takeRowId() });
   const mbox = mailboxPath(recipient.key);
   trace(`agent-send: queued ${row.id} for ${recipient.key} in ${mbox}; withdraw with --cancel --id ${row.id}\n`);
   // The one line a caller reads when the message is safely queued (exit 3).
-  const pendingLine = (id, full = undefined, note = '', status = null, proofWhy = null, when = undefined) => verdict(
-    `agent-send: queued for ${to}${note}, ${whenDelivered(status, when, proofWhy)} (id ${id}; exit 3: pending, do not resend; --cancel --id ${id} withdraws)\n`,
-    full,
-  );
+  // Set once the ack wait ended without an ack: the caller cannot tell a row
+  // that is still pending from one that was lost, so the exit names the
+  // command that answers it.
+  let ackWaitEnded = false;
+  const pendingHint = (id) => {
+    if (ackWaitEnded) process.stderr.write(`agent-send: pending: row ${id}; check with agent-send --status --id ${id}\n`);
+  };
+  const pendingLine = (id, full = undefined, note = '', status = null, proofWhy = null, when = undefined) => {
+    verdict(
+      `agent-send: queued for ${to}${note}, ${whenDelivered(status, when, proofWhy)} (id ${id}; exit 3: pending, do not resend; --cancel --id ${id} withdraws)\n`,
+      full,
+    );
+    pendingHint(id);
+  };
   if (noWait) {
     pendingLine(row.id);
     process.exit(3);
@@ -1046,6 +1152,8 @@ const main = (argv) => {
       if (rcDown()) {
         process.stderr.write(`agent-send: kitty remote control is not answering; row ${row.id} stays queued in ${mbox} for the recipient's own drain (exit 3: not delivered yet, do not resend)\n`);
         peerChannelHint({ sessionId: recipient.sessionId, queuedId: row.id });
+        ackWaitEnded = true;
+        pendingHint(row.id);
         process.exit(3);
       }
       if (rwin != null && why == null) {
@@ -1089,6 +1197,7 @@ const main = (argv) => {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox} (after the wait limit)\n`);
     process.exit(0);
   }
+  ackWaitEnded = true;
   // --queue --deadline ran out against a seat that looks idle but is not
   // provably safe to type into: the row stays queued, and nothing is withdrawn
   // first in the hope that kitty-send refuses.
@@ -1153,7 +1262,7 @@ const main = (argv) => {
   // idle wait ran out, a send already queued, mid-turn without --now). The row
   // is withdrawn, so without this the message is gone: put it back.
   if (KITTY_SENT_NOTHING.has(status)) {
-    const again = appendMessage({ to: recipient.key, from, priority, text, topic });
+    const again = appendMessage({ to: recipient.key, from, priority, text, topic, id: takeRowId(), replaces: row.id });
     pendingLine(again.id, `agent-send: kitty-send exit ${status} sent nothing (${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'}) for ${row.id}; re-queued as ${again.id} in ${mbox}, ${whenDelivered(status, "at the recipient's next tool call, next prompt or when its current turn ends")} (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${again.id})\n`, ` (not typed: ${KITTY_NOTHING_REASON[status] ?? 'see kitty-send.sh'})`, status);
     if (rcDown(status)) peerChannelHint({ sessionId: recipient.sessionId, queuedId: again.id });
     process.exit(3);

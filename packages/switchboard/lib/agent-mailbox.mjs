@@ -52,7 +52,7 @@ export const PRIORITIES = ['now', 'stop', 'idle', 'queue'];
 // no remaining consumer writes them). ack() stays fail-open: an unknown
 // label is still written, so a new consumer can never lose a message by
 // naming a label this list does not know yet.
-export const DELIVERED_AS = Object.freeze(['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed']);
+export const DELIVERED_AS = Object.freeze(['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed', 'typedUnproven']);
 
 // SQLite backend (steps 1-2): an explicit {dir} override always means JSONL
 // files (the path every existing test exercises). Without one, an explicit
@@ -761,11 +761,11 @@ export const formatInboxLines = (found) =>
 
 export const TOPIC_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-export const appendMessage = ({ to, from, priority, text, topic, via, now = Date.now(), dir } = {}) => {
+export const appendMessage = ({ to, from, priority, text, topic, via, id, replaces, now = Date.now(), dir } = {}) => {
   if (!PRIORITIES.includes(priority)) throw new Error(`priority must be one of ${PRIORITIES.join('|')}, got '${priority}'`);
   if (topic != null && !TOPIC_RE.test(topic)) throw new Error(`topic must match ${TOPIC_RE}, got '${topic}'`);
   const row = {
-    id: randomUUID(),
+    id: id ?? randomUUID(),
     ts: new Date(now).toISOString(),
     from: from ?? null,
     to,
@@ -773,6 +773,9 @@ export const appendMessage = ({ to, from, priority, text, topic, via, now = Date
     text,
   };
   if (via != null) row.via = via;
+  // The row this one stands in for after the sender withdrew it (a re-queue or
+  // the typed fallback), so --status on the old id can follow to the live row.
+  if (replaces != null) row.replaces = replaces;
   if (topic != null) {
     row.topic = topic;
     // Withdraw every earlier unacked row of this topic for this recipient, from
@@ -893,7 +896,7 @@ export const ack = ({ key, id, deliveredAs, now = Date.now(), dir } = {}) => {
 // Entries are {key, row} pairs from either backend.
 const classifyRows = (id, entries) => {
   const msg = entries.find((e) => e.row?.id === id);
-  if (!msg) return { key: null, state: 'missing', ackTs: null, deliveredAs: null, withdrawTs: null };
+  if (!msg) return { key: null, state: 'missing', ts: null, ackTs: null, deliveredAs: null, withdrawTs: null };
   const own = entries.filter((e) => e.key === msg.key);
   const ackRow = own.find((e) => e.row?.ack === id)?.row;
   const wdRow = own.find((e) => e.row?.withdraw === id)?.row;
@@ -903,7 +906,7 @@ const classifyRows = (id, entries) => {
   if (ackRow && wdRow) state = own.findIndex((e) => e.row === ackRow) < own.findIndex((e) => e.row === wdRow) ? 'delivered' : 'withdrawn';
   else if (ackRow) state = 'delivered';
   else if (wdRow) state = 'withdrawn';
-  return { key: msg.key, state, ackTs: ackRow?.ts ?? null, deliveredAs: ackRow?.deliveredAs ?? null, withdrawTs: wdRow?.ts ?? null };
+  return { key: msg.key, state, ts: msg.row.ts ?? null, ackTs: ackRow?.ts ?? null, deliveredAs: ackRow?.deliveredAs ?? null, withdrawTs: wdRow?.ts ?? null };
 };
 const dbEntries = (store, id) =>
   store
@@ -929,6 +932,47 @@ const fileEntries = (id, dir) => {
 export const findRow = ({ id, dir } = {}) => {
   if (useMailboxDb(dir)) return withMailboxDb((store) => classifyRows(id, dbEntries(store, id)));
   return classifyRows(id, fileEntries(id, dir));
+};
+
+// What became of a row for a caller that asks later (--status): the row's own
+// state, and when it was withdrawn and replaced (a re-queue or the typed
+// fallback names the row it replaces), the state of its live successor with
+// that row's id. Reads only: with the store backing the mailbox and no store
+// file yet, nothing is opened, so asking never creates one.
+export const followRow = ({ id, dir } = {}) => {
+  const db = useMailboxDb(dir);
+  if (db && !fs.existsSync(defaultStorePath())) return classifyRows(id, []);
+  const find = (rid) => (db ? withMailboxDb((store) => classifyRows(rid, dbEntries(store, rid))) : classifyRows(rid, fileEntries(rid, dir)));
+  const successor = (rid) => {
+    if (db) {
+      return withMailboxDb((store) => store
+        .all("SELECT row_json FROM mailbox_rows WHERE kind = 'message' AND instr(row_json, ?) > 0 ORDER BY rowid", `"replaces":${JSON.stringify(rid)}`)
+        .map((r) => JSON.parse(r.row_json))
+        .find((r) => r.replaces === rid)?.id ?? null);
+    }
+    let files = [];
+    try {
+      files = fs.readdirSync(resolveMailboxDir(dir)).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      return null;
+    }
+    for (const f of files) {
+      const hit = readRows(f.slice(0, -'.jsonl'.length), { dir }).find((r) => r && r.replaces === rid);
+      if (hit) return hit.id;
+    }
+    return null;
+  };
+  let cur = id;
+  let found = find(cur);
+  // A pruned original reads as missing, yet its replacement's own `replaces`
+  // link still names it, so a missing row is followed too.
+  for (let hops = 0; (found.state === 'withdrawn' || found.state === 'missing') && hops < 8; hops += 1) {
+    const next = successor(cur);
+    if (next == null) break;
+    cur = next;
+    found = find(cur);
+  }
+  return { ...found, id: cur };
 };
 
 // Withdraw a queued row by id: {withdraw: id, ts}. The id is looked up and the
@@ -975,9 +1019,12 @@ export const cancelQueued = ({ key, id, now = Date.now(), dir } = {}) => {
 // A delivery that bypassed the mailbox (agent-send's typed kitty fallback)
 // still leaves a message row, acked at once, so the store sees every delivery
 // and a later same-topic send can find it.
-export const recordTypedDelivery = ({ to, from, priority, text, topic, now = Date.now(), dir } = {}) => {
-  const row = appendMessage({ to, from, priority, text, topic, via: 'typed', now, dir });
-  ack({ key: to, id: row.id, deliveredAs: 'typed', now, dir });
+export const recordTypedDelivery = ({ to, from, priority, text, topic, id, replaces, unproven = false, now = Date.now(), dir } = {}) => {
+  const row = appendMessage({ to, from, priority, text, topic, via: 'typed', id, replaces, now, dir });
+  // unproven: typed, but kitty-send could not show it landed. The row is closed
+  // all the same (a mailbox copy would deliver it twice); the marker keeps
+  // --status from calling it delivered.
+  ack({ key: to, id: row.id, deliveredAs: unproven ? 'typedUnproven' : 'typed', now, dir });
   return row;
 };
 
