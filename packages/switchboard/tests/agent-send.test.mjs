@@ -323,7 +323,7 @@ test('kitty-send exit 16 passes through with one verdict line and no kitty-send 
   fs.writeFileSync(chatter, '#!/usr/bin/env bash\necho "kitty-send: raw chatter line" >&2\nexit 16\n', { mode: 0o755 });
   const { code, stderr } = await runSend(
     ['--to', '991001', '--text', 'parked steer'],
-    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: chatter }),
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: chatter, AGENT_SEND_VERBOSE: '' }),
   );
   assert.equal(code, 16, stderr);
   assert.match(stderr, /kitty-send exit 16 for 991001: .*typed, not proven submitted/);
