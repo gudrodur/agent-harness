@@ -984,11 +984,83 @@ const bareSendArgv = async (extraArgs, title, extraEnv = null, to = '991002') =>
   }
 };
 
-test('a bare send to an idle recipient forwards --now to kitty-send', async () => {
+// A title with no spinner is not proof the seat is idle: kitty-send also reads
+// the session state file, and a window it finds mid-turn under --now gets the
+// text in its steering queue with the in-flight tool result DISCARDED. So a
+// bare send never forwards --now; a mid-turn target is kitty-send's exit 7,
+// which agent-send re-queues.
+test('a bare send to a title-idle recipient does not forward --now to kitty-send', async () => {
   const { code, argv } = await bareSendArgv([], 'claude: idle seat');
   assert.equal(code, 5);
-  assert.ok(argv.includes('--now'), `argv: ${argv}`);
+  assert.ok(argv.length > 0, 'kitty-send was still run');
+  assert.ok(!argv.includes('--now'), `argv: ${argv}`);
   assert.ok(!argv.includes('--deadline'));
+});
+
+test('a bare send whose idle-looking recipient is mid-turn for kitty-send keeps the row queued, never --now', async () => {
+  // The title shows no spinner, but kitty-send's own state check finds the seat
+  // mid-turn: with --now it would type into the steering queue (exit 8) and
+  // discard the in-flight tool result; without it, exit 7 sends nothing.
+  const midTurnStub = path.join(binDir, 'kitty-send-midturn.sh');
+  fs.writeFileSync(midTurnStub, [
+    '#!/usr/bin/env bash',
+    `printf '%s\\n' "$@" > ${JSON.stringify(fallbackArgv)}`,
+    'for a in "$@"; do [ "$a" = --now ] && exit 8; done',
+    'exit 7',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const { code, argv, stderr } = await busySend(
+    { AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_IDLE_WAIT_S: '0.5', AGENT_SEND_KITTY_SEND: midTurnStub, AGENT_SEND_VERBOSE: '1' },
+    'claude: idle seat',
+  );
+  assert.ok(argv, `kitty-send ran: ${stderr}`);
+  assert.ok(!argv.includes('--now'), `argv: ${argv}`);
+  assert.equal(code, 3, `exit 7 sent nothing: the row is re-queued, pending: ${stderr}`);
+  // One classification per call: a recipient read as idle is never also called busy.
+  assert.match(stderr, /idle recipient/, stderr);
+  assert.doesNotMatch(stderr, /recipient busy\/parked/, stderr);
+  const id = stderr.match(/re-queued as (\S+) in /)?.[1];
+  assert.ok(id, stderr);
+  assert.ok(readUnacked(KEY_S1, libOpts()).some((r) => r.id === id), 'the row is queued again');
+  cancelQueued({ key: KEY_S1, id, ...libOpts() });
+});
+
+test('a bare send to a no-consumer mid-turn recipient is held with kitty-send --queue: pending exit 3, never --now, never dropped', async () => {
+  // kitty-send's own state check finds the seat mid-turn: exit 7 (nothing sent)
+  // unless --now (exit 8, tool result discarded) or --queue (waiter started, 0).
+  const calls = path.join(binDir, 'kitty-send-calls.log');
+  const stub = path.join(binDir, 'kitty-send-nocons-midturn.sh');
+  fs.writeFileSync(stub, [
+    '#!/usr/bin/env bash',
+    `printf '%s\\n' "$*" >> ${JSON.stringify(calls)}`,
+    'for a in "$@"; do',
+    '  [ "$a" = --now ] && exit 8',
+    '  [ "$a" = --queue ] && exit 0',
+    'done',
+    'exit 7',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.rmSync(calls, { force: true });
+  const { code, stderr } = await (async () => {
+    const saved = fs.readFileSync(presFile, 'utf-8');
+    try {
+      writePresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true }]);
+      return await runSend(['--to', '991002', '--text', 'hello'], childEnv({ CLAUDE_CODE_SESSION_ID: 's1', AGENT_SEND_KITTY_SEND: stub }));
+    } finally {
+      fs.writeFileSync(presFile, saved);
+    }
+  })();
+  const lines = fs.readFileSync(calls, 'utf-8').split('\n').filter(Boolean);
+  assert.ok(lines.length >= 1, stderr);
+  assert.ok(lines.every((l) => !/(^| )--now( |$)/.test(l)), `never --now: ${lines}`);
+  assert.ok(lines.some((l) => /(^| )--queue( |$)/.test(l)), `a --queue call: ${lines}`);
+  assert.equal(code, 3, `pending, do not resend: ${stderr}`);
+  // One pending line only: no failure wording that invites a resend or --now.
+  const pendingLines = stderr.split('\n').filter((l) => /pending/.test(l));
+  assert.equal(pendingLines.length, 1, `exactly one pending line: ${stderr}`);
+  assert.match(pendingLines[0], /held/);
+  assert.match(pendingLines[0], /do not resend/);
+  assert.doesNotMatch(stderr, /failure|send again/i);
 });
 
 // A busy recipient with no mailbox is HELD, never refused and never typed into:
@@ -1002,8 +1074,47 @@ const assertHeld = ({ code, argv, stderr }, label = '') => {
   assert.match(stderr, /pending, do not resend/);
   assert.equal(stderr.split('\n').filter((l) => l.trim()).length, 1, `${label}one verdict line: ${stderr}`);
 };
+test('the race hold in the default (non-verbose) mode prints one line, not kitty-send\'s own exit-7 refusal', async () => {
+  const stub = path.join(binDir, 'kitty-send-race-quiet.sh');
+  fs.writeFileSync(stub, [
+    '#!/usr/bin/env bash',
+    'for a in "$@"; do',
+    '  [ "$a" = --queue ] && exit 0',
+    'done',
+    'echo "kitty-send: refusing to send into a mid-turn target (nothing was sent); use --now to type anyway" >&2',
+    'exit 7',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  let r;
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true }]);
+    r = await runSend(['--to', '991002', '--text', 'hello'],
+      childEnv({ CLAUDE_CODE_SESSION_ID: 's1', AGENT_SEND_KITTY_SEND: stub, AGENT_SEND_VERBOSE: '' }));
+  } finally {
+    fs.writeFileSync(presFile, saved);
+  }
+  assert.equal(r.code, 3, r.stderr);
+  const lines = r.stderr.split('\n').filter((l) => l.trim());
+  assert.equal(lines.length, 1, `one verdict line: ${r.stderr}`);
+  assert.match(lines[0], /held/);
+  assert.match(lines[0], /do not resend/);
+  assert.doesNotMatch(r.stderr, /refusing|exit 7|--now/);
+});
+
 test('a bare send to a busy recipient with no mailbox is held by kitty-send --queue: exit 3, never --now', async () => {
   assertHeld(await bareSendArgv([], '\u2807 claude: working', holdEnv()));
+});
+
+// A session record that says busy is trusted however old it is (README: no
+// staleness bound). A seat that sits idle behind such a record is therefore
+// held by kitty-send --queue, never typed into with --now and never reported as
+// delivered; the trade-off is that the text waits until the record changes.
+test('a bare send to an idle-looking seat whose session record says busy long ago is still held, never --now', async () => {
+  const env = provenKitty(991002, '/repo/b');
+  const recFile = path.join(env.CLAUDE_SESSIONS_DIR, `${4000 + (991002 % 1000)}.json`);
+  fs.writeFileSync(recFile, JSON.stringify({ sessionId: 'proven-991002', cwd: '/repo/b', status: 'busy', statusUpdatedAt: Date.now() - 3 * 3600_000 }));
+  assertHeld(await bareSendArgv([], 'claude: idle seat', { ...holdEnv(), ...env }), 'stale busy record: ');
 });
 
 test('an explicit --queue to an idle recipient is unchanged', async () => {
@@ -1924,6 +2035,34 @@ test('a typed wake-up fallback to a busy seat (idle beacon) queues the row inste
     assert.equal(argv, null, `kitty-send ran, so text was typed into a busy seat: ${argv}`);
     assert.equal(code, 3, stderr);
     assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one queued row');
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+  }
+});
+
+test('the race hold to a seat with a mailbox parks a withdrawable row instead of a detached waiter', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const calls = path.join(binDir, 'kitty-send-race-mailbox.log');
+  const stub = path.join(binDir, 'kitty-send-race-mailbox.sh');
+  fs.writeFileSync(stub, ['#!/usr/bin/env bash', `printf '%s\\n' "$*" >> ${JSON.stringify(calls)}`, 'exit 7', ''].join('\n'), { mode: 0o755 });
+  fs.rmSync(calls, { force: true });
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }] }));
+    const { code, killed, stderr } = await queueSend(['--to', '991001'], {
+      title: 'claude: idle seat', status: 'idle',
+      extraSessions: NAMED, envExtra: { AGENT_MAILBOX_PROC_DIR: procDir, AGENT_SEND_KITTY_SEND: stub },
+    });
+    assert.equal(killed, false, stderr);
+    const lines = fs.readFileSync(calls, 'utf-8').split('\n').filter(Boolean);
+    assert.ok(lines.every((l) => !/--queue|--now/.test(l)), `no waiter, no --now: ${lines}`);
+    assert.equal(code, 3, stderr);
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one withdrawable row');
   } finally {
     fs.writeFileSync(presFile, saved);
     fs.rmSync(procDir, { recursive: true, force: true });
