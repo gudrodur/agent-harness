@@ -1960,7 +1960,8 @@ test('--stop to a busy seat says on stderr that it queues like --now and interru
   });
   assert.match(stderr, /--stop on a busy seat queues like --now; nothing is interrupted/);
   const lines = stderr.split('\n').filter((l) => l.trim());
-  assert.equal(lines.length, 1, `the notice must ride inside the one verdict line: ${stderr}`);
+  assert.equal(lines.length, 2, `the notice must ride inside the one verdict line, then the pending hint: ${stderr}`);
+  assert.doesNotMatch(lines[1], /queues like --now/);
 });
 
 test('--stop to a busy seat with no mailbox is held and carries the notice in its single line', async () => {
@@ -2374,7 +2375,8 @@ test('a busy recipient that ends queued prints one verdict line by default', asy
   const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' }), '⠇ claude: working', { idleAfterMs: 300 });
   assert.equal(code, 3, stderr);
   const lines = nonEmptyLines(stderr);
-  assert.equal(lines.length, 1, `one line, got:\n${stderr}`);
+  assert.equal(lines.length, 2, `verdict line plus the pending hint, got:\n${stderr}`);
+  assert.match(lines[1], /^agent-send: pending: row \S+; check with agent-send --status --id \S+$/);
   assert.match(lines[0], /^agent-send: queued for 991001 \(not typed: idle wait ran out\), delivered at its next tool call.*\(id \S+; exit 3: pending, do not resend/);
   assert.doesNotMatch(stderr, /falling back|withdrew|sent nothing/);
   for (const r of readUnacked(KEY_S1, libOpts())) cancelQueued({ key: KEY_S1, id: r.id, ...libOpts() });
@@ -2522,7 +2524,10 @@ for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds un
     assert.equal(code, 3, stderr);
     assert.match(stderr, reason);
     assert.doesNotMatch(stderr, /next tool call/);
-    assert.equal(nonEmptyLines(stderr).length, 1, stderr);
+    // The verdict line, then the pending hint the ended ack wait adds.
+    const lines = nonEmptyLines(stderr);
+    assert.equal(lines.length, 2, stderr);
+    assert.match(lines[1], /^agent-send: pending: row \S+; check with agent-send --status --id \S+$/);
     clearKey(KEY_S1);
   });
 }
@@ -2699,4 +2704,96 @@ test('--help lists exit 2 and does not claim --no-wait falls back to kitty', asy
   assert.match(out, /^\s+2\s+--no-wait/m);
   assert.doesNotMatch(out, /kitty path runs as usual/);
   assert.match(out, /no mailbox[^]*?exit 1|exit 1[^]*?no mailbox/i);
+});
+
+// --status asks later what became of a row: the exit code is the verdict
+// (0 delivered, 3 pending, 13 withdrawn, 14 no such row) and one stdout line
+// says when and how.
+const runStatus = (args) => {
+  const r = spawnSync('node', [SEND, '--status', ...args], { encoding: 'utf-8', env: childEnv(), timeout: 30_000 });
+  return { code: r.status, stdout: r.stdout, stderr: r.stderr };
+};
+
+test('--status --id reports pending (exit 3), delivered (0), withdrawn (13) and unknown (14)', () => {
+  const pend = appendMessage({ to: KEY_S1, from: 'x', priority: 'now', text: 'p', dir: mboxDir });
+  let r = runStatus(['--id', pend.id]);
+  assert.equal(r.code, 3, r.stderr);
+  assert.equal(r.stdout.trim().split('\n').length, 1);
+  assert.match(r.stdout.trim(), new RegExp(`^pending \\(since ${pend.ts.replace(/[.]/g, '\\.')}, ${KEY_S1}\\)$`));
+
+  const done = appendMessage({ to: KEY_S1, from: 'x', priority: 'now', text: 'd', dir: mboxDir });
+  ack({ key: KEY_S1, id: done.id, deliveredAs: 'steer', dir: mboxDir });
+  r = runStatus(['--id', done.id]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout.trim(), /^delivered \(at \d{4}-\d\d-\d\dT[\d:.]+Z, steer\)$/);
+
+  const gone = appendMessage({ to: KEY_S1, from: 'x', priority: 'now', text: 'w', dir: mboxDir });
+  cancelQueued({ key: KEY_S1, id: gone.id, dir: mboxDir });
+  r = runStatus(['--id', gone.id]);
+  assert.equal(r.code, 13, r.stderr);
+  assert.match(r.stdout.trim(), /^withdrawn \(at \d{4}-\d\d-\d\dT[\d:.]+Z\)$/);
+
+  r = runStatus(['--id', 'no-such-row']);
+  assert.equal(r.code, 14, r.stderr);
+  assert.match(r.stderr, /no row no-such-row/);
+  assert.equal(runStatus([]).code, 1, '--status needs --id');
+});
+
+test('an ack wait that ends without an ack prints the pending hint and keeps exit 3', async () => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--queue', '--deadline', '1', '--text', 'queued steer'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '5', ...provenKitty(991001, '/repo/a') }),
+  );
+  assert.equal(code, 3, stderr);
+  const id = readUnacked(KEY_S1, { dir: mboxDir })[0].id;
+  assert.ok(stderr.includes(`pending: row ${id}; check with agent-send --status --id ${id}`), stderr);
+});
+
+// --file: relative paths resolve against the caller's cwd, and the note is
+// copied into the durable notes dir so a cleared scratch dir cannot dangle it.
+const fileSend = (args, cwd, notesDir) => {
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  return spawnSync('node', [SEND, '--to', KEY_S1, '--no-wait', ...args], {
+    cwd, encoding: 'utf-8', timeout: 30_000,
+    env: childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_VERBOSE: '0', AGENT_SWITCHBOARD_NOTES_DIR: notesDir }),
+  });
+};
+
+test('a relative --file resolves against the caller cwd; a missing one is refused', () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-rel-'));
+  const notes = path.join(scratch, 'notes');
+  try {
+    fs.writeFileSync(path.join(scratch, 'brief.md'), 'do the thing\n');
+    const r = fileSend(['--file', 'brief.md'], scratch, notes);
+    assert.equal(r.status, 3, r.stderr);
+    const [row] = readUnacked(KEY_S1, { dir: mboxDir });
+    assert.match(row.text, /read \S+\.md, a note written for you, and act on what it says\./);
+    const miss = fileSend(['--file', 'nope.md'], scratch, notes);
+    assert.equal(miss.status, 1);
+    assert.match(miss.stderr, /no such file: /);
+    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('--file is copied into the notes dir and the pointer names the copy and the message id', () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-copy-'));
+  const notes = path.join(scratch, 'notes');
+  try {
+    const src = path.join(scratch, 'brief.md');
+    fs.writeFileSync(src, 'durable body\n');
+    const r = fileSend(['--file', src], scratch, notes);
+    assert.equal(r.status, 3, r.stderr);
+    const [row] = readUnacked(KEY_S1, { dir: mboxDir });
+    const copy = path.join(notes, `${row.id}.md`);
+    assert.equal(fs.readFileSync(copy, 'utf-8'), 'durable body\n');
+    assert.ok(row.text.includes(`read ${copy}, a note written for you`), row.text);
+    assert.ok(row.text.includes(`Message id: ${row.id}`), row.text);
+    fs.rmSync(src);
+    assert.equal(fs.readFileSync(copy, 'utf-8'), 'durable body\n', 'the copy outlives the source');
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
 });
