@@ -313,6 +313,24 @@ test('an idle recipient caps the ack wait instead of blocking the full default (
   assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a typed message must not be queued a second time');
 });
 
+// kitty-send exit 16 (a slash command still in the composer after its extra
+// Enters) is typed, not proven submitted: like 10 it passes through, is never
+// re-queued, and its own chatter is held because agent-send prints the verdict.
+test('kitty-send exit 16 passes through with one verdict line and no kitty-send chatter', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const chatter = path.join(binDir, 'chatter-16');
+  fs.writeFileSync(chatter, '#!/usr/bin/env bash\necho "kitty-send: raw chatter line" >&2\nexit 16\n', { mode: 0o755 });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--text', 'parked steer'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: chatter, AGENT_SEND_VERBOSE: '' }),
+  );
+  assert.equal(code, 16, stderr);
+  assert.match(stderr, /kitty-send exit 16 for 991001: .*typed, not proven submitted/);
+  assert.doesNotMatch(stderr, /raw chatter line/);
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a typed message must not be queued a second time');
+});
+
 // First path, the quoted moment: `--to 39 --now --deadline 60` withdrew the
 // row, then kitty-send refused `--now --deadline` with exit 1 and nothing was
 // delivered. The deadline bounded agent-send's ack wait; it is not forwarded

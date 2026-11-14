@@ -13,6 +13,7 @@
 | 13 | `--cancel`: the row was already delivered or withdrawn. |
 | 14 | `--cancel`: no such row. |
 | 15 | `--topic`: the topic was already delivered to the recipient within `--topic-window`; this message was suppressed and nothing was sent (`--force-topic` sends anyway). |
+| 16 | Typed, not proven submitted: kitty-send's code 16, passed through (never re-queued). |
 | other | `bin/kitty-send.sh`'s code, below, except its 11 and 12, which agent-send reports as 1 because its own 11 and 12 mean a refused role claim or release. |
 
 ## kitty-send.sh
@@ -31,6 +32,7 @@
 | 9 | The composer already holds an unsubmitted paste chip that is not kitty-send's own: nothing sent. |
 | 10 | Typed, not proven submitted (no session record to read): look at the window before resending. |
 | 11 | Nothing sent, safe to put the message back: the screen could not be read before the send, the composer was still not clear after the recovery Enter, or the typing proof (`lib/typing-proof.mjs`, run immediately before the first keystroke by `--queue`, `--wait-idle` and `--deadline`) did not pass (a Claude Code tab that is not idle, a draft in the composer, or node or the module missing). A tab with no Claude Code process (a shell, REPL, pi or OpenCode tab) is checked for a dialog only, so it never fails the proof for being that kind of tab. A `/` text is not refused here, so an explicit `/rename` goes through. `--now` and a bare send run only the dialog check, so they still type onto a draft. agent-send re-queues on it, or reports it as 1 on the direct fallback. |
+| 16 | A slash command was typed into a Claude Code tab and its composer still holds the command text after up to `KITTY_SEND_SLASH_ENTER_TRIES` (default 3) extra Enters: typed, not proven submitted, so look at the window and never resend blind. The composer is read back after the send; a swallowed Enter (the screen changes on the echo alone) is pressed again while the text remains. |
 
 The comment block at the top of `bin/kitty-send.sh` is the authority.
 
