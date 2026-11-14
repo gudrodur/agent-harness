@@ -1037,6 +1037,12 @@ test('a bare send to a no-consumer mid-turn recipient is held with kitty-send --
   assert.ok(lines.every((l) => !/(^| )--now( |$)/.test(l)), `never --now: ${lines}`);
   assert.ok(lines.some((l) => /(^| )--queue( |$)/.test(l)), `a --queue call: ${lines}`);
   assert.equal(code, 3, `pending, do not resend: ${stderr}`);
+  // One pending line only: no failure wording that invites a resend or --now.
+  const pendingLines = stderr.split('\n').filter((l) => /pending/.test(l));
+  assert.equal(pendingLines.length, 1, `exactly one pending line: ${stderr}`);
+  assert.match(pendingLines[0], /held/);
+  assert.match(pendingLines[0], /do not resend/);
+  assert.doesNotMatch(stderr, /failure|send again/i);
 });
 
 test('a bare send to a busy recipient does not forward --now', async () => {

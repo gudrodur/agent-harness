@@ -648,7 +648,7 @@ const main = (argv) => {
   // function prints no verdict of its own for those codes (one line, not two).
   // It also runs kitty-send synchronously: --queue starts a detached waiter and
   // returns 0, hiding the real status from the re-queue guard.
-  const runKittySend = (why, target, sendText, noteId = null, { requeue = false, timeoutS = null, holdQueue = false } = {}) => {
+  const runKittySend = (why, target, sendText, noteId = null, { requeue = false, timeoutS = null, holdQueue = false, midTurnHeld = false } = {}) => {
     trace(`agent-send: ${why}, falling back to kitty-send\n`);
     const args = ['--to', String(target)];
     if (file != null) args.push('--file', file);
@@ -721,7 +721,9 @@ const main = (argv) => {
     }
     // A fallback that sent NOTHING must say so with the reason and where the
     // verdict lives: without this an exit 9 reads like delivery.
-    if (KITTY_SENT_NOTHING.has(r.status) && !requeue) {
+    if (r.status === 7 && midTurnHeld) {
+      // The caller hands this to kitty-send --queue and prints the one pending line.
+    } else if (KITTY_SENT_NOTHING.has(r.status) && !requeue) {
       const qlog = kittyQueueLog(target);
       process.stderr.write(
         `agent-send: kitty-send exit ${r.status} for ${args[1]}: nothing was sent (${KITTY_NOTHING_REASON[r.status] ?? 'see kitty-send.sh'}) and nothing is queued: this is a failure, the message did not go; check the tab, then send again` +
@@ -729,7 +731,7 @@ const main = (argv) => {
       );
     } else if (r.status === 0 && !args.includes('--queue')) {
       process.stderr.write(`agent-send: delivered to ${args[1]} by kitty-send (exit 0)\n`);
-    } else if (r.status === 0 && args.includes('--queue') && kittyQueueLog(target)) {
+    } else if (r.status === 0 && args.includes('--queue') && kittyQueueLog(target) && !holdQueue) {
       // Queued, not delivered: the verdict arrives later and asynchronously,
       process.stderr.write(`agent-send: kitty-send queued for ${args[1]}; delivery is pending — confirm it in ${kittyQueueLog(target)} (a later exit 9 there means nothing was sent); exit 3: pending, do not resend\n`);
     }
@@ -805,7 +807,7 @@ const main = (argv) => {
     // (the proof just passed, so the seat is idle now): its verdict is the
     // sender's. A detached --queue waiter would answer exit 3 "do not resend"
     // and then, if its own late proof refused, lose the message with nobody told.
-    const st = runKittySend(why, t, text, null, { requeue: priority === 'queue' });
+    const st = runKittySend(why, t, text, null, { requeue: priority === 'queue', midTurnHeld: mode == null });
     if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
       requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st, `not typed: ${reason}`);
@@ -820,7 +822,7 @@ const main = (argv) => {
     if (st === 7 && mode == null) {
       const qst = runKittySend(`${why}; target mid-turn`, t, text, null, { holdQueue: true });
       if (qst === 0) {
-        process.stderr.write(`agent-send: ${to} is mid-turn; kitty-send --queue holds the message and types it at the seat's next idle point (exit 3: pending, do not resend; verdict in ${kittyQueueLog(t)})\n`);
+        process.stderr.write(`agent-send: ${to} is mid-turn; the message is held by kitty-send --queue and typed at the seat's next idle point: pending, do not resend (exit 3; verdict in ${kittyQueueLog(t)})\n`);
         process.exit(3);
       }
       if (rcDown(qst)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
