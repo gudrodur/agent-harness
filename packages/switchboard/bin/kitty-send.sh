@@ -60,6 +60,11 @@
 #      burst as a paste chip while the echo proof said "delivered"). Never
 #      "delivered", and never resend blind: the text may already sit in the
 #      composer.
+#   16 a slash command was typed into a Claude Code tab and its composer STILL
+#      holds the command text after SLASH_ENTER_TRIES extra Enters: typed, not
+#      proven submitted. Same meaning as 10 for the caller (look at the window,
+#      never resend blind); a distinct code because here the text is known to
+#      sit unsubmitted in the composer.
 #   12 kitty remote control did not answer (a timeout or an unreachable
 #      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
 #      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
@@ -781,6 +786,13 @@ JS
 # Seconds after the first lone \r before the second (see THE send). A test
 # seam as well.
 CLAUDE_ENTER_AFTER="${KITTY_SEND_CLAUDE_ENTER_AFTER:-3}"
+# A slash command is typed with its \r in one call and the composer can swallow
+# that \r, leaving the command text in the box. Extra lone Enters pressed while
+# the composer still holds it, at most this many; then exit 16.
+SLASH_ENTER_TRIES="${KITTY_SEND_SLASH_ENTER_TRIES:-3}"
+# Anything but a non-negative integer (a typo would make the numeric bound below
+# never trip) falls back to the default.
+case "$SLASH_ENTER_TRIES" in ''|*[!0-9]*) SLASH_ENTER_TRIES=3 ;; esac
 
 # Proof to look for. Default to the tail of the message: distinctive enough to be
 # this send, and short enough not to be diluted.
@@ -937,7 +949,7 @@ CLAUDE_ENTERS=0
 proof_gate
 # From here the keystrokes are out. SENT=1 plus the EXIT trap is the one
 # mechanism that keeps the promise of the exit codes: any exit that is not one
-# this section chooses (0, 3, 8, 10) becomes 3, "sent, delivery not proven". A
+# this section chooses (0, 3, 8, 10, 16) becomes 3, "sent, delivery not proven". A
 # command that fails under set -e (or an unset variable, or a signal) would
 # otherwise exit 1, which agent-send reads as "nothing was sent" and re-queues,
 # delivering twice.
@@ -945,7 +957,7 @@ SENT=1
 on_exit() {
   local rc=$?
   if [ "${SENT:-0}" = 1 ]; then
-    case "$rc" in 0|3|8|10) ;; *) exit 3 ;; esac
+    case "$rc" in 0|3|8|10|16) ;; *) exit 3 ;; esac
   fi
 }
 trap on_exit EXIT
@@ -1066,6 +1078,37 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   fi
 done
+
+# A slash command whose \r the composer swallowed leaves the command text in the
+# box, and the screen CHANGED (the echo), which the proofs above take for the
+# command's effect. So after the loop, while the composer still holds the typed
+# text, press Enter again, at most SLASH_ENTER_TRIES times; text that survives
+# them is exit 16. Claude Code tabs only. "Could not tell" (no node, no box on the
+# screen, an unreadable screen, a dialog footer, a busy title) presses nothing: the verdict below stands.
+slash_composer_rc() { # 0 clear, 2 still holds the text, anything else: could not tell
+  local rc=0
+  command -v node >/dev/null 2>&1 && [ -f "$TYPING_PROOF" ] || return 127
+  printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$WID" --mode composer --stdin >/dev/null 2>&1 || rc=$?
+  return "$rc"
+}
+if [ "$SLASH_SEND" = 1 ] && [ "$CLAUDE_TAB" = 1 ] && [ -n "$(win_pid "$WID")" ]; then
+  _slash_tries=0
+  while :; do
+    _src=0; slash_composer_rc || _src=$?
+    [ "$_src" = 2 ] || break  # clear, a dialog is open, or could not tell: no Enter
+    # A spinner in the title means the command was submitted and a turn runs:
+    # another Enter could queue it a second time.
+    if title_busy "$(win_title "$WID" 2>/dev/null || true)"; then break; fi
+    if [ "$_slash_tries" -ge "$SLASH_ENTER_TRIES" ]; then
+      note "typed the slash command into window $WID, but its composer still holds the text after $SLASH_ENTER_TRIES extra Enter(s): typed, not proven submitted. Look at the window before resending (exit 16)."
+      exit 16
+    fi
+    kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
+    _slash_tries=$(( _slash_tries + 1 ))
+    note "the composer of window $WID still holds the slash command: pressed Enter again ($_slash_tries of $SLASH_ENTER_TRIES)"
+    sleep 1
+  done
+fi
 
 if [ "$confirmed" = 1 ]; then
   if [ "$STATE_KNOWN" = 1 ]; then
