@@ -270,7 +270,13 @@ KITTY_SEND_USAGE
 }
 
 
-kitty_up() { kitty @ ls >/dev/null 2>&1; }
+# Three tries: on a loaded machine kitty can refuse or drop one connection and
+# answer the next, and a single miss would abort a send that was fine.
+kitty_up() {
+  local i
+  for i in 1 2 3; do kitty @ ls >/dev/null 2>&1 && return 0; sleep 0.5; done
+  return 1
+}
 
 # Every window as: <id>\t<window title>\t<tab title>
 win_table() {
