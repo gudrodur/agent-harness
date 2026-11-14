@@ -223,3 +223,27 @@ test('exit 1 from tab-state without "no such window" is an error, and the closed
   assert.equal(r.byState.closed.ok, false);
   assert.match(r.byState.closed.reason, /still listed/);
 });
+
+test('closed polls the closed seat\'s own window id, not a cleared one', () => {
+  const r = drill(['--states', 'closed']);
+  assert.equal(r.byState.closed.ok, true, JSON.stringify(r.lines));
+});
+
+test('the busy setup is a tool call the real harness does not refuse (no foreground sleep)', () => {
+  const r = drill(['--states', 'busy']);
+  assert.equal(r.byState.busy.ok, true, JSON.stringify(r.lines));
+});
+
+test('the seat folder pins a prompting permission mode, so a permission prompt can appear', () => {
+  const r = drill(['--states', 'idle']);
+  const settings = JSON.parse(fs.readFileSync(path.join(r.state, 'launch-settings.json'), 'utf8'));
+  assert.equal(settings.permissions.defaultMode, 'default');
+  assert.ok(settings.permissions.ask.some((rule) => /touch/.test(rule)), JSON.stringify(settings));
+  assert.ok(settings.permissions.allow.some((rule) => /node -e/.test(rule)), 'the busy timer must not prompt');
+});
+
+test('permission: a send onto a prompt is queued (exit 3), not typed; refusing the prompt lets it deliver', () => {
+  const r = drill(['--states', 'permission'], { extra: { FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+  assert.equal(r.byState.permission.ok, true, JSON.stringify(r.lines));
+  assert.equal(r.byState.permission.deliveredAs, 'prompt');
+});

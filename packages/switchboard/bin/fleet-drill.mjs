@@ -23,7 +23,7 @@
 //   idle        <LIMIT_IDLE> s   seat at the prompt
 //   slash       <LIMIT_SLASH> s   a harmless slash command; the composer must be
 //                          empty afterwards (it was submitted, not left typed)
-//   busy        <LIMIT_BUSY> s   seat mid-turn in a `sleep 45` tool call; the ack must
+//   busy        <LIMIT_BUSY> s   seat mid-turn in a 45 s node-timer tool call; the ack must
 //                          not be `typed`, and the tool result must still be in
 //                          the transcript (nothing in flight was discarded)
 //   permission  <LIMIT_PERMISSION> s   seat showing a permission prompt
@@ -73,7 +73,7 @@ const READY_S = () => num('FLEET_DRILL_READY_S', 180);
 const SETUP_S = () => num('FLEET_DRILL_SETUP_S', 90);
 const SETTLE_S = () => num('FLEET_DRILL_SETTLE_S', 180);
 const POLL_MS = () => num('FLEET_DRILL_POLL_MS', 1000);
-const SLEEP_SECONDS = 45;
+const BUSY_SECONDS = 45;
 const SLASH_TEXT = '/context';
 // Labels the mailbox hooks write; `typed` is the sender's own terminal fallback.
 const CONSUMER_LABELS = ['prompt', 'tool', 'stop', 'mcp'];
@@ -171,8 +171,8 @@ const ensureKitty = async () => {
 // nothing on stdout and `tab-state: no such window: N ...` on stderr, exit 1
 // (only --watch prints a `state=gone` line, which this drill never uses).
 // Anything else is a crash, or kitty not answering: an error, never "gone".
-const seatState = () => {
-  const r = run(B.tabState, [String(wid), '--json'], { timeoutS: 20 });
+const seatState = (id = wid) => {
+  const r = run(B.tabState, [String(id), '--json'], { timeoutS: 20 });
   try { return JSON.parse(r.stdout); } catch { /* not JSON */ }
   if (r.status === 1 && /^tab-state: no such window: \d+/m.test(r.stderr ?? '')) return { state: 'gone' };
   return { state: 'error', reason: `tab-state exit ${r.status}: ${(r.stderr || r.stdout || '').trim().split('\n').pop()}` };
@@ -199,6 +199,12 @@ const startSeat = async () => {
   cwd = fs.mkdtempSync(path.join(process.env.FLEET_DRILL_CWD_ROOT || os.tmpdir(), 'fleet-drill-'));
   const brief = path.join(cwd, '.fleet-drill-brief.md');
   fs.writeFileSync(brief, SEAT_BRIEF);
+  // A seat inherits the user's permission mode, often bypass, where no prompt can
+  // ever appear. The folder's local settings pin the default mode and make the
+  // permission state's own command (touch fleet-drill-*) ask, whatever allow rules say;
+  // the busy state's node timer is allowed, so it runs without a prompt of its own.
+  fs.mkdirSync(path.join(cwd, '.claude'));
+  fs.writeFileSync(path.join(cwd, '.claude', 'settings.local.json'), `${JSON.stringify({ permissions: { defaultMode: 'default', allow: ['Bash(node -e:*)'], ask: ['Bash(touch fleet-drill-*)'] } }, null, 2)}\n`);
   const r = run(B.claudeTab, ['--seat', '--title', 'fleet-drill', '--model', process.env.FLEET_DRILL_MODEL || 'haiku', '--cwd', cwd, '--brief', brief], { timeoutS: 200 });
   const m = /^WINDOW_ID=(\d+)/m.exec(r.stdout ?? '');
   if (m) wid = Number(m[1]);
@@ -277,9 +283,12 @@ const checks = {
   async busy() {
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the setup');
     const tok = token();
-    prompt(`Use the Bash tool to run exactly this command, then reply done: sleep ${SLEEP_SECONDS} && echo DRILL-$((6*7))-${tok}`);
+    // A timer in node, not `sleep N`: Claude Code refuses a foreground sleep and
+    // steers the model to a background run, which is no in-flight tool call.
+    const cmd = `node -e "setTimeout(()=>console.log('DRILL-'+6*7+'-${tok}'),${BUSY_SECONDS * 1000})"`;
+    prompt(`Use the Bash tool, in the foreground (not run_in_background), to run exactly this command, then reply done: ${cmd}`);
     const reached = await waitFor(() => {
-      if (isWaiting()) approveIfShowing(`DRILL-$((6*7))-${tok}`); // only this drill's own command
+      if (isWaiting()) approveIfShowing(`'DRILL-'+6*7+'-${tok}'`); // only this drill's own command
       return isBusy();
     }, SETUP_S());
     if (!reached) return fail('seat never went busy for the sleep tool call');
@@ -300,10 +309,27 @@ const checks = {
     const tok = token();
     prompt(`Use the Bash tool to run exactly this command, then reply done: touch fleet-drill-${tok}`);
     if (!(await waitFor(isWaiting, SETUP_S()))) return fail('seat never showed a permission prompt');
-    const { sent, ack } = await sendAndAck('permission', `fleet-drill permission ${token()}: reply with the single word ok.`);
-    sendKeys('\\x1b'); // refuse the tool call, whatever happened
+    const text = `fleet-drill permission ${token()}: reply with the single word ok.`;
+    const since = Date.now();
+    const sent = run(B.agentSend, ['--to', String(wid), '--text', text], { timeoutS: limitS('permission') });
+    // agent-send never types into a selection dialog: it queues the message (exit 3,
+    // pending) and a hook delivers it once the turn goes on. So the drill approves
+    // its own prompt (the screen must show this drill's touch command) and awaits
+    // the ack after. Escape is no way to clear it: the seat then sits idle and the
+    // queued row is never delivered (a product gap, not asserted here).
+    const queued = sent.status === 3 && /selection dialog open/.test(sent.stderr ?? '');
+    if (screenText().includes(text.slice(0, 40))) {
+      sendKeys('\\x1b');
+      return fail('the message was typed into the permission prompt instead of being queued');
+    }
+    approveIfShowing(`touch fleet-drill-${tok}`);
+    const ack = await waitFor(() => findAck(text, since), Math.max(1, limitS('permission') - (Date.now() - since) / 1000));
     await waitFor(isIdle, SETTLE_S());
-    return accepted(sent, ack) ? pass(ack.deliveredAs) : rejectReason('permission', sent, ack);
+    if (!ack?.deliveredAs) {
+      const screen = screenText().split('\n').filter((l) => l.trim()).slice(-4).join(' | ').slice(0, 300);
+      return fail(`${noAck('permission', sent).reason}; after the prompt was approved the seat is ${seatState().state}, screen: ${screen}`);
+    }
+    return queued || accepted(sent, ack) ? pass(ack.deliveredAs, queued ? 'queued while the prompt was open, delivered after it was approved' : '') : rejectReason('permission', sent, ack);
   },
 
   async merge() {
@@ -330,7 +356,7 @@ const checks = {
     const r = run(B.kitty, ['@', 'close-window', '--match', `id:${closedWid}`], { timeoutS: 30 });
     if (r.status !== 0) return fail(`could not close the seat window: kitty close-window exit ${r.status}`);
     wid = null;
-    if (!(await waitFor(() => seatState().state === 'gone', 30))) return fail('the seat window is still listed after close-window');
+    if (!(await waitFor(() => seatState(closedWid).state === 'gone', 30))) return fail('the seat window is still listed after close-window');
     const text = `fleet-drill closed ${token()}: nobody is listening.`;
     const since = Date.now();
     const sent = run(B.agentSend, ['--to', String(closedWid), '--text', text], { timeoutS: limitS('closed') });

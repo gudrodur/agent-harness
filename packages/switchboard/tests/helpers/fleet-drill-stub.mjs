@@ -55,6 +55,9 @@ if (role === 'claude-tab') {
     process.exit(0);
   }
   writeJson('launch-env.json', { dir: process.env.AGENT_SWITCHBOARD_DIR, db: process.env.AGENT_SWITCHBOARD_DB });
+  // What the real seat would read from its folder before its first turn.
+  const settings = path.join(flag('--cwd') ?? '', '.claude', 'settings.local.json');
+  if (fs.existsSync(settings)) fs.copyFileSync(settings, P('launch-settings.json'));
   needValue('--title', '--model', '--cwd', '--brief');
   if (args.includes('--brief') && !fs.existsSync(flag('--brief'))) process.exit(1);
   fs.writeFileSync(transcript, '');
@@ -76,10 +79,30 @@ if (role === 'claude-tab') {
     const s = seat();
     const keys = args[args.length - 1];
     if (s.status === 'waiting' && keys === '\\r' && s.approveTo) save({ ...s, status: 'busy', busyUntil: Date.now() + 4000, screen: '' });
-    else if (s.status === 'waiting') save({ ...s, status: 'idle' });
+    else if (s.status === 'waiting') {
+      save({ ...s, status: 'idle', screen: '' });
+      // The real agent-send queues a message while a selection dialog is open. A
+      // hook delivers it when the turn goes on (the prompt was approved); after an
+      // Escape the seat sits idle and the queued row is never delivered (measured).
+      if (keys !== '\\r') process.exit(0);
+      const rows = readJson('store.json', []);
+      const pending = rows.filter((r) => r.id && r.queuedForDialog && !rows.some((a) => a.ack === r.id));
+      for (const m of pending) rows.push({ recipient: 'k', ack: m.id, ts: new Date().toISOString(), deliveredAs: 'prompt' });
+      writeJson('store.json', rows);
+    }
   }
 } else if (role === 'tab-state') {
   const s = seat();
+  // The real script takes a numeric window id: anything else is a usage error
+  // (exit 1, "usage" on stderr), and an id kitty does not list is "no such window".
+  if (!/^\d+$/.test(args[0] ?? '')) {
+    process.stderr.write('tab-state: usage: tab-state.sh <window-id> [--json] [--watch [--interval=S]]\n');
+    process.exit(1);
+  }
+  if (Number(args[0]) !== WID && s.open) {
+    process.stderr.write(`tab-state: no such window: ${args[0]} (try opencode-tab.sh --list)\n`);
+    process.exit(1);
+  }
   if (process.env.STUB_TABSTATE_GARBAGE && !s.open) {
     process.stderr.write('tab-state: boom\n');
     process.exit(2);
@@ -105,17 +128,19 @@ if (role === 'claude-tab') {
   needValue('--to', '--text', '--wait-idle');
   const text = flag('--text') ?? '';
   const s = seat();
-  const m = /DRILL-\$\(\(6\*7\)\)-(\w+)/.exec(text);
+  // The real harness refuses a foreground `sleep N`, so the drill's long tool call is a node timer.
+  if (/\bsleep \d/.test(text)) process.exit(1);
+  const m = /DRILL-'\+6\*7\+'-(\w+)/.exec(text);
   if (m && process.env.STUB_NEVER_BUSY) {
     // typed, nothing happens
   } else if (m && process.env.STUB_PERMISSION_FIRST) {
-    save({ ...s, status: 'waiting', approveTo: true, screen: process.env.STUB_SCREEN_MISMATCH ? 'rm -rf /' : `Bash(sleep 45 && echo DRILL-$((6*7))-${m[1]})` });
+    save({ ...s, status: 'waiting', approveTo: true, screen: process.env.STUB_SCREEN_MISMATCH ? 'rm -rf /' : `Bash(node -e "setTimeout(()=>console.log('DRILL-'+6*7+'-${m[1]}'),45000)")` });
     fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (m) {
     save({ ...s, status: 'busy', busyUntil: Date.now() + 4000 });
     fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (text.includes('touch ')) {
-    save({ ...s, status: 'waiting' });
+    save({ ...s, status: 'waiting', screen: `Bash(${/touch \S+/.exec(text)?.[0] ?? ''})` });
   } else if (text.includes('gh pr create')) {
     writeJson('pr.json', { open: true });
   }
@@ -128,6 +153,15 @@ if (role === 'claude-tab') {
   }
   needValue('--to', '--text');
   let deliveredAs = 'prompt';
+  if (s.status === 'waiting') {
+    // Not typed into the dialog: queued, exit 3 (pending), acked after the dialog clears.
+    const id = randomUUID();
+    const rows = readJson('store.json', []);
+    rows.push({ recipient: 'k', id, ts: new Date().toISOString(), from: 'x', to: 'k', priority: 'now', text, queuedForDialog: true });
+    writeJson('store.json', rows);
+    process.stderr.write(`agent-send: queued for ${WID} (not typed: selection dialog open), delivered only after the seat clears its selection dialog (id ${id}; exit 3: pending, do not resend)\n`);
+    process.exit(3);
+  }
   if (s.status === 'busy') {
     deliveredAs = broken.has('busy') ? 'typed' : 'tool';
     if (broken.has('busy')) fs.writeFileSync(transcript, '');
