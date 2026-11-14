@@ -216,3 +216,10 @@ test('the stub reports a gone window exactly as the real tab-state.sh does', () 
   assert.match(real.stderr, /no such window: 7001/);
   assert.deepEqual({ status: stub.status, stdout: stub.stdout, stderr: stub.stderr }, { status: real.status, stdout: real.stdout, stderr: real.stderr });
 });
+
+test('exit 1 from tab-state without "no such window" is an error, and the closed state does not pass', () => {
+  const r = drill(['--states', 'closed'], { extra: { STUB_TABSTATE_UNAVAILABLE: '1', FLEET_DRILL_READY_S: '5' } });
+  assert.equal(r.status, 1, r.stderr);
+  assert.equal(r.byState.closed.ok, false);
+  assert.match(r.byState.closed.reason, /still listed/);
+});

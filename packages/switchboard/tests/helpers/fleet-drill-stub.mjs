@@ -84,6 +84,10 @@ if (role === 'claude-tab') {
     process.stderr.write('tab-state: boom\n');
     process.exit(2);
   }
+  if (process.env.STUB_TABSTATE_UNAVAILABLE && !s.open) {
+    process.stderr.write('tab-state: kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)\n');
+    process.exit(1);
+  }
   if (!s.open) {
     // Without --watch the real tab-state.sh prints only this on stderr, nothing
     // on stdout, exit 1 (tests/fleet-drill.test.mjs compares it with the real script).

@@ -174,7 +174,7 @@ const ensureKitty = async () => {
 const seatState = () => {
   const r = run(B.tabState, [String(wid), '--json'], { timeoutS: 20 });
   try { return JSON.parse(r.stdout); } catch { /* not JSON */ }
-  if (r.status === 1 && /\bno such window\b/.test(r.stderr ?? '')) return { state: 'gone' };
+  if (r.status === 1 && /^tab-state: no such window: \d+/m.test(r.stderr ?? '')) return { state: 'gone' };
   return { state: 'error', reason: `tab-state exit ${r.status}: ${(r.stderr || r.stdout || '').trim().split('\n').pop()}` };
 };
 const isIdle = () => seatState().state === 'idle';
