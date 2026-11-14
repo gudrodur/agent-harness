@@ -3013,7 +3013,7 @@ test('a --file typed unproven (kitty-send exit 3) is recorded as unproven: --sta
     const argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
     const named = path.basename(argv[argv.indexOf('--file') + 1], '.md');
     const r = runStatus(['--id', named]);
-    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.equal(r.code, 10, r.stdout + r.stderr);
     assert.match(r.stdout, /^typed, delivery unproven \(at \S+; /);
     assert.doesNotMatch(r.stdout, /withdrawn \(/);
     assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'no mailbox copy left to deliver twice');
@@ -3071,6 +3071,31 @@ test('--cancel names the row it withdrew and prints one line for a corrupt store
     const lines = c.stderr.split('\n').filter((l) => l.trim());
     assert.equal(lines.length, 1, c.stderr);
     assert.match(lines[0], /^agent-send: could not read the store /);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('a kitty-send killed by a signal reads as typed, unproven in --status, never withdrawn', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-killed-'));
+  try {
+    const src = path.join(scratch, 'brief.md');
+    fs.writeFileSync(src, 'k\n');
+    const killer = path.join(scratch, 'kitty-send-kill.sh');
+    fs.writeFileSync(killer, ['#!/usr/bin/env bash', `printf '%s\\n' "$@" > ${JSON.stringify(fallbackArgv)}`, 'kill -KILL $$', ''].join('\n'), { mode: 0o755 });
+    fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+    fs.rmSync(fallbackArgv, { force: true });
+    const { code, stderr } = await runSend(
+      ['--to', '991001', '--file', src, '--deadline', '1'],
+      childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: killer, AGENT_SWITCHBOARD_NOTES_DIR: path.join(scratch, 'notes') }),
+    );
+    assert.equal(code, 1, stderr);
+    const argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
+    const named = path.basename(argv[argv.indexOf('--file') + 1], '.md');
+    const r = runStatus(['--id', named]);
+    assert.equal(r.code, 10, r.stdout + r.stderr);
+    assert.match(r.stdout, /^typed, delivery unproven/);
+    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

@@ -169,7 +169,8 @@ const usage = () => `Usage:
                 <ts>, <recipient>), delivered (at <ts>, <how>) or withdrawn (at
                 <ts>); a row the sender withdrew and replaced (re-queue, typed
                 fallback) answers with its replacement's state; typed but unproven
-                reads "typed, delivery unproven" (exit 3, do not resend). Exit 0 delivered, 3 pending, 13 withdrawn, 14 no such
+                reads "typed, delivery unproven" (exit 10, look at the window before resending;
+                a kitty-send that exited 3 or died by a signal lands here). Exit 0 delivered, 3 pending, 10 typed unproven, 13 withdrawn, 14 no such
                 row. A send whose ack wait ended without an ack prints
                 "pending: row <id>; check with agent-send --status --id <id>"
   --read        print this session's unacked inbox rows, including the queues of
@@ -634,7 +635,7 @@ const main = (argv) => {
     }
     if (found.state === 'delivered' && found.deliveredAs === 'typedUnproven') {
       process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
-      return exitAfterStdout(3);
+      return exitAfterStdout(10);
     }
     if (found.state === 'delivered') {
       process.stdout.write(`delivered (at ${found.ackTs}, ${found.deliveredAs}${via})\n`);
@@ -816,9 +817,9 @@ const main = (argv) => {
     if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11) && !(r.status === 7 && midTurnHeld)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
-    if (typedKey != null && [0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
+    if (typedKey != null && ([0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) || (r.status == null && r.signal != null)) && !args.includes('--queue')) {
       try {
-        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId(), replaces: noteId ?? undefined, unproven: r.status === 3 });
+        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic, id: takeRowId(), replaces: noteId ?? undefined, unproven: r.status === 3 || r.status == null });
       } catch {
         // see above
       }
