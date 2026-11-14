@@ -1007,6 +1007,38 @@ test('a bare send whose idle-looking recipient is mid-turn for kitty-send keeps 
   cancelQueued({ key: KEY_S1, id, ...libOpts() });
 });
 
+test('a bare send to a no-consumer mid-turn recipient is held with kitty-send --queue: pending exit 3, never --now, never dropped', async () => {
+  // kitty-send's own state check finds the seat mid-turn: exit 7 (nothing sent)
+  // unless --now (exit 8, tool result discarded) or --queue (waiter started, 0).
+  const calls = path.join(binDir, 'kitty-send-calls.log');
+  const stub = path.join(binDir, 'kitty-send-nocons-midturn.sh');
+  fs.writeFileSync(stub, [
+    '#!/usr/bin/env bash',
+    `printf '%s\\n' "$*" >> ${JSON.stringify(calls)}`,
+    'for a in "$@"; do',
+    '  [ "$a" = --now ] && exit 8',
+    '  [ "$a" = --queue ] && exit 0',
+    'done',
+    'exit 7',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.rmSync(calls, { force: true });
+  const { code, stderr } = await (async () => {
+    const saved = fs.readFileSync(presFile, 'utf-8');
+    try {
+      writePresence([{ sessionId: 's1', cwd: '/repo/a', mailbox: true }]);
+      return await runSend(['--to', '991002', '--text', 'hello'], childEnv({ CLAUDE_CODE_SESSION_ID: 's1', AGENT_SEND_KITTY_SEND: stub }));
+    } finally {
+      fs.writeFileSync(presFile, saved);
+    }
+  })();
+  const lines = fs.readFileSync(calls, 'utf-8').split('\n').filter(Boolean);
+  assert.ok(lines.length >= 1, stderr);
+  assert.ok(lines.every((l) => !/(^| )--now( |$)/.test(l)), `never --now: ${lines}`);
+  assert.ok(lines.some((l) => /(^| )--queue( |$)/.test(l)), `a --queue call: ${lines}`);
+  assert.equal(code, 3, `pending, do not resend: ${stderr}`);
+});
+
 test('a bare send to a busy recipient does not forward --now', async () => {
   const { argv } = await bareSendArgv([], '\u2807 claude: working');
   assert.ok(!argv.includes('--now'), `argv: ${argv}`);

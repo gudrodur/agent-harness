@@ -648,7 +648,7 @@ const main = (argv) => {
   // function prints no verdict of its own for those codes (one line, not two).
   // It also runs kitty-send synchronously: --queue starts a detached waiter and
   // returns 0, hiding the real status from the re-queue guard.
-  const runKittySend = (why, target, sendText, noteId = null, { requeue = false, timeoutS = null } = {}) => {
+  const runKittySend = (why, target, sendText, noteId = null, { requeue = false, timeoutS = null, holdQueue = false } = {}) => {
     trace(`agent-send: ${why}, falling back to kitty-send\n`);
     const args = ['--to', String(target)];
     if (file != null) args.push('--file', file);
@@ -658,14 +658,14 @@ const main = (argv) => {
       args.push('--file', note);
     } else args.push('--text', sendText);
     if (priority === 'idle') args.push('--idle-when', idleWhen);
-    if (priority === 'queue') {
+    if (priority === 'queue' || holdQueue) {
       // The withdraw path runs under --queue when --deadline ran out or the
       // recipient window showed idle with the row undrained. kitty-send runs the
       // typing proof (lib/typing-proof.mjs) immediately before its first
       // keystroke in every --wait-idle run, so a window that went busy, grew a
       // draft or opened a dialog since the early verdict gets nothing typed
       // (exit 5 or 11, and the row goes back in the mailbox).
-      if (requeue) args.push('--wait-idle', deadline != null ? String(deadline) : String(TYPE_AFTER_PROOF_WAIT_S));
+      if (requeue && !holdQueue) args.push('--wait-idle', deadline != null ? String(deadline) : String(TYPE_AFTER_PROOF_WAIT_S));
       else args.push('--queue');
     }
     // An explicit --now/--stop sends mid-turn, --stop becoming --now (the one
@@ -679,7 +679,7 @@ const main = (argv) => {
     // (exit 1, "mutually exclusive"), and here --deadline bounded agent-send's
     // own ack wait, not a kitty-send idle wait.
     if (mode === 'now' || mode === 'stop') args.push('--now');
-    else if (deadline != null && !(requeue && priority === 'queue')) args.push('--deadline', deadline);
+    else if (deadline != null && !holdQueue && !(requeue && priority === 'queue')) args.push('--deadline', deadline);
     if (timeoutS != null) args.push('--timeout', String(timeoutS));
     // A foreground run that the caller re-queues on "sent nothing" has its
     // stderr held: the caller's one verdict line replaces it. Any other result
@@ -812,6 +812,19 @@ const main = (argv) => {
       process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
       if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
       process.exit(exitOfKittySend(st));
+    }
+    // A bare send that kitty-send found mid-turn (exit 7, nothing sent) must not
+    // be dropped and must not go with --now (the in-flight tool result would be
+    // discarded): hand it to kitty-send --queue, which types it at the seat's
+    // next idle point, and report it pending (exit 3).
+    if (st === 7 && mode == null) {
+      const qst = runKittySend(`${why}; target mid-turn`, t, text, null, { holdQueue: true });
+      if (qst === 0) {
+        process.stderr.write(`agent-send: ${to} is mid-turn; kitty-send --queue holds the message and types it at the seat's next idle point (exit 3: pending, do not resend; verdict in ${kittyQueueLog(t)})\n`);
+        process.exit(3);
+      }
+      if (rcDown(qst)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
+      process.exit(exitOfKittySend(qst));
     }
     if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
     process.exit(exitOfKittySend(st));
