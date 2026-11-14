@@ -152,8 +152,8 @@ By default a send prints exactly one stderr line, the final verdict, on every ex
 Busy follows the order of kitty-send's busy check for the two signals they share: the Claude Code session record first, the title spinner only without a record.
 It does not read the tab-state script or the `--idle-when` screen proof, which kitty-send also uses.
 The record has no staleness bound: a stale `busy` record keeps its window busy, and the row waits for its drain.
-A busy window with no mailbox to park the row in fails with nothing sent.
-`--stop` is an alias of `--now` here: on a busy seat nothing is interrupted, and a one-line stderr notice says so.
+A busy window with no mailbox to park the row in is held by `kitty-send --queue`, which types the text at the seat's next idle point: one line, exit 3 (pending, do not resend), never exit 1 and never `--now`.
+`--stop` is an alias of `--now` here: on a busy seat nothing is interrupted, and the one verdict line says so.
 `--idle-when` is the caller's own parked proof and outranks every busy signal, so it is never held back by this guard; `--queue` waits for its own parked proof.
 `--queue` never interrupts a turn and never waits on a seat that is provably idle: while the recipient's window shows it mid-turn the row stays queued for its own drain (next tool call or turn end).
 Once the window has shown idle for `AGENT_SEND_IDLE_WAIT_S` (5 s) without the row being taken, the sender types the row in through `kitty-send.sh --wait-idle`, but only on positive proof of all of: no spinner in the title, a Claude Code session record whose status is `idle` or `shell` (the turn ended and a background shell still runs; `waiting`, `blocked`, an unknown status or no record is not idle), a readable screen with no dialog footer in its bottom rows (question, plan approval), and an empty composer box (the prompt line and every line under it up to the closing rule).
@@ -169,7 +169,8 @@ A `/` text is refused by agent-send for a `--queue` send (mailbox and fallback) 
 The `--queue` kitty fallback runs kitty-send in the foreground, so a refusal reaches the sender: the text is queued for the seat (exit 3) or the send fails.
 The exception is a seat with no mailbox consumer that is busy, or a tab that is not Claude Code: with no mailbox to park the row in, it is handed to kitty-send's detached `--queue` waiter (exit 3, pending), which re-proves at typing time and keeps polling while a refusal is a not-idle-yet one (a draft, a placeholder hint); with no deadline it never drops the text.
 So the withdraw path after `--deadline` runs out, and any caller that skipped its own check, cannot type onto a draft or a slash command either (exit 11, nothing typed, and the sender puts the row back in the mailbox).
-When `--deadline` runs out against a seat that looks idle but fails the proof, the row is not even withdrawn: it stays queued and the sender exits 3. A dialog (the record status `waiting` or `blocked`, or a dialog footer on screen) is refused in every mode, `--now` included (exit 4).
+When `--deadline` runs out against a seat that looks idle but fails the proof, the row is not even withdrawn: it stays queued and the sender exits 3.
+A dialog (the record status `waiting` or `blocked`, or a dialog footer on screen) is refused in every mode, `--now` included (exit 4).
 `--now` does not read the composer, so it still types onto a draft, by design.
 The remaining window is the few milliseconds between kitty-send's proof and its first keystroke.
 After an unacked wait the sender withdraws the mailbox row and falls through to `bin/kitty-send.sh`, which types the text plus carriage return in one call and proves it by a new inbound row in the tab's session file.

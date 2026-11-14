@@ -973,11 +973,19 @@ test('a bare send to an idle recipient forwards --now to kitty-send', async () =
   assert.ok(!argv.includes('--deadline'));
 });
 
-test('a bare send to a busy recipient types nothing: kitty-send does not run', async () => {
-  const { code, argv, stderr } = await bareSendArgv([], '\u2807 claude: working');
-  assert.equal(argv, null, `argv: ${argv}`);
-  assert.equal(code, 1, stderr);
-  assert.match(stderr, /busy, so nothing was typed/);
+// A busy recipient with no mailbox is HELD, never refused and never typed into:
+// kitty-send --queue types the text at the seat's next idle point, the sender
+// exits 3 with one line (pending, do not resend), and --now is never forwarded.
+const holdEnv = () => ({ AGENT_SEND_KITTY_SEND: realRulesStub, AGENT_SEND_VERBOSE: '', AGENT_SEND_BUDGET_S: '4' });
+const assertHeld = ({ code, argv, stderr }, label = '') => {
+  assert.ok(argv?.includes('--queue'), `${label} kitty-send --queue must hold it: ${argv} / ${stderr}`);
+  assert.ok(!argv.includes('--now'), `${label} never --now: ${argv}`);
+  assert.equal(code, 3, `${label}${stderr}`);
+  assert.match(stderr, /pending, do not resend/);
+  assert.equal(stderr.split('\n').filter((l) => l.trim()).length, 1, `${label}one verdict line: ${stderr}`);
+};
+test('a bare send to a busy recipient with no mailbox is held by kitty-send --queue: exit 3, never --now', async () => {
+  assertHeld(await bareSendArgv([], '\u2807 claude: working', holdEnv()));
 });
 
 test('an explicit --queue to an idle recipient is unchanged', async () => {
@@ -1577,10 +1585,9 @@ test('findRecentTopicDelivery honours the window and ignores unacked rows', () =
   assert.equal(findRecentTopicDelivery({ key, topic: 'win', windowMs: 0, now, dir: mboxDir }), null, 'a zero window disables');
 });
 
-test('a bare send to a recipient with Claude Code\'s half-circle busy mark types nothing', async () => {
+test('a bare send to a recipient with Claude Code\'s half-circle busy mark is held, not typed', async () => {
   for (const mark of ['◐', '◑']) {
-    const { argv } = await bareSendArgv([], `${mark} claude: working`);
-    assert.equal(argv, null, `${mark} argv: ${argv}`);
+    assertHeld(await bareSendArgv([], `${mark} claude: working`, holdEnv()), `${mark} `);
   }
 });
 
@@ -1817,9 +1824,22 @@ test('--stop to a busy seat says on stderr that it queues like --now and interru
   const { stderr } = await queueSend(['--to', '991001', '--stop'], {
     title: '\u2807 claude: working',
     status: 'busy',
-    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', AGENT_SEND_VERBOSE: '' },
   });
   assert.match(stderr, /--stop on a busy seat queues like --now; nothing is interrupted/);
+  const lines = stderr.split('\n').filter((l) => l.trim());
+  assert.equal(lines.length, 1, `the notice must ride inside the one verdict line: ${stderr}`);
+});
+
+test('--stop to a busy seat with no mailbox is held and carries the notice in its single line', async () => {
+  const r = await bareSendArgv(['--stop'], '\u2807 claude: working', holdEnv());
+  assertHeld(r);
+  assert.match(r.stderr, /--stop on a busy seat queues like --now; nothing is interrupted/);
+});
+
+test('--idle-when to a spinner-title seat with no mailbox still runs kitty-send (typed-fallback guard)', async () => {
+  const { argv, stderr } = await bareSendArgv(['--idle-when', 'parked'], '\u2807 claude: waiting for input', { AGENT_SEND_BUDGET_S: '4' });
+  assert.ok(argv?.includes('--idle-when'), `kitty-send did not run: ${argv} / ${stderr}`);
 });
 
 test('--now to a busy seat prints no --stop notice', async () => {
@@ -1832,9 +1852,8 @@ test('--now to a busy seat prints no --stop notice', async () => {
 });
 
 test('a window addressed by a title substring is guarded like one addressed by id', async () => {
-  const { code, argv, stderr } = await bareSendArgv(['--now'], '\u2807 claude: working', { AGENT_SEND_BUDGET_S: '4' }, 'claude: working');
-  assert.equal(argv, null, `argv: ${argv}`);
-  assert.equal(code, 1, stderr);
+  const r = await bareSendArgv(['--now'], '\u2807 claude: working', holdEnv(), 'claude: working');
+  assertHeld(r);
 });
 
 test('a typed wake-up fallback to a busy seat (idle beacon) queues the row instead of typing', async () => {
