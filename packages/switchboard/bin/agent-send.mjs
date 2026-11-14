@@ -906,6 +906,16 @@ const main = (argv) => {
       peerChannelHint({ sessionId: winBeacon?.sessionId ?? null, queuedId: null });
       process.exit(1);
     }
+    // A poller with no composer has nothing to type into, live or not: queue.
+    if ((e?.code === 'mailbox-idle' || e?.code === 'mailbox-stale') && e.mailboxOnly === true && e.key != null) {
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const qrow = appendMessage({ to: e.key, from, priority, text, topic });
+      verdict(
+        `agent-send: queued for ${to} (mailbox-only seat, nothing to type into), delivered at its next poll (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
+        `agent-send: ${e.message}; mailbox-only seat: queued ${qrow.id} for ${e.key} in ${mailboxPath(e.key)}, nothing typed (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`,
+      );
+      process.exit(3);
+    }
     if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`, e.key ?? null);
     if (e?.code === 'mailbox-stale') kittyFallback(`stale mailbox beacon for ${to} (${e.message})`);
     if (e?.code === 'mailbox-self' || e?.code === 'mailbox-no-beacon') kittyFallback(`no mailbox consumer at ${to}`);
@@ -961,7 +971,7 @@ const main = (argv) => {
     warnNoLiveSeats();
     process.exit(3);
   }
-  if (!recipient.hasConsumer) {
+  if (!recipient.hasConsumer && recipient.mailboxOnly !== true) {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
   }
@@ -1007,7 +1017,11 @@ const main = (argv) => {
     deadlineMs = Math.min(envS('AGENT_SEND_BUSY_WAIT_S', 15) * 1000, Math.max(0, budgetEndMs - Date.now()));
     return budgetEndMs;
   };
-  if (deadline == null && deadlineMs != null) {
+  // A mailbox-only seat has no window to type into, so its title says nothing
+  // about when it can ack: wait the busy bound, never the idle cap.
+  if (deadline == null && recipient.mailboxOnly === true) {
+    if (priority === 'queue') deadlineMs = envS('AGENT_SEND_BUSY_WAIT_S', 15) * 1000;
+  } else if (deadline == null && deadlineMs != null) {
     const rwin = recipient.windowId ?? recipient.beaconWindowId ?? null;
     if (rwin != null) {
       const rIdle = windowIsIdle(rwin);
@@ -1076,7 +1090,7 @@ const main = (argv) => {
       }
     }
   };
-  const ok = priority === 'queue' ? waitQueued() : waitForAck({ key: recipient.key, id: row.id, deadlineMs });
+  const ok = priority === 'queue' && recipient.mailboxOnly !== true ? waitQueued() : waitForAck({ key: recipient.key, id: row.id, deadlineMs });
   if (ok) {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox}\n`);
     process.exit(0);
@@ -1088,6 +1102,12 @@ const main = (argv) => {
   if (!readUnacked(recipient.key, {}).some((r) => r.id === row.id)) {
     process.stderr.write(`agent-send: acked ${row.id} in ${mbox} (after the wait limit)\n`);
     process.exit(0);
+  }
+  // A mailbox-only seat acks when its poll reaches the row; with no composer
+  // there is nothing to type into, so the row stays queued, busy or not.
+  if (recipient.mailboxOnly === true) {
+    pendingLine(row.id, `agent-send: queued for ${to}; it is a mailbox-only seat (no composer to type into) and has not acked yet, so nothing is typed and row ${row.id} stays queued in ${mbox} for its next poll (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id})\n`, ' (mailbox-only seat, not typed)', null, null, 'at its next poll');
+    process.exit(3);
   }
   // --queue --deadline ran out against a seat that looks idle but is not
   // provably safe to type into: the row stays queued, and nothing is withdrawn
