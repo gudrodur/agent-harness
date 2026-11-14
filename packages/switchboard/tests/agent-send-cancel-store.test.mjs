@@ -104,3 +104,15 @@ test('followRow in store mode follows a withdrawn row to the row that replaced i
   assert.equal(got.state, 'delivered');
   assert.equal(followRow({ id: 'nope' }).state, 'missing');
 });
+
+test('followRow in store mode follows a replacement after the withdrawn row was pruned', () => {
+  const key = recipientKey({ cwd: '/repo/proj', sessionId: 'holder-pruned' });
+  const first = appendMessage({ to: key, priority: 'now', text: 'x' });
+  cancelQueued({ key, id: first.id });
+  const second = appendMessage({ to: key, priority: 'now', text: 'x', replaces: first.id });
+  const s = openStore(dbPath);
+  try { s.run('DELETE FROM mailbox_rows WHERE msg_id = ?', first.id); } finally { s.close(); }
+  const got = followRow({ id: first.id });
+  assert.equal(got.id, second.id);
+  assert.equal(got.state, 'queued');
+});

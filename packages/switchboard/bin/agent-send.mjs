@@ -521,7 +521,7 @@ const main = (argv) => {
   }
   if (statusQuery) {
     if (rowId == null) die('--status needs --id <row-id>');
-    if (to != null || text != null || file != null || mode != null || cancel || read || who || asSession != null || claimRoleName != null || releaseRoleName != null || takeOver) die('--status takes only --id');
+    if (to != null || text != null || file != null || mode != null || cancel || read || who || asSession != null || claimRoleName != null || releaseRoleName != null || takeOver || deadline != null || noWait || topic != null || forceTopic || idleWhen != null || json) die('--status takes only --id (and --verbose)');
   }
   // Inbox read: print this session's unacked rows and ack them, the pull path
   // for a session whose hook prompt has not delivered them yet (host-agent
@@ -616,7 +616,12 @@ const main = (argv) => {
   // Status: ask later what became of a row. The exit code is the verdict, the
   // same codes --cancel uses (0 delivered, 3 pending, 13 withdrawn, 14 no row).
   if (statusQuery) {
-    const found = followRow({ id: rowId });
+    let found;
+    try {
+      found = followRow({ id: rowId });
+    } catch (e) {
+      die(`could not read the store ${mailboxPath('x')}: ${String(e?.message ?? e).split('\n')[0]}`);
+    }
     // The row may have been withdrawn and replaced: say which row answers.
     const via = found.id !== rowId ? `; ${rowId} was withdrawn and replaced by ${found.id}` : '';
     if (found.state === 'queued') {
@@ -638,7 +643,11 @@ const main = (argv) => {
   if (cancel) {
     if (rowId == null) die('--cancel needs --id <row-id> (--to is optional)');
     if (text != null || file != null || mode != null) die('--cancel takes only --id and optionally --to');
-    const res = cancelQueued({ key: to, id: rowId });
+    // A row the sender withdrew and replaced is cancelled through its live
+    // replacement: the id a pointer names is the original's.
+    const target = followRow({ id: rowId }).id;
+    const res = cancelQueued({ key: to, id: target });
+    if (target !== rowId) process.stderr.write(`agent-send: ${rowId} was withdrawn and replaced by ${target}; cancelling ${target}\n`);
     if (res.withdrawn) {
       process.stderr.write(`agent-send: withdrew ${rowId} (recipient ${res.key})${res.keyCorrected ? ` — --to named ${to}, the row's own recipient was used` : ''}\n`);
       process.exit(0);

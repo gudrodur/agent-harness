@@ -964,7 +964,9 @@ export const followRow = ({ id, dir } = {}) => {
   };
   let cur = id;
   let found = find(cur);
-  for (let hops = 0; found.state === 'withdrawn' && hops < 8; hops += 1) {
+  // A pruned original reads as missing, yet its replacement's own `replaces`
+  // link still names it, so a missing row is followed too.
+  for (let hops = 0; (found.state === 'withdrawn' || found.state === 'missing') && hops < 8; hops += 1) {
     const next = successor(cur);
     if (next == null) break;
     cur = next;
