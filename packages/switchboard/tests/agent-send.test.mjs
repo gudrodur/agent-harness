@@ -963,9 +963,9 @@ test('priority flags reach kitty-send unchanged on the fallback path', async () 
   }
 });
 // Bare send (no mode) is priority now: an idle recipient gets --now so kitty-send
-// types and submits at once; a busy one (spinner in the title) does not, so
-// kitty-send's mid-turn guard still applies.
-const bareSendArgv = async (extraArgs, title, extraEnv = null) => {
+// types and submits at once; a busy one is never typed into, so kitty-send does
+// not run at all.
+const bareSendArgv = async (extraArgs, title, extraEnv = null, to = '991002') => {
   const saved = fs.readFileSync(presFile, 'utf-8');
   const busyKitty = path.join(binDir, 'kitty-title-stub');
   try {
@@ -976,9 +976,9 @@ const bareSendArgv = async (extraArgs, title, extraEnv = null) => {
       '',
     ].join('\n'), { mode: 0o755 });
     fs.rmSync(fallbackArgv, { force: true });
-    const r = await runSend(['--to', '991002', ...extraArgs, '--text', 'hello'],
+    const r = await runSend(['--to', to, ...extraArgs, '--text', 'hello'],
       childEnv({ CLAUDE_CODE_SESSION_ID: 's1', AGENT_MAILBOX_KITTY: busyKitty, ...extraEnv }));
-    return { code: r.code, argv: fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean) };
+    return { code: r.code, stderr: r.stderr, argv: fs.existsSync(fallbackArgv) ? fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean) : null };
   } finally {
     fs.writeFileSync(presFile, saved);
   }
@@ -991,9 +991,19 @@ test('a bare send to an idle recipient forwards --now to kitty-send', async () =
   assert.ok(!argv.includes('--deadline'));
 });
 
-test('a bare send to a busy recipient does not forward --now', async () => {
-  const { argv } = await bareSendArgv([], '\u2807 claude: working');
-  assert.ok(!argv.includes('--now'), `argv: ${argv}`);
+// A busy recipient with no mailbox is HELD, never refused and never typed into:
+// kitty-send --queue types the text at the seat's next idle point, the sender
+// exits 3 with one line (pending, do not resend), and --now is never forwarded.
+const holdEnv = () => ({ AGENT_SEND_KITTY_SEND: realRulesStub, AGENT_SEND_VERBOSE: '', AGENT_SEND_BUDGET_S: '4' });
+const assertHeld = ({ code, argv, stderr }, label = '') => {
+  assert.ok(argv?.includes('--queue'), `${label} kitty-send --queue must hold it: ${argv} / ${stderr}`);
+  assert.ok(!argv.includes('--now'), `${label} never --now: ${argv}`);
+  assert.equal(code, 3, `${label}${stderr}`);
+  assert.match(stderr, /pending, do not resend/);
+  assert.equal(stderr.split('\n').filter((l) => l.trim()).length, 1, `${label}one verdict line: ${stderr}`);
+};
+test('a bare send to a busy recipient with no mailbox is held by kitty-send --queue: exit 3, never --now', async () => {
+  assertHeld(await bareSendArgv([], '\u2807 claude: working', holdEnv()));
 });
 
 test('an explicit --queue to an idle recipient is unchanged', async () => {
@@ -1593,10 +1603,9 @@ test('findRecentTopicDelivery honours the window and ignores unacked rows', () =
   assert.equal(findRecentTopicDelivery({ key, topic: 'win', windowMs: 0, now, dir: mboxDir }), null, 'a zero window disables');
 });
 
-test('a bare send to a recipient with Claude Code\'s half-circle busy mark does not forward --now', async () => {
+test('a bare send to a recipient with Claude Code\'s half-circle busy mark is held, not typed', async () => {
   for (const mark of ['◐', '◑']) {
-    const { argv } = await bareSendArgv([], `${mark} claude: working`);
-    assert.ok(!argv.includes('--now'), `${mark} argv: ${argv}`);
+    assertHeld(await bareSendArgv([], `${mark} claude: working`, holdEnv()), `${mark} `);
   }
 });
 
@@ -1604,15 +1613,22 @@ test('a bare send to a recipient with Claude Code\'s half-circle busy mark does 
 // wait on top). AGENT_SEND_BUDGET_S bounds process start to exit;
 // AGENT_SEND_BUSY_WAIT_S is the ack wait inside it; kitty-send gets only what
 // is left as --timeout.
-const busySend = async (env, title = '⠇ claude: working') => {
+// idleAfterMs: the window's title turns idle after that long (a turn that ends
+// during the ack wait); without it the window stays as titled. A window that
+// still shows the busy marker when the wait ends is never typed into.
+const busySend = async (env, title = '⠇ claude: working', { idleAfterMs = null } = {}) => {
   const saved = fs.readFileSync(presFile, 'utf-8');
   const titleKitty = path.join(binDir, 'kitty-title-stub');
+  const idleFlag = path.join(binDir, 'kitty-title-idle-flag');
   try {
+    fs.rmSync(idleFlag, { force: true });
     fs.writeFileSync(titleKitty, [
       '#!/usr/bin/env bash',
-      `echo '[{"tabs":[{"windows":[{"id":991001,"title":${JSON.stringify(title)},"cwd":"/repo/a"}]}]}]'`,
+      `if [ -e ${JSON.stringify(idleFlag)} ]; then t='claude: idle seat'; else t='${title}'; fi`,
+      `echo "[{\\"tabs\\":[{\\"windows\\":[{\\"id\\":991001,\\"title\\":\\"$t\\",\\"cwd\\":\\"/repo/a\\"}]}]}]"`,
       '',
     ].join('\n'), { mode: 0o755 });
+    if (idleAfterMs != null) setTimeout(() => fs.writeFileSync(idleFlag, ''), idleAfterMs);
     fs.rmSync(fallbackArgv, { force: true });
     const t0 = Date.now();
     const r = await runSend(['--to', '991001', '--text', 'budgeted'],
@@ -1626,7 +1642,7 @@ const busySend = async (env, title = '⠇ claude: working') => {
 };
 
 test('a busy recipient returns within the budget and kitty-send gets only the remaining time', async () => {
-  const { code, elapsedMs, argv, stderr } = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' });
+  const { code, elapsedMs, argv, stderr } = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' }, '⠇ claude: working', { idleAfterMs: 300 });
   assert.ok(argv, `kitty-send ran: ${stderr}`);
   const i = argv.indexOf('--timeout');
   assert.ok(i >= 0, `kitty-send got --timeout: ${argv}`);
@@ -1763,6 +1779,157 @@ test('--queue to a busy recipient stays queued and is acked by its drain, never 
   assert.equal(typedRows().length, 0);
 });
 
+// A typed fallback never lands on a busy seat: typing mid-turn discards the
+// tool result in flight. A recipient window that still shows the busy marker
+// when the ack wait ends gets the row left in its mailbox for the tool-boundary
+// drain, whatever the send mode, and kitty-send (the only thing that types)
+// never runs.
+for (const mode of ['--now', '--stop']) {
+  test(`${mode} to a busy recipient types nothing and leaves one queued row, exit 3`, async () => {
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', mode], {
+      title: '⠇ claude: working',
+      status: 'busy',
+      envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(argv, null, `kitty-send ran, so text was typed into a busy seat: ${argv}`);
+    assert.equal(code, 3, stderr);
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one queued row');
+    assert.equal(typedRows().length, 0);
+    assert.match(stderr, /busy/);
+    assert.match(stderr, /--cancel --id/);
+  });
+}
+
+// A renamed Claude Code seat shows no spinner in its title while it works, so
+// busy is read from its session record first (as kitty-send does), the title
+// only without a record.
+for (const args of [['--now'], ['--stop'], []]) {
+  test(`${args[0] ?? 'a bare send'} to a renamed busy seat (no spinner, record busy) types nothing and leaves one queued row`, async () => {
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', ...args], {
+      title: 'my renamed seat',
+      status: 'busy',
+      envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(argv, null, `kitty-send ran, so text was typed into a busy seat: ${argv}`);
+    assert.equal(code, 3, stderr);
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one queued row');
+    assert.match(stderr, /next tool call/);
+    assert.doesNotMatch(stderr, /next prompt/);
+  });
+}
+
+test('a renamed seat whose record says idle is still typed into (the record outranks a spinner-free title)', async () => {
+  const { argv } = await queueSend(['--to', '991001', '--now'], { title: 'my renamed seat', status: 'idle' });
+  assert.ok(argv?.includes('--now'), `argv: ${argv}`);
+});
+
+// --idle-when is the caller's own parked proof (a seat that spins while it
+// waits for input); it outranks every busy signal, so it is never guarded.
+test('--idle-when to a spinner-title seat still runs kitty-send (the caller proof outranks the busy marker)', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--idle-when', 'parked'], {
+    title: '\u2807 claude: working',
+    status: 'busy',
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+  });
+  assert.equal(killed, false, stderr);
+  assert.ok(argv?.includes('--idle-when'), `kitty-send did not run: ${argv} / ${stderr}`);
+  // Without the skip the guard would hold it: --queue is added and a "holds" line printed.
+  assert.ok(!argv.includes('--queue'), `the busy guard held an --idle-when send: ${argv}`);
+  assert.doesNotMatch(stderr, /holds the message/);
+  assert.equal(code, 0, stderr);
+});
+
+test('--stop to a busy seat says on stderr that it queues like --now and interrupts nothing', async () => {
+  const { stderr } = await queueSend(['--to', '991001', '--stop'], {
+    title: '\u2807 claude: working',
+    status: 'busy',
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', AGENT_SEND_VERBOSE: '' },
+  });
+  assert.match(stderr, /--stop on a busy seat queues like --now; nothing is interrupted/);
+  const lines = stderr.split('\n').filter((l) => l.trim());
+  assert.equal(lines.length, 1, `the notice must ride inside the one verdict line: ${stderr}`);
+});
+
+test('--stop to a busy seat with no mailbox is held and carries the notice in its single line', async () => {
+  const r = await bareSendArgv(['--stop'], '\u2807 claude: working', holdEnv());
+  assertHeld(r);
+  assert.match(r.stderr, /--stop on a busy seat queues like --now; nothing is interrupted/);
+});
+
+test('--idle-when to a spinner-title seat with no mailbox still runs kitty-send (typed-fallback guard)', async () => {
+  const { argv, stderr } = await bareSendArgv(['--idle-when', 'parked'], '\u2807 claude: waiting for input', { AGENT_SEND_BUDGET_S: '4' });
+  assert.ok(argv?.includes('--idle-when'), `kitty-send did not run: ${argv} / ${stderr}`);
+  assert.ok(!argv.includes('--queue'), `the busy guard held an --idle-when send: ${argv}`);
+  assert.doesNotMatch(stderr, /holds the message/);
+});
+
+// The real kitty-send prints two note lines on stderr for a --queue run unless
+// it is given --quiet. This stub does the same, so the hold's one-line verdict
+// is checked against what the real script prints.
+const noisyHoldStub = (exitCode = 0) => {
+  const stub = path.join(binDir, `kitty-send-noisy-${exitCode}.sh`);
+  fs.writeFileSync(stub, [
+    '#!/usr/bin/env bash',
+    `printf '%s\\n' "$@" > ${JSON.stringify(fallbackArgv)}`,
+    'quiet=0; for a in "$@"; do [ "$a" = --quiet ] && quiet=1; done',
+    '[ "$quiet" = 1 ] || { echo "kitty-send: note one" >&2; echo "kitty-send: note two" >&2; }',
+    `exit ${exitCode}`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return stub;
+};
+test('the hold passes --quiet to kitty-send, so its notes never add lines to the one verdict', async () => {
+  const r = await bareSendArgv([], '\u2807 claude: working', { ...holdEnv(), AGENT_SEND_KITTY_SEND: noisyHoldStub(0) });
+  assertHeld(r);
+  assert.ok(r.argv.includes('--quiet'), `argv: ${r.argv}`);
+});
+
+test('a hold that kitty-send refuses with exit 6 says an earlier message is already held, not "send again"', async () => {
+  const { code, stderr } = await bareSendArgv([], '\u2807 claude: working', { ...holdEnv(), AGENT_SEND_KITTY_SEND: noisyHoldStub(6) });
+  assert.notEqual(code, 0, stderr);
+  assert.match(stderr, /an earlier message is already held for that window/);
+  assert.doesNotMatch(stderr, /send again/);
+});
+
+test('--now to a busy seat prints no --stop notice', async () => {
+  const { stderr } = await queueSend(['--to', '991001', '--now'], {
+    title: '\u2807 claude: working',
+    status: 'busy',
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+  });
+  assert.doesNotMatch(stderr, /--stop on a busy seat/);
+});
+
+test('a window addressed by a title substring is guarded like one addressed by id', async () => {
+  const r = await bareSendArgv(['--now'], '\u2807 claude: working', holdEnv(), 'claude: working');
+  assertHeld(r);
+});
+
+test('a typed wake-up fallback to a busy seat (idle beacon) queues the row instead of typing', async () => {
+  const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
+  fs.mkdirSync(path.join(procDir, '4001'));
+  fs.writeFileSync(path.join(procDir, '4001', 'comm'), 'claude\n');
+  fs.writeFileSync(path.join(procDir, '4001', 'environ'), 'KITTY_WINDOW_ID=991001\0');
+  const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }] }));
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--now'], {
+      title: '⠇ claude: working', status: 'busy',
+      extraSessions: NAMED, envExtra: { AGENT_MAILBOX_PROC_DIR: procDir },
+    });
+    assert.equal(killed, false, stderr);
+    assert.equal(argv, null, `kitty-send ran, so text was typed into a busy seat: ${argv}`);
+    assert.equal(code, 3, stderr);
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one queued row');
+  } finally {
+    fs.writeFileSync(presFile, saved);
+    fs.rmSync(procDir, { recursive: true, force: true });
+  }
+});
+
 test('--queue to a busy recipient that goes idle without draining is typed in then', async () => {
   const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
     title: '⠇ claude: working',
@@ -1791,15 +1958,15 @@ test('--queue to an idle recipient whose drain acks inside the idle wait is not 
   assert.equal(typedRows().length, 0);
 });
 
-test('--queue --deadline still bounds the wait for a busy recipient', async () => {
+test('--queue --deadline still bounds the wait for a busy recipient, which is then never typed into', async () => {
   const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue', '--deadline', '1'], {
     title: '⠇ claude: working',
     envExtra: { KITTY_SEND_STUB_EXIT: '5' },
   });
   assert.equal(killed, false, stderr);
   assert.equal(code, 3, stderr);
-  assert.equal(argv[argv.indexOf('--wait-idle') + 1], '1', `argv: ${argv}`);
-  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 're-queued for the drain');
+  assert.equal(argv, null, `a busy window is never typed into: ${argv}`);
+  assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'left queued for the drain');
 });
 
 // Fail closed: text is typed only on positive proof that the seat is idle AND
@@ -2065,7 +2232,7 @@ const quiet = (extra = {}) => ({ AGENT_SEND_VERBOSE: '', ...extra });
 const nonEmptyLines = (s) => s.split('\n').filter(Boolean);
 
 test('a busy recipient that ends queued prints one verdict line by default', async () => {
-  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' }));
+  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1' }), '⠇ claude: working', { idleAfterMs: 300 });
   assert.equal(code, 3, stderr);
   const lines = nonEmptyLines(stderr);
   assert.equal(lines.length, 1, `one line, got:\n${stderr}`);
@@ -2076,7 +2243,7 @@ test('a busy recipient that ends queued prints one verdict line by default', asy
 
 test('--verbose and AGENT_SEND_VERBOSE bring the step-by-step trace back', async () => {
   fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
-  const viaEnv = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_VERBOSE: '1' });
+  const viaEnv = await busySend({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_VERBOSE: '1' }, '⠇ claude: working', { idleAfterMs: 300 });
   assert.match(viaEnv.stderr, /withdrew the mailbox row/);
   assert.match(viaEnv.stderr, /falling back to kitty-send/);
   assert.ok(nonEmptyLines(viaEnv.stderr).length >= 4, viaEnv.stderr);
@@ -2165,7 +2332,7 @@ test('a kitty-send exit 1 reason survives the re-queue in the quiet default', as
   const failStub = path.join(binDir, 'kitty-send-exit1.sh');
   fs.writeFileSync(failStub, '#!/usr/bin/env bash\necho "kitty-send: no such window for the reason test" >&2\nexit 1\n', { mode: 0o755 });
   fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
-  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: failStub }));
+  const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: failStub }), '⠇ claude: working', { idleAfterMs: 300 });
   assert.equal(code, 3, stderr);
   assert.match(stderr, /no such window for the reason test/);
   assert.match(stderr, /queued for 991001/);
@@ -2212,7 +2379,7 @@ test('--queue prints the queued id line at once, not only when it exits', async 
 for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds unsubmitted text/], [11, /screen unreadable or composer not clear/]]) {
   test(`a re-queue after kitty-send exit ${st} names the reason and does not promise a tool-call delivery`, async () => {
     fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
-    const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`exit${st}`, st) }));
+    const { code, stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`exit${st}`, st) }), '⠇ claude: working', { idleAfterMs: 300 });
     assert.equal(code, 3, stderr);
     assert.match(stderr, reason);
     assert.doesNotMatch(stderr, /next tool call/);
@@ -2296,7 +2463,7 @@ test('a notice already read is not raised again inside the notice window', async
 for (const [st, verdictRe] of [[0, /delivered/], [3, /typed.*not proven|unproven/], [8, /steering queue/], [10, /not proven submitted/]]) {
   test(`busy path, kitty-send exit ${st}: one verdict line, kitty-send chatter not replayed`, async () => {
     fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
-    const { stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`noise${st}`, st, 'kitty-send: chatty detail') }));
+    const { stderr } = await busySend(quiet({ AGENT_SEND_BUDGET_S: '4', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_KITTY_SEND: exitStub(`noise${st}`, st, 'kitty-send: chatty detail') }), '⠇ claude: working', { idleAfterMs: 300 });
     assert.doesNotMatch(stderr, /chatty detail/);
     const lines = nonEmptyLines(stderr);
     assert.equal(lines.length, 1, stderr);
