@@ -20,6 +20,7 @@ A mailbox with acks between agents on three runtimes (Claude Code, opencode and 
 | Terminal if no ack | Terminal remote control: types the message into the window. Delivery is proven by a new inbound row in that tab's session file. | `bin/kitty-send.sh` |
 | Launch | Terminal remote control: opens a titled tab running the agent with its brief, confirms it started, and refuses to close a window it did not launch; details in [`docs/launchers.md`](docs/launchers.md). | `bin/opencode-tab.sh`, `bin/claude-tab.sh`, `bin/claude-resume-set.sh`, `lib/tab-ledger.sh` |
 | Read state | Not the screen but the disk: the window's process and the runtime's own session record: a Claude Code window is read from Claude's session record (`status` busy or idle) and transcript, an opencode window from opencode's session database. Any other window reads as `unknown`. | `bin/tab-state.sh` |
+| Drill | Nightly end-to-end check that a send reaches a live seat idle, busy, at a permission prompt, on a slash command and closed, with an optional PR merge stage; details in [`docs/fleet-drill.md`](docs/fleet-drill.md). | `bin/fleet-drill.mjs` |
 | Files | Plain files every agent can read: plan, briefs, steers, reports, logs. | a directory the agents share |
 | Shared record | The `gh` command line: issues, pull requests, checks, merges. | `gh` |
 | Approval path | The host agent's own hold screen for a message between sessions in different permission modes. | The host agent's settings file |
