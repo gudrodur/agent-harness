@@ -136,7 +136,17 @@ if (role === 'claude-tab') {
   // What Claude Code draws: the echo of the typed prompt (it names the command
   // whatever the model then proposes), then the dialog with its own command.
   const echo = `❯ ${text}`;
-  const dialog = (proposed) => `${echo}\n● Bash(${proposed})\n ────\n Bash command\n  run it\n ╌╌╌╌\n  ${proposed}\n ╌╌╌╌\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n`;
+  // The dialog screens are fixtures: ruled is a real seat's screen (captured by a live
+  // drill run, command and echo replaced by placeholders); unruled is the other recorded
+  // layout, without dashed rules. STUB_LAYOUT picks one.
+  const fixture = fs.readFileSync(new URL(`../fixtures/permission-dialog-${process.env.STUB_LAYOUT || 'ruled'}.txt`, import.meta.url), 'utf8');
+  // STUB_WRAP: a narrow window wraps the command over two lines inside the dialog.
+  const wrap = (c) => (process.env.STUB_WRAP ? `${c.slice(0, 20)}\n ${c.slice(20)}` : c);
+  const dialog = (proposed) => fixture
+    .replace(/^ \{\{CMD\}\}$/m, () => ` ${wrap(proposed)}`)
+    .replaceAll('{{ECHO}}', () => echo)
+    .replaceAll('{{RULE}}', () => (proposed.startsWith('touch') ? 'Bash(touch fleet-drill-*)' : 'Bash(node -e:*)'))
+    .replaceAll('{{CMD}}', () => proposed);
   const other = process.env.STUB_DIALOG_OTHER; // a different dialog under the same echo
   if (m && process.env.STUB_NEVER_BUSY) {
     // typed, nothing happens

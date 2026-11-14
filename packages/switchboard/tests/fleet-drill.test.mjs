@@ -180,10 +180,44 @@ test('busy needs the drill to approve its own prompt: a tool_use row with no dia
   assert.match(r.byState.busy.reason, /never went busy/);
 });
 
-test('any failed state leaves no dialog open for the next one (busy mismatch, then permission)', () => {
-  const r = drill(['--states', 'busy'], { extra: { STUB_SCREEN_MISMATCH: '1', FLEET_DRILL_SETUP_S: '1' } });
+test('a busy state that fails on a mismatched dialog does not strand permission: Escape refuses it', () => {
+  const r = drill(['--states', 'busy,permission'], { extra: { STUB_SCREEN_MISMATCH: '1', FLEET_DRILL_SETUP_S: '2', FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
   assert.equal(r.byState.busy.ok, false);
-  assert.notEqual(stubSeat(r.state).status, 'waiting', 'Escape was pressed after the failed state');
+  assert.equal(r.byState.permission.ok, true, JSON.stringify(r.lines));
+  assert.equal(stubSeat(r.state).status, 'idle');
+});
+
+test('both recorded dialog layouts are read: ruled (a real capture) and unruled', () => {
+  for (const layout of ['ruled', 'unruled']) {
+    const r = drill(['--states', 'busy,permission'], { extra: { STUB_LAYOUT: layout, FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+    assert.equal(r.status, 0, `${layout}: ${r.stderr}${JSON.stringify(r.lines)}`);
+  }
+});
+
+test('unruled layout: a multi-line proposal is still not approved', () => {
+  for (const extra of [{ STUB_SCREEN_MULTI: '1' }]) {
+    const r = drill(['--states', 'busy'], { extra: { STUB_LAYOUT: 'unruled', FLEET_DRILL_SETUP_S: '1', ...extra } });
+    assert.equal(r.byState.busy.ok, false, JSON.stringify(r.lines));
+  }
+  const p = drill(['--states', 'permission'], { extra: { STUB_LAYOUT: 'unruled', STUB_DIALOG_OTHER: 'multi', FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+  assert.equal(p.byState.permission.ok, false, JSON.stringify(p.lines));
+  assert.match(p.byState.permission.reason, /not approved/);
+});
+
+test('solid borders are not a command frame: a dialog framed only by solid rules is not approved', () => {
+  const r = drill(['--states', 'permission'], { extra: { STUB_LAYOUT: 'solid', FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+  assert.equal(r.byState.permission.ok, false, JSON.stringify(r.lines));
+});
+
+test('a wrapped command fails as "dialog seen, command not matched", in both layouts', () => {
+  for (const layout of ['ruled', 'unruled']) {
+    const b = drill(['--states', 'busy'], { extra: { STUB_LAYOUT: layout, STUB_WRAP: '1', FLEET_DRILL_SETUP_S: '1' } });
+    assert.equal(b.byState.busy.ok, false, JSON.stringify(b.lines));
+    assert.match(b.byState.busy.reason, /dialog was on screen but its command did not match/, layout);
+    const p = drill(['--states', 'permission'], { extra: { STUB_LAYOUT: layout, STUB_WRAP: '1', FLEET_DRILL_LIMIT_PERMISSION_S: '3' } });
+    assert.equal(p.byState.permission.ok, false, JSON.stringify(p.lines));
+    assert.match(p.byState.permission.reason, /dialog was on screen but its command did not match/, layout);
+  }
 });
 
 test('the seat settings make the busy timer ask whatever allow rules say', () => {

@@ -188,32 +188,70 @@ const sendKeys = (keys) => run(B.kitty, ['@', 'send-text', '--match', `id:${wid}
 // Types a setup prompt into an idle seat (not part of what is measured).
 const prompt = (text) => run(B.kittySend, ['--to', String(wid), '--text', text, '--wait-idle', String(SETUP_S())], { timeoutS: SETUP_S() + 60 });
 const screenText = () => run(B.kitty, ['@', 'get-text', '--match', `id:${wid}`], { timeoutS: 10 }).stdout ?? '';
-// The permission dialog's own text: everything below the last "Bash command" header.
-// Above it sits the echo of the setup prompt the drill typed, which names the same
-// command whatever the model then proposes, so the echo proves nothing.
-const dialogText = (screen) => {
+// The permission dialog, parsed from the screen. Only what sits below the last
+// "Bash command" header is the dialog: above it is the echo of the setup prompt the
+// drill typed, which names the same command whatever the model then proposes.
+// Two layouts are known:
+//   ruled    (recorded from a real seat, tests/fixtures/permission-dialog-ruled.txt):
+//            header, description, a dashed rule, the command line(s), a dashed rule,
+//            the rule that asked, "Do you want to proceed?".
+//   unruled  (recorded elsewhere; tests/fixtures/permission-dialog-unruled.txt is built from that description, not a capture here): header, blank, the command, its description, blank,
+//            "Do you want to proceed?". The command and a description are then told
+//            apart only by the tool-call line above the header, `Bash(<command>)`.
+// Dashed rules are the broken `╌`; a solid `─` is the dialog's own border and the
+// seat's status line, never the frame of the command.
+const parseDialog = (screen) => {
   const lines = screen.split('\n');
   let at = -1;
   lines.forEach((l, i) => { if (/^\s*Bash command\s*$/.test(l)) at = i; });
-  return at < 0 ? null : lines.slice(at + 1);
+  if (at < 0) return { seen: false };
+  const below = lines.slice(at + 1);
+  const ask = below.findIndex((l) => /Do you want to proceed/.test(l));
+  if (ask < 0) return { seen: false };
+  const body = below.slice(0, ask);
+  const rules = [];
+  body.forEach((l, i) => { if (/^\s*╌{3,}\s*$/.test(l)) rules.push(i); });
+  if (rules.length >= 2) {
+    const [open, close] = rules.slice(-2);
+    return { seen: true, layout: 'ruled', block: body.slice(open + 1, close).map((l) => l.trim()).filter(Boolean).join('\n') };
+  }
+  const first = body.findIndex((l) => l.trim());
+  const group = [];
+  for (let i = first < 0 ? body.length : first; i < body.length && body[i].trim(); i++) group.push(body[i].trim());
+  let call = null;
+  for (let i = at - 1; i >= 0; i--) {
+    const m = /^\s*[●⏺]\s*(Bash\(.*\))\s*$/.exec(lines[i]);
+    if (m) { call = m[1]; break; }
+  }
+  return { seen: true, layout: 'unruled', group, call };
 };
+// True when the dialog proposes exactly `command`: the whole ruled block, or in the
+// unruled layout the first line, with at most one description line after it, and the
+// tool-call line above the header naming the same single-line command.
+const proposes = (d, command) => {
+  if (!d.seen) return false;
+  if (d.layout === 'ruled') return d.block === command;
+  return d.group.length >= 1 && d.group.length <= 2 && d.group[0] === command && d.call === `Bash(${command})`;
+};
+// Set when a dialog was on screen but its command did not match (a wrapped command
+// on a narrow window shows up here), so a failure can say so.
+let unmatchedDialog = false;
+const dialogNote = () => (unmatchedDialog ? ' (a permission dialog was on screen but its command did not match: a wrapped command or another proposal)' : '');
+let dumps = 0;
 // Approves the prompt on screen only when its dialog proposes exactly `command`,
 // this drill's own, and the seat is still waiting at the moment of the keypress.
-// The dialog frames the proposal between two dashed rules, just above the question.
-// The whole block must equal the command: a multi-line proposal that merely starts
-// with it (`touch x` then `rm -rf y`) is not this drill's command.
-const proposalBlock = (dialog) => {
-  const ask = dialog.findIndex((l) => /Do you want to proceed/.test(l));
-  if (ask < 0) return null;
-  const rules = [];
-  dialog.slice(0, ask).forEach((l, i) => { if (/^\s*[╌─-]{3,}\s*$/.test(l)) rules.push(i); });
-  if (rules.length < 2) return null;
-  const [open, close] = rules.slice(-2);
-  return dialog.slice(open + 1, close).map((l) => l.trim()).filter(Boolean).join('\n');
-};
 const approveIfShowing = (command) => {
-  const dialog = dialogText(screenText());
-  if (!dialog || proposalBlock(dialog) !== command) return false;
+  const screen = screenText();
+  // Debug aid: keep every screen that shows a permission dialog (the layouts to test against).
+  if (process.env.FLEET_DRILL_DUMP_DIR && parseDialog(screen).seen) {
+    fs.mkdirSync(process.env.FLEET_DRILL_DUMP_DIR, { recursive: true });
+    fs.writeFileSync(path.join(process.env.FLEET_DRILL_DUMP_DIR, `dialog-${String(dumps++).padStart(2, '0')}.txt`), screen);
+  }
+  const d = parseDialog(screen);
+  if (!proposes(d, command)) {
+    if (d.seen) unmatchedDialog = true;
+    return false;
+  }
   if (!isWaiting()) return false;
   sendKeys('\\r');
   return true;
@@ -309,6 +347,7 @@ const checks = {
   },
 
   async busy() {
+    unmatchedDialog = false;
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the setup');
     const tok = token();
     // A timer in node, not `sleep N`: Claude Code refuses a foreground sleep and
@@ -317,15 +356,17 @@ const checks = {
     prompt(`Use the Bash tool, in the foreground (not run_in_background), to run exactly this command, then reply done: ${cmd}`);
     // The seat reads busy while the model is still composing the tool call, before
     // any dialog: busy alone does not mean the timer runs. It does once the drill
-    // approved its own prompt. The seat settings make that prompt certain (an ask
-    // rule beats any allow), so no weaker evidence, such as a tool_use row that the
-    // dialog may not be drawn for yet, counts as the timer running.
+    // approved its own prompt. The seat settings carry an ask rule for the timer, and a
+    // live run showed it prompting ("Permission rule Bash(node -e:*) requires
+    // confirmation"); that no allow rule elsewhere outranks it is Claude Code's
+    // documented precedence, not measured here. So no weaker evidence, such as a
+    // tool_use row the dialog may not be drawn for yet, counts as the timer running.
     let approved = false;
     const reached = await waitFor(() => {
       if (isWaiting() && approveIfShowing(cmd)) approved = true; // only this drill's own command
       return approved && seatState().state === 'busy';
     }, SETUP_S());
-    if (!reached) return fail('seat never went busy for the timer tool call after the drill approved its prompt');
+    if (!reached) return fail(`seat never went busy for the timer tool call after the drill approved its prompt${dialogNote()}`);
     const session = seatState().session;
     const { sent, ack } = await sendAndAck('busy', `fleet-drill busy ${token()}: reply with the single word ok.`);
     if (!accepted(sent, ack)) return rejectReason('busy', sent, ack);
@@ -339,6 +380,7 @@ const checks = {
   },
 
   async permission() {
+    unmatchedDialog = false;
     if (!(await waitFor(isIdle, SETUP_S()))) return fail('seat not idle before the setup');
     const tok = token();
     const cmd = `touch fleet-drill-${tok}`;
@@ -355,7 +397,7 @@ const checks = {
     // dialog queue, deliberately not asserted here).
     const queued = sent.status === 3 && /selection dialog/.test(sent.stderr ?? '');
     if (screenText().includes(text.slice(0, 40))) return fail('the message was typed into the permission prompt instead of being queued');
-    if (!approveIfShowing(cmd)) return fail(`the permission dialog does not propose exactly "${cmd}": not approved`);
+    if (!approveIfShowing(cmd)) return fail(`the permission dialog does not propose exactly "${cmd}": not approved${dialogNote()}`);
     const ack = await waitFor(() => findAck(text, since), Math.max(1, limitS('permission') - (Date.now() - since) / 1000));
     await waitFor(isIdle, SETTLE_S());
     if (!ack?.deliveredAs) {
