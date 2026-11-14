@@ -167,13 +167,14 @@ const ensureKitty = async () => {
   return Boolean(await waitFor(() => run(B.kitty, ['@', 'ls'], { timeoutS: 5 }).status === 0, 30));
 };
 
-// tab-state prints JSON for a window it can read, and the plain line
-// `window N state=gone ...` (exit 1) for one that is gone, even under --json.
-// Anything else is a crash, never "gone".
+// tab-state prints JSON for a window it can read. For one that is gone it prints
+// nothing on stdout and `tab-state: no such window: N ...` on stderr, exit 1
+// (only --watch prints a `state=gone` line, which this drill never uses).
+// Anything else is a crash, or kitty not answering: an error, never "gone".
 const seatState = () => {
   const r = run(B.tabState, [String(wid), '--json'], { timeoutS: 20 });
   try { return JSON.parse(r.stdout); } catch { /* not JSON */ }
-  if (r.status === 1 && /\bstate=gone\b/.test(r.stdout ?? '')) return { state: 'gone' };
+  if (r.status === 1 && /\bno such window\b/.test(r.stderr ?? '')) return { state: 'gone' };
   return { state: 'error', reason: `tab-state exit ${r.status}: ${(r.stderr || r.stdout || '').trim().split('\n').pop()}` };
 };
 const isIdle = () => seatState().state === 'idle';

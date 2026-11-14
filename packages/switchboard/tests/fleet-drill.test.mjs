@@ -200,3 +200,19 @@ test('a failed close-window is reported and fails the run', () => {
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stderr, /close-window/);
 });
+
+test('the stub reports a gone window exactly as the real tab-state.sh does', () => {
+  const kdir = fs.mkdtempSync(path.join(root, 'fakekitty-'));
+  fs.writeFileSync(path.join(kdir, 'kitty'), '#!/bin/sh\nprintf "[]\\n"\n', { mode: 0o755 });
+  const real = spawnSync('bash', [fileURLToPath(new URL('../bin/tab-state.sh', import.meta.url)), '7001', '--json'], {
+    encoding: 'utf8',
+    env: isolatedEnv({ PATH: `${kdir}:${process.env.PATH}` }),
+  });
+  const state = fs.mkdtempSync(path.join(root, 'state-'));
+  fs.writeFileSync(path.join(state, 'seat.json'), JSON.stringify({ open: false, status: 'idle' }));
+  const stub = spawnSync(path.join(root, 'bin', 'tab-state'), ['7001', '--json'], { encoding: 'utf8', env: isolatedEnv({ STUB_DIR: state }) });
+  assert.equal(real.status, 1);
+  assert.equal(real.stdout, '');
+  assert.match(real.stderr, /no such window: 7001/);
+  assert.deepEqual({ status: stub.status, stdout: stub.stdout, stderr: stub.stderr }, { status: real.status, stdout: real.stdout, stderr: real.stderr });
+});

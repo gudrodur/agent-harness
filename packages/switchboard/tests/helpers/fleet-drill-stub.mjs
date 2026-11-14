@@ -85,8 +85,9 @@ if (role === 'claude-tab') {
     process.exit(2);
   }
   if (!s.open) {
-    // The real tab-state prints this plain line even under --json.
-    console.log(`window ${WID} state=gone reason=no-such-window`);
+    // Without --watch the real tab-state.sh prints only this on stderr, nothing
+    // on stdout, exit 1 (tests/fleet-drill.test.mjs compares it with the real script).
+    process.stderr.write(`tab-state: no such window: ${WID} (try opencode-tab.sh --list)\n`);
     process.exit(1);
   }
   const waiting = s.status === 'waiting';
