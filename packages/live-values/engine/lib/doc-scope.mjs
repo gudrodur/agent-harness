@@ -1,5 +1,5 @@
-// Shared machinery for the scripts that read facts out of a repo's prose
-// and run a command per fact: a proof reader (one-off claims with a
+// Shared machinery for the scripts that read facts out of this repo's prose
+// and run a command per fact: proof-sweep.mjs (one-off claims with a
 // `<!-- proof: … -->`) and live-values.mjs (named values with
 // `<!-- live:NAME -->`). There is one scope, one runner, one local gate and
 // one notion of "inside a generated block", so the two readers cannot
@@ -8,15 +8,16 @@
 //   collectFiles(root)             the prose in scope (INDEX.md never is)
 //   liveScope(root)                collectFiles plus any repo's agent-facing docs
 //   autogenMask(lines)             true for each line inside an AUTO-GEN block
-//   checkLocal(run, root)          the proof reader's --local gate (every segment, read-only tools)
+//   checkLocal(run, root)          proof-sweep's --local gate (every segment, read-only tools)
 //   checkQuerySegments(run, tools) every command in a pipeline/list allowlisted
 //   runCommand(run, opts)          bash -c in root, with a timeout
 //
 // autogenMask is anchored: a marker is a WHOLE line, `<!-- AUTO-GEN:start NAME -->`
 // or `<!-- AUTO-GEN:end NAME -->`, and an end closes only the block of the same
-// NAME. The loose prefix regex it replaces treated a table cell that QUOTES both
-// markers as the block's end, so everything after it read as hand-written, and
-// a claim placed there reported `ok` when it should be MISPLACED.
+// NAME. The loose prefix regex it replaces treated SCRIPTS-ORGANIZATION.md:92,
+// a table cell that QUOTES both markers, as the block's end. So everything
+// from :93 to the real end at :198 read as hand-written, and a proof placed
+// there reported `ok` when it should be MISPLACED (LV phase 0, probe A19).
 
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
@@ -24,14 +25,15 @@ import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { commandStart, commandWord, shellWords, splitSegments } from "./shell-command.mjs";
 
-// live-values' scope, portable to any repo it is copied into:
+// live-values' scope, portable to any repo it is copied into (LV phase 4):
 // collectFiles plus the agent-facing docs of a project repo - root CLAUDE.md,
 // AGENTS.md and README.md, docs/**/*.md at any depth, and skills/*/SKILL.md or
 // .claude/skills/*/SKILL.md - never INDEX.md, and in a git checkout only
 // TRACKED files, so the hook judges exactly what CI will. Untracked scratch
 // docs are not the repo's prose, and git lists a symlink as a link, so a
-// skills symlink into a dependency directory is never followed. Outside a git
-// checkout it is collectFiles alone.
+// skills symlink into node_modules is never followed (xj-greenfield, phase 0
+// section 4). Outside a git checkout it is collectFiles alone. In agent-config
+// the change added 26 files and no marker.
 const PROJECT_DOC_RE = /^(?:(?:CLAUDE|AGENTS|README)\.md|docs\/.+\.md|(?:\.claude\/)?skills\/[^/]+\/SKILL\.md)$/;
 export const liveScope = (root) => {
   const base = collectFiles(root);
@@ -51,15 +53,13 @@ export const liveScope = (root) => {
   return out.sort();
 };
 
-// The local lane of a proof-annotation reader: tools that need no network, auth or machine path.
+// proof-sweep's --local lane: tools that need no network, auth or machine path.
 export const LOCAL_TOOLS = new Set(["ls", "test", "grep", "node", "jq", "git", "cat", "wc"]);
 
-// Files in scope: the always-read entry docs plus the docs directory and
-// skills that carry factual claims. INDEX.md is generated, so it is never in
-// scope. AGENTS.md and CLAUDE.md are both listed; a repo keeps whichever
-// entry doc it uses (the other name simply matches nothing). The four
-// *-ORGANIZATION.md names come from the setup this engine was extracted from;
-// a repo without them loses nothing.
+// Files in scope: the always-injected contract plus the lazy-read docs that
+// carry factual claims. INDEX.md is generated, so it is never in scope.
+// AGENTS.md is canonical since the 2026-09-13 cutover; CLAUDE.md stays listed
+// so a sweep still visits the compatibility pointer (it carries no proofs).
 export const collectFiles = (root) => {
   const files = [];
   for (const name of ["AGENTS.md", "CLAUDE.md", "MCP-ORGANIZATION.md", "HOOKS-ORGANIZATION.md", "SKILLS-ORGANIZATION.md", "SCRIPTS-ORGANIZATION.md"]) {
@@ -115,18 +115,18 @@ export const autogenMask = (lines) => {
 
 const expandPath = (tok) => (tok.startsWith("~") ? join(homedir(), tok.slice(1)) : tok);
 
-// The proof reader's `--local` gate. EVERY command of the proof (each pipe, `&&`,
+// proof-sweep's `--local` gate. EVERY command of the proof (each pipe, `&&`,
 // `||`, `;` segment and each `$(…)` or backtick substitution) must be on the
 // read-only allowlist below, and every path-like argument must exist. Relative
 // path-likes resolve against the repo root, which is also the commands' cwd.
 // The gate used to read the FIRST word only, so `jq … | gh api …` and
-// `node -e '…'` passed it.
+// `node -e '…'` passed it (#1534).
 export const LOCAL_READ_TOOLS = new Set([
   "ls", "test", "[", "grep", "jq", "git", "cat", "wc", "head", "tail", "sort", "uniq", "cut", "tr",
   "awk", "sed", "stat", "readlink", "find", "cmp", "diff", "printf", "basename", "dirname", "echo",
   "node", "rg", "exit", "true", "false", ":",
 ]);
-// Why a tool is off the list, printed with each skipped proof.
+// Why a tool is off the list, printed with each skipped proof (#1534).
 const NETWORK_TOOLS = new Set(["gh", "gcloud", "gsutil", "bq", "curl", "wget", "ssh", "scp", "rsync", "wrangler", "firebase", "npx", "pnpm", "npm"]);
 const CONTAINER_TOOLS = new Set(["podman", "docker"]);
 const notLocal = (word) => {
@@ -145,7 +145,10 @@ const onPath = (word) => {
   return onPathMemo.get(key);
 };
 const GIT_READ = new Set(["log", "show", "diff", "rev-parse", "ls-files", "grep", "cat-file", "status", "rev-list", "for-each-ref"]);
-const NODE_SCRIPT_RE = /^(?:\.\/)?scripts\/[\w./-]+\.mjs$/;
+const NODE_SCRIPT_RE = /^(?:~\/\.claude\/|\.\/)?scripts\/[\w./-]+\.mjs$/;
+const NODE_TEST_FLAG_RE = /^--test-(?:reporter|name-pattern|timeout|concurrency|shard|force-exit)(?:=.*)?$/;
+const NODE_TEST_FILE_RE = /^(?:~\/\.claude\/|\.\/)?(?:scripts|skills|templates)\/[\w./-]+\.mjs$/;
+const REDIRECT_WORD_RE = /^(?:\d*>&?\d*|>>?|<)$/;
 
 // Output redirected anywhere but /dev/null (or a descriptor, `2>&1`) writes a file.
 const writesFile = (segment) => {
@@ -161,8 +164,20 @@ const writesFile = (segment) => {
 const badArgs = (word, args) => {
   const has = (re) => args.some((a) => re.test(a));
   switch (word) {
-    case "node":
+    case "node": {
+      if (args[0] === "--test") {
+        for (const a of args.slice(1)) {
+          if (REDIRECT_WORD_RE.test(a)) continue;
+          if (a.startsWith("-")) {
+            if (!NODE_TEST_FLAG_RE.test(a)) return `node --test flag not allowed: ${a}`;
+          } else {
+            if (!NODE_TEST_FILE_RE.test(a)) return `node --test only runs test files under scripts/, skills/, templates/: ${a}`;
+          }
+        }
+        return null;
+      }
       return !args[0] || !NODE_SCRIPT_RE.test(args[0]) ? "node only runs scripts/<name>.mjs" : null;
+    }
     case "git": {
       // `-c`, `--config-env` and `--exec-path` run code only as git's own options,
       // before the subcommand; after it, `-c` is the subcommand's (grep counts).
@@ -203,7 +218,7 @@ const withoutSubstitutions = (text) => {
 // Every refusal in the proof, outer commands and substitutions alike. The
 // reason printed is the most telling one: a network tool, then a container,
 // then the first refusal, so `node x.mjs $(gcloud …)` and `podman … $(seq 9)`
-// name gcloud and podman.
+// name gcloud and podman (#1534).
 const refusals = (run) => {
   const out = [];
   for (const seg of splitSegments(run)) {

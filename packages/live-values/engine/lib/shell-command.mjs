@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-// Shared shell-command cleaners for gates that judge shell commands.
+// Shared shell-command cleaners for the PreToolUse(Bash) guards.
 //
-// Every gate judges the COMMAND, not the text the command carries: a heredoc
-// body is prose or an embedded program the agent did not run as a shell
-// command, and a quoted span is a message, a filter pattern, or a payload.
-// Judging those spans as commands fires the gate on reads (heredoc briefs
-// fired a config gate on filenames mentioned in their bodies; a deployment
-// listing plus quoted "deploy" prose claimed a deploy). The same shape a
-// command gate strips before judging.
+// Both the config guard and the mutation-claim guard judge the COMMAND, not
+// the text the command carries: a heredoc body is prose or an embedded
+// program the agent did not run as a shell command, and a quoted span is a
+// message, a filter pattern, or a payload. Judging those spans as commands
+// fires the guard on reads (2026-09-10: four `cat > /tmp/... <<EOF` briefs
+// fired the config guard on SKILL.md mentions in their bodies; a
+// `wrangler deployments list` plus quoted "deploy" prose claimed a wrangler
+// deploy). Same shape git-branch-guard.sh already strips in awk (#393 row 6).
 
 // Drop heredoc bodies: from a line carrying `<<TAG` (also `<<-TAG`, quoted
 // tags) through the terminating line `TAG`. Head lines are kept verbatim so
@@ -51,15 +52,15 @@ const QUOTE_OPEN_PRECEDER = /[=\s([{;&|<>$`'"]/;
 // Split a command into segments the way the guards judge them: one segment,
 // one verdict, so a read in one segment neither fires for nor hides behind
 // another. Quote-aware: separators inside a quoted span (`VAR='a && b'`, a
-// `send-text "…; …"` message) do not split, and a multiline quoted span
+// `kitty send-text "…; …"` message) do not split, and a multiline quoted span
 // stays one segment. An unbalanced quote is treated as a literal, so it can
 // never swallow the rest of the command.
 export const splitSegments = (command) => splitSegmentsDetailed(command).map((s) => s.text);
 
 // splitSegments plus the operator that PRECEDES each segment ('' for the
-// first, else one of `|`, `||`, `&&`, `;`, `&`, newline). A gate that must
-// know whether a command's stdin is a pipe reads `sep === '|'`; everyone
-// else uses splitSegments.
+// first, else one of `|`, `||`, `&&`, `;`, `&`, newline). A guard that must
+// know whether a command's stdin is a pipe (opencode-headless-guard.mjs) reads
+// `sep === '|'`; everyone else uses splitSegments.
 export const splitSegmentsDetailed = (command) => {
   const text = String(command ?? '');
   const segs = [];
@@ -185,7 +186,9 @@ export const shellWords = (segment) => {
 };
 
 // Words that may precede the real command in a segment without being it.
-const PREFIX_WORDS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'then', 'do', 'else', '!', '{', '(']);
+const PREFIX_WORDS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'then', 'do', 'else', 'if', 'while', 'until', '!', '{', '(']);
+// Leading `(`, `{`, `$(` and backtick: a command opener glued to the next word.
+const OPENERS_RE = /^(?:\$\(|[({`])+/;
 const ASSIGNMENT_RE = /^[A-Za-z_]\w*=/;
 
 // Where the command word sits in a segment's words: past `NAME=value`
@@ -196,7 +199,7 @@ export const commandStart = (words) => {
   const env = {};
   let i = 0;
   while (i < words.length) {
-    const w = words[i].replace(/^[({]+/, '');
+    const w = words[i].replace(OPENERS_RE, '');
     if (w === '') {
       i++;
       continue;
@@ -217,6 +220,12 @@ export const commandStart = (words) => {
       i++;
       continue;
     }
+    if (w === 'nice' || w === 'ionice' || w === 'xargs') {
+      // Launchers with their own options: `nice -n 5`, `nice -5`, `xargs -r -n1`.
+      i++;
+      while (i < words.length && /^-/.test(words[i])) i += /^-[nc]$/.test(words[i]) ? 2 : 1;
+      continue;
+    }
     if (w === 'timeout') {
       i++;
       while (i < words.length && /^(-\S+|\d+(\.\d+)?[smhd]?)$/.test(words[i])) i++;
@@ -230,13 +239,13 @@ export const commandStart = (words) => {
 // The command word of a segment with its leading `(`/`{` removed, or ''.
 export const commandWord = (words) => {
   const { index } = commandStart(words);
-  return index < 0 ? '' : words[index].replace(/^[({]+/, '');
+  return index < 0 ? '' : words[index].replace(OPENERS_RE, '');
 };
 
 // Heredoc bodies in the RAW command, one entry per `<<TAG`, in order: the
 // head line that opened it and the body lines up to the terminator. Mirrors
-// stripHeredocBodies, which drops exactly these lines; a gate that has to
-// READ a body (a message passed as `-F - <<EOF` or `-m "$(cat <<EOF)"`)
+// stripHeredocBodies, which drops exactly these lines; a guard that has to
+// READ a body (a commit message passed as `-F - <<EOF` or `-m "$(cat <<EOF)"`)
 // pairs a segment with the entry whose head line carries it.
 export const heredocBodies = (command) => {
   const lines = String(command ?? '').split('\n');
@@ -261,11 +270,11 @@ export const heredocBodies = (command) => {
   return out;
 };
 // Is the text at `index` an actual command, or is it sitting inside a quoted
-// string or a comment? Shared by gates that refuse a command string: without
-// this a gate refuses an `echo` of a command in quotes, which does nothing —
-// and refuses the very shell calls used to diagnose that. A blocking gate that
-// rejects a command with no effect teaches people to route around it, so
-// quote-awareness is load-bearing, not polish.
+// string or a comment? Shared by the PreToolUse(Bash) gates (issue-title-hook,
+// pr-close-row-hook): without this a gate refuses an `echo` of a command in
+// quotes, which does nothing — and refuses the very Bash calls used to diagnose
+// that. A blocking gate that rejects a command with no effect teaches people to
+// route around it, so quote-awareness is load-bearing, not polish.
 //
 // This is a scanner, not a shell parser. It tracks single quotes, double quotes
 // and backslash escapes, and treats an unquoted `#` as a comment to end of
@@ -302,10 +311,10 @@ export const matchesAtCommandPosition = (command, re) => {
 
 // Stricter than matchesAtCommandPosition: the match must also BE the command
 // of its segment, with only assignments and prefix words (`sudo`, `env`,
-// `timeout 30`, …) before it. `echo deploy …` carries the verb unquoted
+// `timeout 30`, …) before it. `echo gh pr create …` carries the verb unquoted
 // but runs `echo`, and a deny gate that refused it blocked a command with no
-// effect. Judged per segment of the heredoc-stripped command, so
-// `cd x && deploy` still matches.
+// effect (measured 2026-09-25). Judged per segment of
+// the heredoc-stripped command, so `cd x && gh pr create` still matches.
 export const matchesAsCommand = (command, re) =>
   splitSegments(stripHeredocBodies(command)).some((segment) => {
     re.lastIndex = 0;
@@ -316,3 +325,18 @@ export const matchesAsCommand = (command, re) =>
     }
     return false;
   });
+
+// `> "$HOME/f"`, `2>'f'`: stripQuoted blanks a quoted redirect target, so a check on the stripped text
+// never sees it. Yields each quoted redirect target whose operator sits outside every quoted span, as
+// the match: [0] operator plus target, [1] the operator, [2] the quoted target, `.index` in `segment`.
+const QUOTED_REDIRECT_RE = /((?:^|[^<>\w])(?:\d|&)?>>?\s*)("(?:[^"\\]|\\.)*"|'[^']*')/g;
+export const quotedRedirects = (segment) => {
+  const out = [];
+  for (const m of String(segment ?? '').matchAll(QUOTED_REDIRECT_RE)) {
+    // Swap the target for a bare marker, then strip quotes: the operator is a real redirect only if it
+    // survives outside every quoted span.
+    const marked = segment.slice(0, m.index) + m[1] + 'QTARGET' + segment.slice(m.index + m[0].length);
+    if (/>\s*QTARGET/.test(stripQuoted(marked))) out.push(m);
+  }
+  return out;
+};
