@@ -165,13 +165,14 @@ var shellWords = (segment) => {
     words.push(cur);
   return words;
 };
-var PREFIX_WORDS = new Set(["sudo", "command", "exec", "nohup", "time", "then", "do", "else", "!", "{", "("]);
+var PREFIX_WORDS = new Set(["sudo", "command", "exec", "nohup", "time", "then", "do", "else", "if", "while", "until", "!", "{", "("]);
+var OPENERS_RE = /^(?:\$\(|[({`])+/;
 var ASSIGNMENT_RE = /^[A-Za-z_]\w*=/;
 var commandStart = (words) => {
   const env = {};
   let i = 0;
   while (i < words.length) {
-    const w = words[i].replace(/^[({]+/, "");
+    const w = words[i].replace(OPENERS_RE, "");
     if (w === "") {
       i++;
       continue;
@@ -192,6 +193,12 @@ var commandStart = (words) => {
       i++;
       continue;
     }
+    if (w === "nice" || w === "ionice" || w === "xargs") {
+      i++;
+      while (i < words.length && /^-/.test(words[i]))
+        i += /^-[nc]$/.test(words[i]) ? 2 : 1;
+      continue;
+    }
     if (w === "timeout") {
       i++;
       while (i < words.length && /^(-\S+|\d+(\.\d+)?[smhd]?)$/.test(words[i]))
@@ -204,7 +211,7 @@ var commandStart = (words) => {
 };
 var commandWord = (words) => {
   const { index } = commandStart(words);
-  return index < 0 ? "" : words[index].replace(/^[({]+/, "");
+  return index < 0 ? "" : words[index].replace(OPENERS_RE, "");
 };
 
 // engine/lib/doc-scope.mjs
