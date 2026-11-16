@@ -105,11 +105,17 @@ const composerBox = (lines) => {
   return { rows: [lines[at].replace(/^[❯>]/, ''), ...lines.slice(at + 1, bottom)] };
 };
 
+// AGENT_KITTY_GET_TEXT_TIMEOUT_MS lengthens the bound (test seam: a loaded machine).
+const getTextTimeoutMs = () => {
+  const v = Number(process.env.AGENT_KITTY_GET_TEXT_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 5000;
+};
+
 // The visible screen as right-trimmed lines, or null when it cannot be read.
 const readScreenLines = (winId) => {
   const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
   try {
-    return execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }).split('\n').map((l) => l.trimEnd());
+    return execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: getTextTimeoutMs() }).split('\n').map((l) => l.trimEnd());
   } catch { return null; }
 };
 
