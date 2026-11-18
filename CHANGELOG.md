@@ -17,6 +17,11 @@ All notable changes to the agent-harness workspace are documented here. The form
 - `packages/live-values`:
   - Cleaned build header: removed repository URL / slug from generated bundle header (`dist/live-values.mjs`) and added `tests/build-header.test.mjs`.
 
+### Fixed
+
+- `packages/switchboard`:
+  - Typing proof: the composer is read with `get-text --ansi`, so the faint prompt suggestion Claude Code shows after a turn no longer blocks typed delivery to an idle seat; normal text, chips and unparsable escapes still refuse. A quiet `--queue` wait now prints `held: <reason>` once per distinct reason.
+
 ## [1.0.0] - 2026-11-11
 
 First tagged release of the multi-package agent harness repository.

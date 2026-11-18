@@ -1072,9 +1072,12 @@ const main = (argv) => {
         }
       } else {
         idleSince = null;
-        // Said once per distinct reason; a busy window needs no line.
+        // Said once per distinct reason; a busy window needs no line. The quiet
+        // default says it too (`held: <reason>`): a --queue wait can last
+        // hours, and a caller reading only the last line must see why.
         if (why !== 'recipient window not idle' && why !== lastWhy) {
-          trace(`agent-send: not typed into window ${rwin}: ${why}; row ${row.id} stays queued for the recipient's own drain\n`);
+          if (verbose) trace(`agent-send: not typed into window ${rwin}: ${why}; row ${row.id} stays queued for the recipient's own drain\n`);
+          else process.stderr.write(`agent-send: held: ${why}; row ${row.id} stays queued for the recipient's own drain\n`);
         }
         lastWhy = why;
       }
