@@ -287,36 +287,34 @@ win_pid() {
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null \
     | head -1
 }
-win_cwd() {
-  kitty @ ls 2>/dev/null \
-    | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .cwd // empty' 2>/dev/null \
-    | head -1
-}
-
 win_title() {
   kitty @ ls 2>/dev/null \
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .title // ""' 2>/dev/null \
     | head -1
 }
 copilot_session_for_pid() {
-  local window_pid="$1" window_cwd="$2" session_dir lock lock_pid proc_cwd proc_cmdline
+  local window_pid="$1" session_dir lock lock_pid proc_cmdline
   for session_dir in "$COPILOT_STATE_DIR"/*; do
     [ -d "$session_dir" ] || continue
     lock="$session_dir/inuse.${window_pid}.lock"
     [ -f "$lock" ] && { printf '%s' "$session_dir"; return 0; }
   done
   # kitty may report the launcher pid while the lock belongs to Copilot's child.
+  # Only descendants can belong to this window; cwd alone is ambiguous.
   for session_dir in "$COPILOT_STATE_DIR"/*; do
     [ -d "$session_dir" ] || continue
     for lock in "$session_dir"/inuse.*.lock; do
       [ -f "$lock" ] || continue
       lock_pid="${lock##*/inuse.}"; lock_pid="${lock_pid%.lock}"
       case "$lock_pid" in ''|*[!0-9]*) continue ;; esac
-      kill -0 "$lock_pid" 2>/dev/null || continue
-      proc_cwd=$(readlink "/proc/$lock_pid/cwd" 2>/dev/null || true)
+      pid="$lock_pid"; descendant=0
+      while [ "$pid" -gt 1 ] 2>/dev/null; do
+        [ "$pid" = "$window_pid" ] && { descendant=1; break; }
+        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || printf '1')
+      done
+      [ "$descendant" = 1 ] || continue
       proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || true)
       printf '%s' "$proc_cmdline" | grep -q 'copilot' || continue
-      [ "$proc_cwd" = "$window_cwd" ] || continue
       printf '%s' "$session_dir"
       return 0
     done
@@ -785,7 +783,7 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID"); then
   fi
 fi
 if [ "$CLAUDE_TAB" = 0 ] && [ "$OPENCODE_TAB" = 0 ] \
-  && copilot_dir=$(copilot_session_for_pid "$(win_pid "$WID")" "$(win_cwd "$WID")"); then
+  && copilot_dir=$(copilot_session_for_pid "$(win_pid "$WID")"); then
   COPILOT_EVENTS="$copilot_dir/events.jsonl"
   if [ -r "$COPILOT_EVENTS" ]; then
     TAB_LINES=$(wc -l <"$COPILOT_EVENTS")

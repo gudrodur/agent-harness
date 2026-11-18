@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HOOK="$ROOT/hooks/copilot/presence.mjs"
+SWITCHBOARD_HOME="${AGENT_SWITCHBOARD_HOME:-$HOME/Development/projects/agent-harness/packages/switchboard}"
+HOOK="$SWITCHBOARD_HOME/hooks/copilot/presence.mjs"
 CONFIG_DIR="${COPILOT_CONFIG_DIR:-${HOME:?}/.copilot}"
 SETTINGS="$CONFIG_DIR/settings.json"
 

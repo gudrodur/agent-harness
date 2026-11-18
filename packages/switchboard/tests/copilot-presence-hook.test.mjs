@@ -2,10 +2,15 @@
 import './helpers/isolate-setup.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { presenceFromStatus, publishPresence } from '../hooks/copilot/presence.mjs';
 import { readAllPresence } from '../lib/presence.mjs';
 
 const FILE = process.env.AGENT_SWITCHBOARD_PRESENCE_FILE;
+const INSTALLER = path.resolve('bin/copilot-install.sh');
 
 test('status-line input identifies a Copilot seat from its kitty window', () => {
   assert.deepEqual(
@@ -26,4 +31,26 @@ test('publishing presence leaves the seat on kitty fallback, not mailbox deliver
 test('missing kitty window does not publish an anonymous seat', () => {
   assert.equal(publishPresence('', {}), false);
   assert.equal(readAllPresence({ file: FILE }).some((entry) => entry.windowId == null), false);
+});
+
+test('installer writes a stable switchboard hook path and is idempotent', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-install-home-'));
+  const stable = '/home/example/Development/projects/agent-harness/packages/switchboard';
+  const env = {
+    ...process.env,
+    HOME: home,
+    AGENT_SWITCHBOARD_HOME: stable,
+    COPILOT_CONFIG_DIR: path.join(home, '.copilot'),
+  };
+  try {
+    execFileSync('bash', [INSTALLER], { env, encoding: 'utf8' });
+    const settingsPath = path.join(home, '.copilot', 'settings.json');
+    const first = fs.readFileSync(settingsPath, 'utf8');
+    const settings = JSON.parse(first);
+    assert.equal(settings.statusLine.command, `node '${stable}/hooks/copilot/presence.mjs'`);
+    execFileSync('bash', [INSTALLER], { env, encoding: 'utf8' });
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), first);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

@@ -46,6 +46,13 @@ an external mailbox row arrives. Install the status-line beacon with:
 bash <checkout>/bin/copilot-install.sh
 ```
 
+The installer points at `$AGENT_SWITCHBOARD_HOME/hooks/copilot/presence.mjs`,
+defaulting to `~/Development/projects/agent-harness/packages/switchboard`, not
+the checkout used to run the installer. Copilot's documented
+`statusLine: { type: "command", command, refreshInterval }` shape is accepted,
+but the setting is read at session startup; restart existing Copilot sessions
+after installation.
+
 The beacon keeps the Copilot kitty window addressable, but intentionally does
 not mark it as a mailbox consumer. `agent-send.mjs` therefore uses the
 existing kitty-send typing fallback; an idle Copilot session receives the
