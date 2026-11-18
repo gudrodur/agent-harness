@@ -205,6 +205,17 @@ test('a Claude tab whose session status is shell is sendable even with a spinner
   assert.deepEqual(await calls(), ['text']);
 });
 
+test('a busy Claude tab parked by --idle-when remains pending, not falsely delivered', async () => {
+  await reset('never', 'busy');
+  await fs.writeFile(path.join(stateDir, 'screen'), 'Bíð eftir næsta skilaboði.\n');
+  const r = await runScript([
+    '--to', WID, '--text', MSG, '--idle-when', 'Bíð eftir næsta', '--timeout', '2',
+  ]);
+  assert.equal(r.code, 8, `${r.out}${r.err}`);
+  assert.match(r.err, /pending in its steering queue/);
+  assert.deepEqual(await calls(), ['text']);
+});
+
 // ---- the chokepoint: the typing proof runs immediately before the first keystroke ----
 //
 // Every mode that claims the seat is idle (--wait-idle, --deadline, --queue and

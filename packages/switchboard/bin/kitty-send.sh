@@ -321,6 +321,25 @@ copilot_session_for_pid() {
   done
   return 1
 }
+copilot_process_for_window() {
+  local window_pid="$1" row pid cmdline
+  [ -n "$window_pid" ] || return 1
+  row=$(kitty @ ls 2>/dev/null | jq -r --argjson id "$WID" '
+    .[].tabs[].windows[] | select(.id == $id) |
+    (.foreground_processes // [])[] |
+    [(.pid // ""), ((.cmdline // []) | join(" "))] | @tsv
+  ' 2>/dev/null || true)
+  while IFS=$'\t' read -r pid cmdline; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    printf '%s' "$cmdline" | grep -qE '(^|[[:space:]/])copilot([[:space:]]|$)' || continue
+    printf '%s' "$pid"
+    return 0
+  done <<EOF
+$row
+EOF
+  return 1
+}
 copilot_presence_row_for_window() {
   local file="${AGENT_MAILBOX_PRESENCE_FILE:-${AGENT_SWITCHBOARD_PRESENCE_FILE:-}}" db
   if [ -n "$file" ] && [ -r "$file" ]; then
@@ -683,8 +702,17 @@ if [ "$CANCEL" = 1 ]; then
 fi
 
 [ -n "$(win_pid "$WID")" ] || die "window $WID is not alive (try --list)" 1
-if copilot_presence_pid_dead "$WID"; then
-  die "Copilot for window $WID has exited (its presence pid is gone); refusing to type into the shell left behind" 1
+window_title=$(win_title "$WID")
+copilot_pid=""
+if copilot_pid=$(copilot_process_for_window "$(win_pid "$WID")"); then
+  :
+elif printf '%s' "$window_title" | grep -qi 'copilot'; then
+  die "Copilot window $WID has no live Copilot process; refusing to type into the shell left behind" 1
+fi
+COPILOT_TAB=0; COPILOT_EVENTS=""; COPILOT_HEAD=""
+if [ -n "$copilot_pid" ] && copilot_dir=$(copilot_session_for_pid "$copilot_pid"); then
+  COPILOT_EVENTS="$copilot_dir/events.jsonl"
+  [ -r "$COPILOT_EVENTS" ] && COPILOT_TAB=1
 fi
 
 # --queue: hand the wait to a detached waiter and return. The waiter is this
@@ -821,7 +849,13 @@ fi
 # Idle at the send or not: the busy-transition proof in the poll
 # loop below only means something when the target was idle here. A target that
 # was already busy (--now) being busy afterwards proves nothing about this send.
-if target_busy "$title" "$WID"; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
+if [ "$COPILOT_TAB" = 1 ]; then
+  if copilot_busy "$WID"; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
+elif title_busy "$title" || [ "$(tab_state_of "$WID")" = busy ] || [ "$(claude_state_of "$WID")" = busy ]; then
+  WAS_BUSY_BEFORE_SEND=1
+else
+  WAS_BUSY_BEFORE_SEND=0
+fi
 
 # Proof by state: where the tab's session file is linked, the post-send poll
 # waits for a NEW role:user message row past this line count, and the echo
@@ -829,7 +863,6 @@ if target_busy "$title" "$WID"; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFOR
 # the weaker proof — its verdict says so.
 TAB_SESSION=""; TAB_LINES=0; STATE_KNOWN=0
 OPENCODE_TAB=0; OPENCODE_SID=""; OPENCODE_HEAD=""
-COPILOT_TAB=0; COPILOT_EVENTS=""; COPILOT_HEAD=""
 # A Claude Code tab (see CLAUDE CODE TABS above) is asked first: tab-state
 # reports its status too, but the send proof below needs CLAUDE_TAB, which the
 # state branch does not set. Its transcript may not exist yet in a fresh
@@ -1101,7 +1134,7 @@ if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$SLASH_SEND" = 0 ]
   elif [ "$COPILOT_TAB" = 1 ]; then
     copilot_row_landed || row_landed=0
   fi
-  if [ "$row_landed" = 0 ]; then
+  if [ "$row_landed" = 0 ] && ! { [ "$CLAUDE_TAB" = 1 ] && [ "$WAS_BUSY_BEFORE_SEND" = 1 ]; }; then
     kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
     CLAUDE_ENTERS=1
   fi
@@ -1143,7 +1176,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # a composer that swallowed the first. An Enter in an empty Claude Code
     # composer does nothing, so a first \r that did submit, with its row
     # slow to land (UserPromptSubmit hooks run first), costs nothing.
-    if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$CLAUDE_ENTERS" = 1 ] \
+    if { [ "$COPILOT_TAB" = 1 ] || { [ "$CLAUDE_TAB" = 1 ] && [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; } \
+       && [ "$CLAUDE_ENTERS" = 1 ] \
        && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ] \
        && { [ "$COPILOT_TAB" = 0 ] || { copilot_composer_holds_text && ! copilot_busy "$WID" && ! copilot_dialog_open "$WID"; }; }; then
       kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true

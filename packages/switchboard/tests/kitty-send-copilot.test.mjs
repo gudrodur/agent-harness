@@ -55,13 +55,25 @@ before(async () => {
       }],
     }],
   }]);
+  const lsDeadJson = JSON.stringify([{
+    tabs: [{
+      title: 'copilot',
+      windows: [{
+        id: Number(WID),
+        title: 'Copilot',
+        pid: process.pid,
+        cwd: CWD,
+        foreground_processes: [{ pid: process.pid, cmdline: ['bash'], cwd: CWD }],
+      }],
+    }],
+  }]);
   const stub = [
     '#!/usr/bin/env bash',
     `events=${JSON.stringify(events)}`,
     `state=${JSON.stringify(stateDir)}`,
     `ls_json=${JSON.stringify(lsJson)}`,
     'case "$1/$2" in',
-    '  @/ls) printf "%s\\n" "$ls_json" ;;',
+    '  @/ls) if [ -f "$state/no-copilot" ]; then printf "%s\\n" ' + JSON.stringify(lsDeadJson) + '; else printf "%s\\n" "$ls_json"; fi ;;',
     '  @/send-text)',
     '    text="${@: -1}";',
     '    if [ "$text" = $' + "'\\r'" + ' ]; then echo enter >> "$state/calls"; if [ -f "$state/composer" ] && [ "$(wc -c < "$state/composer")" -gt 500 ] && [ ! -f "$state/long-first-enter" ]; then touch "$state/long-first-enter"; else jq -cn --arg text "$(cat "$state/composer")" \'{type:"user.message",data:{content:$text}}\' >> "$events"; rm -f "$state/composer"; fi;',
@@ -194,15 +206,8 @@ test('a Copilot permission dialog refuses the send', async () => {
 });
 
 test('a dead Copilot presence pid refuses typing into the shell left behind', async () => {
-  await fs.writeFile(presence, JSON.stringify({
-    beacons: [{
-      sessionId: SID,
-      cwd: CWD,
-      windowId: Number(WID),
-      pid: 999999,
-      lastTick: new Date().toISOString(),
-    }],
-  }));
+  await fs.writeFile(presence, JSON.stringify({ beacons: [] }));
+  await fs.writeFile(path.join(stateDir, 'no-copilot'), '');
   let result;
   try {
     result = await run(SCRIPT, ['--to', WID, '--text', MSG], {
@@ -220,5 +225,5 @@ test('a dead Copilot presence pid refuses typing into the shell left behind', as
     result = error;
   }
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /presence pid is gone/);
+  assert.match(result.stderr, /no live Copilot process/);
 });
