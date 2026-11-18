@@ -43,9 +43,7 @@ Copilot CLI 1.0.114 does not provide a hook that runs between prompts or when
 an external mailbox row arrives. Install the status-line beacon with:
 
 ```sh
-copilot config statusLine.type command && \
-copilot config statusLine.command "node $PWD/hooks/copilot/presence.mjs" && \
-copilot config statusLine.refreshInterval 5
+bash <checkout>/bin/copilot-install.sh
 ```
 
 The beacon keeps the Copilot kitty window addressable, but intentionally does

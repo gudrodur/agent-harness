@@ -177,6 +177,9 @@ STATE_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tab-state.sh"
 # writes no jsonl and no Claude transcript, only rows in SQLite. Same seam name
 # tab-state.sh and opencode-tab.sh use.
 OPENCODE_TAB_DB="${OPENCODE_TAB_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+# Copilot CLI writes one events.jsonl per session and holds an inuse lock named
+# for its long-lived process. The state directory is overrideable for tests.
+COPILOT_STATE_DIR="${COPILOT_STATE_DIR:-$HOME/.copilot/session-state}"
 # One of busy|idle|exited|unknown. Anything the state script cannot answer —
 # no such window, no session file, unreadable file — is unknown, never fatal
 # here: the spinner fallback below is weaker but still available.
@@ -284,11 +287,41 @@ win_pid() {
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null \
     | head -1
 }
+win_cwd() {
+  kitty @ ls 2>/dev/null \
+    | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .cwd // empty' 2>/dev/null \
+    | head -1
+}
 
 win_title() {
   kitty @ ls 2>/dev/null \
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .title // ""' 2>/dev/null \
     | head -1
+}
+copilot_session_for_pid() {
+  local window_pid="$1" window_cwd="$2" session_dir lock lock_pid proc_cwd proc_cmdline
+  for session_dir in "$COPILOT_STATE_DIR"/*; do
+    [ -d "$session_dir" ] || continue
+    lock="$session_dir/inuse.${window_pid}.lock"
+    [ -f "$lock" ] && { printf '%s' "$session_dir"; return 0; }
+  done
+  # kitty may report the launcher pid while the lock belongs to Copilot's child.
+  for session_dir in "$COPILOT_STATE_DIR"/*; do
+    [ -d "$session_dir" ] || continue
+    for lock in "$session_dir"/inuse.*.lock; do
+      [ -f "$lock" ] || continue
+      lock_pid="${lock##*/inuse.}"; lock_pid="${lock_pid%.lock}"
+      case "$lock_pid" in ''|*[!0-9]*) continue ;; esac
+      kill -0 "$lock_pid" 2>/dev/null || continue
+      proc_cwd=$(readlink "/proc/$lock_pid/cwd" 2>/dev/null || true)
+      proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || true)
+      printf '%s' "$proc_cmdline" | grep -q 'copilot' || continue
+      [ "$proc_cwd" = "$window_cwd" ] || continue
+      printf '%s' "$session_dir"
+      return 0
+    done
+  done
+  return 1
 }
 win_created() {
   kitty @ ls 2>/dev/null \
@@ -719,6 +752,7 @@ if title_busy "$title" || [ "$(tab_state_of "$WID")" = busy ] || [ "$(claude_sta
 # the weaker proof — its verdict says so.
 TAB_SESSION=""; TAB_LINES=0; STATE_KNOWN=0
 OPENCODE_TAB=0; OPENCODE_SID=""; OPENCODE_HEAD=""
+COPILOT_TAB=0; COPILOT_EVENTS=""; COPILOT_HEAD=""
 # A Claude Code tab (see CLAUDE CODE TABS above) is asked first: tab-state
 # reports its status too, but the send proof below needs CLAUDE_TAB, which the
 # state branch does not set. Its transcript may not exist yet in a fresh
@@ -748,6 +782,15 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID"); then
         ;;
       *) : ;;  # no other tab kind has a record to prove a send by
     esac
+  fi
+fi
+if [ "$CLAUDE_TAB" = 0 ] && [ "$OPENCODE_TAB" = 0 ] \
+  && copilot_dir=$(copilot_session_for_pid "$(win_pid "$WID")" "$(win_cwd "$WID")"); then
+  COPILOT_EVENTS="$copilot_dir/events.jsonl"
+  if [ -r "$COPILOT_EVENTS" ]; then
+    TAB_LINES=$(wc -l <"$COPILOT_EVENTS")
+    COPILOT_HEAD=$(printf '%s' "$TEXT" | cut -c1-40 | tr -d '[:space:]')
+    STATE_KNOWN=1; COPILOT_TAB=1
   fi
 fi
 # Does a user row past the pre-send count carry this message's start? The
@@ -782,6 +825,11 @@ for (const r of rows) {
 }
 process.exit(1);
 JS
+}
+copilot_row_landed() {
+  tail -n "+$((TAB_LINES + 1))" "$COPILOT_EVENTS" 2>/dev/null \
+    | jq -r 'select(.type == "user.message") | .data.content // empty' 2>/dev/null \
+    | tr -d '[:space:]' | grep -qF -- "$COPILOT_HEAD"
 }
 # Seconds after the first lone \r before the second (see THE send). A test
 # seam as well.
@@ -997,6 +1045,10 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       if claude_row_landed; then
         confirmed=1; where="proved by transcript row (a new user prompt with this text reached the Claude Code session's transcript)"; break
       fi
+    elif [ "$COPILOT_TAB" = 1 ]; then
+      if copilot_row_landed; then
+        confirmed=1; where="proved by Copilot session event (a new user.message reached events.jsonl)"; break
+      fi
     fi
     # One more lone \r, at most, if the transcript still shows no prompt:
     # a composer that swallowed the first. An Enter in an empty Claude Code
@@ -1173,6 +1225,9 @@ if [ "$CLAUDE_TAB" = 1 ]; then
   note "The text may still sit in its composer: look at the window before sending again."
 elif [ "$OPENCODE_TAB" = 1 ]; then
   note "sent to window $WID (an OpenCode tab), but no new type:user row with this text reached session $OPENCODE_SID's rows in opencode.db within ${TIMEOUT}s (was seq $TAB_LINES)."
+  note "The text may still sit in its composer: look at the window before sending again."
+elif [ "$COPILOT_TAB" = 1 ]; then
+  note "sent to window $WID (a Copilot tab), but no new user.message with this text reached $COPILOT_EVENTS within ${TIMEOUT}s (was $TAB_LINES lines)."
   note "The text may still sit in its composer: look at the window before sending again."
 else
   note "sent to window $WID but could not observe it on screen within ${TIMEOUT}s."
