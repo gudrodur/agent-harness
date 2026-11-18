@@ -385,6 +385,22 @@ test('a fallback that sends nothing puts the message back in the mailbox ', asyn
   assert.equal(left[0].text, 'bare steer');
 });
 
+// Exit 17 (a Copilot seat whose Copilot is gone) sends nothing too: the row
+// goes back for when Copilot is running in the window again.
+test('a fallback refused at a Copilot seat with no live Copilot (exit 17) puts the message back', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--text', 'copilot gone steer', '--deadline', '1'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '17' }),
+  );
+  assert.equal(code, 3);
+  assert.match(stderr, /kitty-send exit 17 sent nothing \(Copilot seat with no live Copilot in its foreground\) for \S+; re-queued as \S+/);
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1);
+  assert.equal(left[0].text, 'copilot gone steer');
+});
+
 // Exit 9 (a dirty composer holding a chip kitty-send does not own) also sends
 // nothing, so the withdrawn row must go back too, or the message is lost.
 test('a fallback refused at a dirty composer (exit 9) puts the message back in the mailbox', async () => {

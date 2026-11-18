@@ -68,6 +68,11 @@
 #   12 kitty remote control did not answer (a timeout or an unreachable
 #      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
 #      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
+#   17 the window is a Copilot seat (bound while its Copilot was alive) but no
+#      live Copilot process is in its foreground — NOTHING WAS SENT. The
+#      Copilot exited or was killed and a shell is left behind; typing there
+#      would run the message as a shell command. Restart Copilot in the window
+#      or send elsewhere.
 #
 # A composer echo is NOT delivery. An agent TUI's
 # composer collapses a send-text burst into a `[Pasted text #N +M lines]` chip
@@ -321,58 +326,53 @@ copilot_session_for_pid() {
   done
   return 1
 }
+# The live Copilot in the window's foreground, by kitty's own report of the
+# foreground process group: argv[0] is the copilot binary, or a node/bun
+# launcher whose script is the copilot bin or package. A process that only
+# NAMES copilot (an editor or pager on copilot.log) is not one. The title and
+# the session lock say nothing about liveness: a shell left behind resets the
+# title, a clean exit removes the lock, a kill leaves it under a dead pid.
 copilot_process_for_window() {
-  local window_pid="$1" row pid cmdline
+  local window_pid="$1" pid
   [ -n "$window_pid" ] || return 1
-  row=$(kitty @ ls 2>/dev/null | jq -r --argjson id "$WID" '
+  for pid in $(kitty @ ls 2>/dev/null | jq -r --argjson id "$WID" '
+    def base: tostring | split("/") | last;
     .[].tabs[].windows[] | select(.id == $id) |
     (.foreground_processes // [])[] |
-    [(.pid // ""), ((.cmdline // []) | join(" "))] | @tsv
-  ' 2>/dev/null || true)
-  while IFS=$'\t' read -r pid cmdline; do
+    select((.cmdline // []) as $c |
+      (($c[0] // "") | base) == "copilot"
+      or ((($c[0] // "") | base | test("^(node|nodejs|bun)$"))
+          and ((($c[1] // "") | base) == "copilot"
+               or (($c[1] // "") | test("/@github/copilot/"))))) |
+    .pid // empty
+  ' 2>/dev/null || true); do
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     kill -0 "$pid" 2>/dev/null || continue
-    printf '%s' "$cmdline" | grep -qE '(^|[[:space:]/])copilot([[:space:]]|$)' || continue
     printf '%s' "$pid"
     return 0
-  done <<EOF
-$row
-EOF
+  done
   return 1
 }
-copilot_presence_row_for_window() {
-  local file="${AGENT_MAILBOX_PRESENCE_FILE:-${AGENT_SWITCHBOARD_PRESENCE_FILE:-}}" db
-  if [ -n "$file" ] && [ -r "$file" ]; then
-    jq -r --argjson id "$1" '
-      .beacons[]? | select((.windowId // .window_id) == $id)
-      | [(.sessionId // .session_id // ""), (.pid // "")] | @tsv
-    ' "$file" 2>/dev/null | head -1
-    return 0
-  fi
-  db="${AGENT_SWITCHBOARD_DB:-${AGENT_SWITCHBOARD_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-switchboard}/state.db}"
-  [ -r "$db" ] || return 0
-  node - "$db" "$1" <<'JS' 2>/dev/null || true
-const { DatabaseSync } = require('node:sqlite');
-const [db, windowId] = process.argv.slice(2);
-const d = new DatabaseSync(db, { readOnly: true });
-const row = d.prepare(
-  'SELECT session_id, pid FROM presence_beacons WHERE window_id = ? ORDER BY last_tick DESC LIMIT 1',
-).get(Number(windowId));
-if (row) process.stdout.write(`${row.session_id ?? ''}\t${row.pid ?? ''}\n`);
-JS
-}
-copilot_presence_pid_dead() {
-  local row session_id pid
-  row=$(copilot_presence_row_for_window "$1")
-  [ -n "$row" ] || return 1
-  IFS=$'\t' read -r session_id pid <<EOF
-$row
-EOF
-  [ -n "$session_id" ] || return 1
-  [ -r "$COPILOT_STATE_DIR/$session_id/events.jsonl" ] || case "$session_id" in copilot-*) ;; *) return 1 ;; esac
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$pid" 2>/dev/null && return 1
+# THE COPILOT SEAT BINDING. Once a window is known to run Copilot it stays a
+# Copilot seat for the window's life, so a send after Copilot is gone is
+# refused instead of typed into the shell left behind (exit 17). Two writers:
+# the status-line hook (hooks/copilot/presence.mjs, every refresh while
+# Copilot lives) and this script, whenever it finds a live Copilot in the
+# window's foreground. The file holds the window's own pid as kitty reports
+# it, so a window id reused by a later kitty instance (another pid) is not
+# taken for the old seat. It survives presence pruning and lives in the
+# runtime dir, gone at logout like the windows themselves.
+copilot_binding_file() { printf '%s/copilot-window-%s' "$QUEUE_DIR" "$1"; }
+copilot_bind_window() { # $1 = window id, $2 = window pid
+  local f
+  f=$(copilot_binding_file "$1")
+  [ "$(cat "$f" 2>/dev/null)" = "$2" ] && return 0
+  mkdir -p "$QUEUE_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$2" >"$f.$$" 2>/dev/null && mv -f "$f.$$" "$f" 2>/dev/null || rm -f "$f.$$" 2>/dev/null
   return 0
+}
+copilot_window_bound() { # $1 = window id, $2 = window pid
+  [ -n "$2" ] && [ "$(cat "$(copilot_binding_file "$1")" 2>/dev/null)" = "$2" ]
 }
 win_created() {
   kitty @ ls 2>/dev/null \
@@ -704,13 +704,17 @@ fi
 [ -n "$(win_pid "$WID")" ] || die "window $WID is not alive (try --list)" 1
 window_pid=$(win_pid "$WID")
 window_title=$(win_title "$WID")
+# A Copilot seat is delivered to only while a live Copilot is in the window's
+# foreground. Any sign that the window is or was a Copilot seat (the binding,
+# a lock named by the window pid, the title) without one is exit 17: the
+# message would otherwise run as a command in the shell left behind.
 copilot_pid=""
 if copilot_pid=$(copilot_process_for_window "$window_pid"); then
-  :
-elif copilot_dir=$(copilot_session_for_pid "$window_pid"); then
-  die "Copilot window $WID has no live Copilot process; refusing to type into the shell left behind" 1
-elif printf '%s' "$window_title" | grep -qi 'copilot'; then
-  die "Copilot window $WID has no live Copilot process; refusing to type into the shell left behind" 1
+  copilot_bind_window "$WID" "$window_pid"
+elif copilot_window_bound "$WID" "$window_pid" \
+  || copilot_session_for_pid "$window_pid" >/dev/null \
+  || printf '%s' "$window_title" | grep -qi 'copilot'; then
+  die "window $WID is a Copilot seat with no live Copilot process in its foreground; refusing to type into the shell left behind (nothing was sent)" 17
 fi
 COPILOT_TAB=0; COPILOT_EVENTS=""; COPILOT_HEAD=""
 if [ -n "$copilot_pid" ] && copilot_dir=$(copilot_session_for_pid "$copilot_pid"); then

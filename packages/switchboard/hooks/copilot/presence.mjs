@@ -6,6 +6,8 @@
 // kitty typing fallback to wake the seat and deliver the next prompt.
 
 import { recordPresence } from '../../lib/presence.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const readStdin = () =>
@@ -50,7 +52,60 @@ export const publishPresence = (input, env = process.env, record = recordPresenc
   return true;
 };
 
+// The parent pid from /proc/<pid>/stat. The command name sits in parentheses
+// and may hold spaces or ')', so the fields are read after the LAST ')'.
+const parentOf = (pid) => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+  } catch {
+    return null;
+  }
+};
+
+// The kitty window's own pid: the ancestor of this hook whose parent is kitty
+// (KITTY_PID, which kitty puts in every window's environment). It is the pid
+// `kitty @ ls` reports for the window, whatever runs in it.
+export const windowPidFor = (env = process.env, pid = process.pid, parent = parentOf) => {
+  const kittyPid = Number(env.KITTY_PID);
+  if (!Number.isInteger(kittyPid) || kittyPid <= 1) return null;
+  for (let cur = pid, hops = 0; Number.isInteger(cur) && cur > 1 && hops < 64; hops += 1) {
+    const up = parent(cur);
+    if (up === kittyPid) return cur;
+    cur = up;
+  }
+  return null;
+};
+
+// Bind the window as a Copilot seat for kitty-send (its "COPILOT SEAT
+// BINDING"; same path and one-line format): once bound, a send to the
+// window with no live Copilot in its foreground is refused instead of typed
+// into the shell left behind. Unlike the presence beacon, nothing prunes it.
+export const bindCopilotWindow = (env = process.env, pid = process.pid, parent = parentOf) => {
+  const windowId = numberFrom(env.KITTY_WINDOW_ID);
+  const windowPid = windowPidFor(env, pid, parent);
+  if (windowId == null || windowPid == null) return null;
+  const dir = path.join(env.XDG_RUNTIME_DIR || env.TMPDIR || '/tmp', 'kitty-send');
+  const file = path.join(dir, `copilot-window-${windowId}`);
+  const body = `${windowPid}\n`;
+  try {
+    if (fs.readFileSync(file, 'utf8') === body) return file;
+  } catch {
+    // Not bound yet.
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${file}.${process.pid}`;
+  fs.writeFileSync(tmp, body);
+  fs.renameSync(tmp, file);
+  return file;
+};
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    bindCopilotWindow();
+  } catch {
+    // The binding is a guard for senders; a failed write must not stop presence.
+  }
   try {
     publishPresence(await readStdin());
   } catch {

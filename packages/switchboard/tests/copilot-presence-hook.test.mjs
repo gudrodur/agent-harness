@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { presenceFromStatus, publishPresence } from '../hooks/copilot/presence.mjs';
+import { presenceFromStatus, publishPresence, windowPidFor } from '../hooks/copilot/presence.mjs';
 import { readAllPresence } from '../lib/presence.mjs';
 
 const FILE = process.env.AGENT_SWITCHBOARD_PRESENCE_FILE;
@@ -27,6 +27,14 @@ test('publishing presence leaves the seat on kitty fallback, not mailbox deliver
   assert.equal(beacon.pid, process.ppid);
   assert.notEqual(beacon.mailbox, true);
   assert.notEqual(beacon.mailboxOnly, true);
+});
+
+test('the window pid is the ancestor whose parent is kitty, not the hook\'s own parent', () => {
+  // hook 40 -> sh 30 -> copilot 20 -> window shell 10 -> kitty 5
+  const parents = { 40: 30, 30: 20, 20: 10, 10: 5, 5: 1 };
+  assert.equal(windowPidFor({ KITTY_PID: '5' }, 40, (pid) => parents[pid] ?? null), 10);
+  assert.equal(windowPidFor({}, 40, (pid) => parents[pid] ?? null), null);
+  assert.equal(windowPidFor({ KITTY_PID: '7' }, 40, (pid) => parents[pid] ?? null), null);
 });
 
 test('missing kitty window does not publish an anonymous seat', () => {

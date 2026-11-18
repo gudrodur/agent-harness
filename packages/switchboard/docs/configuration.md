@@ -58,3 +58,13 @@ not mark it as a mailbox consumer. `agent-send.mjs` therefore uses the
 existing kitty-send typing fallback; an idle Copilot session receives the
 message as its next prompt. Copilot cannot acknowledge mailbox rows itself
 until it gains a prompt/turn hook.
+
+The hook also binds the kitty window as a Copilot seat in
+`$XDG_RUNTIME_DIR/kitty-send/copilot-window-<window id>` (the window's own
+pid, one line); kitty-send writes the same binding whenever it finds a live
+Copilot in a window. A send to a bound window is delivered only while its
+foreground processes, as `kitty @ ls` reports them, include a live Copilot;
+otherwise it exits 17 and types nothing, because the shell left behind would
+run the message as a command. Unlike the presence beacon, the binding is never
+pruned, and a window id reused by a later kitty instance (a different pid)
+does not match it.
