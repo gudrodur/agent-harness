@@ -46,7 +46,7 @@ export const presenceFromStatus = (input, env = process.env) => {
 export const publishPresence = (input, env = process.env, record = recordPresence) => {
   const identity = presenceFromStatus(input, env);
   if (!identity) return false;
-  record({ ...identity, mailbox: false, mailboxOnly: false });
+  record({ ...identity, pid: process.ppid, mailbox: false, mailboxOnly: false });
   return true;
 };
 

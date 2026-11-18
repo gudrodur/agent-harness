@@ -6,6 +6,11 @@ HOOK="$SWITCHBOARD_HOME/hooks/copilot/presence.mjs"
 CONFIG_DIR="${COPILOT_CONFIG_DIR:-${HOME:?}/.copilot}"
 SETTINGS="$CONFIG_DIR/settings.json"
 
+if [ ! -f "$HOOK" ]; then
+  printf 'copilot-install: no hook at %s\n' "$HOOK" >&2
+  exit 1
+fi
+
 HOOK="$HOOK" SETTINGS="$SETTINGS" node <<'JS'
 const fs = require('node:fs');
 const path = require('node:path');

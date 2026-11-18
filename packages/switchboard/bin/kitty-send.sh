@@ -321,6 +321,40 @@ copilot_session_for_pid() {
   done
   return 1
 }
+copilot_presence_row_for_window() {
+  local file="${AGENT_MAILBOX_PRESENCE_FILE:-${AGENT_SWITCHBOARD_PRESENCE_FILE:-}}" db
+  if [ -n "$file" ] && [ -r "$file" ]; then
+    jq -r --argjson id "$1" '
+      .beacons[]? | select((.windowId // .window_id) == $id)
+      | [(.sessionId // .session_id // ""), (.pid // "")] | @tsv
+    ' "$file" 2>/dev/null | head -1
+    return 0
+  fi
+  db="${AGENT_SWITCHBOARD_DB:-${AGENT_SWITCHBOARD_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-switchboard}/state.db}"
+  [ -r "$db" ] || return 0
+  node - "$db" "$1" <<'JS' 2>/dev/null || true
+const { DatabaseSync } = require('node:sqlite');
+const [db, windowId] = process.argv.slice(2);
+const d = new DatabaseSync(db, { readOnly: true });
+const row = d.prepare(
+  'SELECT session_id, pid FROM presence_beacons WHERE window_id = ? ORDER BY last_tick DESC LIMIT 1',
+).get(Number(windowId));
+if (row) process.stdout.write(`${row.session_id ?? ''}\t${row.pid ?? ''}\n`);
+JS
+}
+copilot_presence_pid_dead() {
+  local row session_id pid
+  row=$(copilot_presence_row_for_window "$1")
+  [ -n "$row" ] || return 1
+  IFS=$'\t' read -r session_id pid <<EOF
+$row
+EOF
+  [ -n "$session_id" ] || return 1
+  [ -r "$COPILOT_STATE_DIR/$session_id/events.jsonl" ] || case "$session_id" in copilot-*) ;; *) return 1 ;; esac
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null && return 1
+  return 0
+}
 win_created() {
   kitty @ ls 2>/dev/null \
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .created_at // empty' 2>/dev/null \
@@ -449,6 +483,7 @@ steerable_screen() {
 # the wait loop and the exit-7 precheck cannot drift apart.
 target_busy() {  # $1 = title, $2 = window id
   steerable_screen "$2" && return 1
+  copilot_busy "$2" && return 0
   case "$(tab_state_of "$2")" in
     busy) return 0 ;;
     idle) return 1 ;;
@@ -460,10 +495,48 @@ target_busy() {  # $1 = title, $2 = window id
   title_busy "$1" || return 1
   return 0
 }
+copilot_event_state() {
+  local events="$1"
+  [ -r "$events" ] || return 1
+  jq -s -r '
+    reduce .[] as $e ({busy:false, dialog:false};
+      if $e.type == "assistant.turn_start" then .busy = true
+      elif $e.type == "assistant.turn_end" then .busy = false
+      elif $e.type == "permission.requested" then .dialog = true
+      elif $e.type == "permission.completed" then .dialog = false
+      else .
+      end
+    ) | "\(.busy|if . then 1 else 0 end) \(.dialog|if . then 1 else 0 end)"
+  ' "$events" 2>/dev/null
+}
+copilot_events_for_window() {
+  local dir
+  dir=$(copilot_session_for_pid "$(win_pid "$1")") || return 1
+  [ -r "$dir/events.jsonl" ] || return 1
+  printf '%s' "$dir/events.jsonl"
+}
+copilot_busy() {
+  local events state
+  events="${COPILOT_EVENTS:-}"
+  [ -n "$events" ] || events=$(copilot_events_for_window "$1") || return 1
+  state=$(copilot_event_state "$events") || return 1
+  [ "${state%% *}" = 1 ]
+}
+copilot_dialog_open() {
+  local events state
+  events="${COPILOT_EVENTS:-}"
+  [ -n "$events" ] || events=$(copilot_events_for_window "$1") || return 1
+  state=$(copilot_event_state "$events") || return 1
+  [ "${state##* }" = 1 ]
+}
 # dialog_open with the read failure turned into the exit this script promises:
 # nothing sent, exit 11 (distinct from exit 3, which means sent but unproven).
 dialog_or_die() {
   local rc=0
+  if copilot_dialog_open "$1"; then
+    PROOF_REASON="Copilot permission dialog is open"
+    return 0
+  fi
   dialog_open "$1" || rc=$?
   case "$rc" in
     0|1) return "$rc" ;;
@@ -610,6 +683,9 @@ if [ "$CANCEL" = 1 ]; then
 fi
 
 [ -n "$(win_pid "$WID")" ] || die "window $WID is not alive (try --list)" 1
+if copilot_presence_pid_dead "$WID"; then
+  die "Copilot for window $WID has exited (its presence pid is gone); refusing to type into the shell left behind" 1
+fi
 
 # --queue: hand the wait to a detached waiter and return. The waiter is this
 # same script (run with KITTY_SEND_WAIT_UNBOUNDED=1 when no bound was given,
@@ -729,7 +805,10 @@ if title_busy "$title" && steerable_screen "$WID"; then
   note "window $WID has a spinner in its title but its screen matches --idle-when: treating it as parked, not working."
 fi
 if target_busy "$title" "$WID"; then
-  if [ "$NOW" = 1 ]; then
+  if copilot_busy "$WID"; then
+    note "window $WID is a busy Copilot turn; Copilot sends are held until its turn ends"
+    die "refusing to send into a busy Copilot target (nothing was sent) — pass --wait-idle N or --queue to hold" 7
+  elif [ "$NOW" = 1 ]; then
     note "window $WID is mid-turn (spinner in the title); --now given, so the message lands in its steering queue"
     note "and the tool call in flight will have its result DISCARDED."
   else
@@ -742,7 +821,7 @@ fi
 # Idle at the send or not: the busy-transition proof in the poll
 # loop below only means something when the target was idle here. A target that
 # was already busy (--now) being busy afterwards proves nothing about this send.
-if title_busy "$title" || [ "$(tab_state_of "$WID")" = busy ] || [ "$(claude_state_of "$WID")" = busy ]; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
+if target_busy "$title" "$WID"; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
 
 # Proof by state: where the tab's session file is linked, the post-send poll
 # waits for a NEW role:user message row past this line count, and the echo
@@ -828,6 +907,12 @@ copilot_row_landed() {
   tail -n "+$((TAB_LINES + 1))" "$COPILOT_EVENTS" 2>/dev/null \
     | jq -r 'select(.type == "user.message") | .data.content // empty' 2>/dev/null \
     | tr -d '[:space:]' | grep -qF -- "$COPILOT_HEAD"
+}
+copilot_composer_holds_text() {
+  [ "$COPILOT_TAB" = 1 ] || return 1
+  local screen
+  screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]') || return 1
+  [ -n "$COPILOT_HEAD" ] && printf '%s' "$screen" | grep -qF -- "$COPILOT_HEAD"
 }
 # Seconds after the first lone \r before the second (see THE send). A test
 # seam as well.
@@ -1059,7 +1144,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # composer does nothing, so a first \r that did submit, with its row
     # slow to land (UserPromptSubmit hooks run first), costs nothing.
     if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$CLAUDE_ENTERS" = 1 ] \
-       && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ]; then
+       && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ] \
+       && { [ "$COPILOT_TAB" = 0 ] || { copilot_composer_holds_text && ! copilot_busy "$WID" && ! copilot_dialog_open "$WID"; }; }; then
       kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
       CLAUDE_ENTERS=2
       note "no prompt row in window $WID's transcript yet: sent a second lone Enter"
