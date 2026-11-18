@@ -34,8 +34,13 @@ export const stripIsolatedVars = (env = process.env) => {
   return out;
 };
 
-// Child-process environment: stripped base plus the test's own pins.
-export const isolatedEnv = (extra = {}) => ({ ...stripIsolatedVars(), ...extra });
+// Child-process environment: stripped base plus the test's own pins. Copilot
+// sender detection is also disabled unless a test supplies its own fixture.
+export const isolatedEnv = (extra = {}) => ({
+  ...stripIsolatedVars(),
+  COPILOT_STATE_DIR: '/dev/null',
+  ...extra,
+});
 
 // In-process scrub: delete the pins from this process before importing the
 // lib (module constants such as MAILBOX_DIR capture env at import time).

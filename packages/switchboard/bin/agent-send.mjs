@@ -58,6 +58,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
@@ -437,6 +438,45 @@ const senderWindowId = () => {
   return Number.isFinite(n) ? n : null;
 };
 
+const copilotStateDir = () =>
+  process.env.COPILOT_STATE_DIR || path.join(process.env.HOME || os.homedir(), '.copilot', 'session-state');
+
+const parentPidOf = (pid) => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+  } catch {
+    return null;
+  }
+};
+
+// Copilot's shell children do not inherit a session id. Its session lock is
+// the durable identity, and walking ancestors avoids choosing another live
+// Copilot tab that happens to share this cwd.
+const copilotSessionForSender = () => {
+  const seen = new Set();
+  let pid = process.ppid;
+  while (Number.isInteger(pid) && pid > 1 && !seen.has(pid)) {
+    seen.add(pid);
+    let sessions = [];
+    try { sessions = fs.readdirSync(copilotStateDir()); } catch { return null; }
+    for (const sessionId of sessions) {
+      if (fs.existsSync(path.join(copilotStateDir(), sessionId, `inuse.${pid}.lock`))) return sessionId;
+    }
+    pid = parentPidOf(pid);
+  }
+  return null;
+};
+
+const senderAddress = () => {
+  const copilotSession = copilotSessionForSender();
+  if (copilotSession) {
+    const window = senderWindowId();
+    return `copilot:${copilotSession.slice(0, 8)}${window == null ? '' : ` w${window}`}`;
+  }
+  return recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+};
+
 const main = (argv) => {
   process.title = 'agent-send';
   let to = null;
@@ -582,7 +622,7 @@ const main = (argv) => {
       const b = displaced.beacon;
       appendMessage({
         to: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }),
-        from: recipientKey({ cwd: process.cwd(), sessionId }),
+        from: senderAddress(),
         priority: 'now',
         text: `role ${claimRoleName} was taken over by window ${wid ?? '(unknown)'} (session ${sessionId}); mail addressed to role:${claimRoleName} no longer reaches you`,
       });
@@ -723,7 +763,7 @@ const main = (argv) => {
     // started is not one). Best-effort: a failed record never fails the send.
     if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
       try {
-        recordTypedDelivery({ to: typedKey, from: recipientKey({ cwd: process.cwd(), sessionId: senderSessionId }), priority, text, topic });
+        recordTypedDelivery({ to: typedKey, from: senderAddress(), priority, text, topic });
       } catch {
         // see above
       }
@@ -797,7 +837,7 @@ const main = (argv) => {
     // --no-wait only writes a mailbox row: never type, never wait on a proof.
     if (noWait) {
       if (queueKey == null) die(`${why}; --no-wait only queues, there is no mailbox to queue in, so nothing was sent and nothing is queued`);
-      const nrow = appendMessage({ to: queueKey, from: recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null }), priority, text, topic });
+      const nrow = appendMessage({ to: queueKey, from: senderAddress(), priority, text, topic });
       verdict(
         `agent-send: queued for ${to} (${why}), delivered at its next prompt (id ${nrow.id}; exit 3: pending, do not resend; --cancel --id ${nrow.id} withdraws)\n`,
         `agent-send: ${why}; --no-wait: queued ${nrow.id} for ${queueKey} in ${mailboxPath(queueKey)}, nothing typed (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${nrow.id})\n`,
@@ -809,7 +849,7 @@ const main = (argv) => {
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
     const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null, when = 'at its next prompt') => {
       if (queueKey == null) return false;
-      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const from = senderAddress();
       const qrow = appendMessage({ to: queueKey, from, priority, text, topic });
       verdict(
         `agent-send: queued for ${to}${detail ? ` (${detail})` : ''}, ${whenDelivered(kittyStatus, when, proofWhy)} (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
@@ -908,7 +948,7 @@ const main = (argv) => {
     }
     // A poller with no composer has nothing to type into, live or not: queue.
     if ((e?.code === 'mailbox-idle' || e?.code === 'mailbox-stale') && e.mailboxOnly === true && e.key != null) {
-      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const from = senderAddress();
       const qrow = appendMessage({ to: e.key, from, priority, text, topic });
       verdict(
         `agent-send: queued for ${to} (mailbox-only seat, nothing to type into), delivered at its next poll (id ${qrow.id}; exit 3: pending, do not resend; --cancel --id ${qrow.id} withdraws)\n`,
@@ -963,7 +1003,7 @@ const main = (argv) => {
 
   dupCheck(recipient.key);
   if (recipient.queuedForRole) {
-    const qfrom = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+    const qfrom = senderAddress();
     const qrow = appendMessage({ to: recipient.key, from: qfrom, priority, text, topic });
     process.stderr.write(`agent-send: queued for role ${recipient.role}; no live holder${recipient.holderSessionId ? ` (last holder ${recipient.holderSessionId} is gone)` : ''}. Row ${qrow.id} in ${mailboxPath(recipient.key)}; the next session that claims the role receives it (exit 3: not delivered yet, do not resend; withdraw with --cancel --id ${qrow.id})\n`);
     noticeUnreadRole(recipient.role, qrow.id, qfrom);
@@ -975,7 +1015,7 @@ const main = (argv) => {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
   }
-  const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+  const from = senderAddress();
   const row = appendMessage({ to: recipient.key, from, priority, text, topic });
   const mbox = mailboxPath(recipient.key);
   trace(`agent-send: queued ${row.id} for ${recipient.key} in ${mbox}; withdraw with --cancel --id ${row.id}\n`);
