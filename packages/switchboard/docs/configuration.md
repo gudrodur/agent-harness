@@ -37,3 +37,19 @@ Every variable, its default, and what reads it — taken from the code, not from
 The ledger of launched tabs is `$XDG_RUNTIME_DIR/opencode-tab-launched.<uid>`; a ledger left under its former name `omp-tab-launched.<uid>` is moved to the new name on first use.
 
 Timers, for orientation: presence beacons go stale after 20 minutes (`PRESENCE_STALE_MS`, never restated), or at once when the beacon carries a writer pid that is dead (`isLiveBeacon` in `lib/presence.mjs`, which the mailbox readers import); the sender waits at most `AGENT_SEND_BUSY_WAIT_S` (15 s, inside a 30 s `AGENT_SEND_BUDGET_S` for the whole send) for an ack from a busy recipient and 5 s from one whose window title shows it idle (`AGENT_SEND_IDLE_WAIT_S`; `--deadline N` always wins; unbounded for `--queue`, whose sender reads the recipient's window title every 2 s and types the row in once the window has shown idle for `AGENT_SEND_IDLE_WAIT_S` without the row being taken; a busy target acks only at its next tool boundary, and a kitty fallback under `--now` would discard the tool result it was waiting for); the queued terminal waiter heartbeats every 5 min and never times out unless `--deadline` caps it.
+## Copilot CLI
+
+Copilot CLI 1.0.114 does not provide a hook that runs between prompts or when
+an external mailbox row arrives. Install the status-line beacon with:
+
+```sh
+copilot config statusLine.type command && \
+copilot config statusLine.command "node $PWD/hooks/copilot/presence.mjs" && \
+copilot config statusLine.refreshInterval 5
+```
+
+The beacon keeps the Copilot kitty window addressable, but intentionally does
+not mark it as a mailbox consumer. `agent-send.mjs` therefore uses the
+existing kitty-send typing fallback; an idle Copilot session receives the
+message as its next prompt. Copilot cannot acknowledge mailbox rows itself
+until it gains a prompt/turn hook.
