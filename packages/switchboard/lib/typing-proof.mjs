@@ -32,8 +32,10 @@ export const DIALOG = 'dialog';
 //     `waiting` is a permission prompt or question and `blocked` a stuck turn,
 //     both the DIALOG kind; an unknown or missing status proves nothing);
 //   - the screen must be readable and carry no dialog footer;
-//   - the composer box, found by its top and bottom rule, must be empty. A fresh
-//     session's placeholder hint reads as text: not typed.
+//   - the composer box, found by its top and bottom rule, must be empty of
+//     everything but faint text (a prompt suggestion or a hint drawn faint is
+//     not typed input; see "screen attributes" below). A hint at normal
+//     intensity, or a paste or image chip however drawn, reads as text: not typed.
 // Mode `dialog` (--now, --stop and every send that does not claim idleness)
 // asks only the dialog question; a busy mid-turn seat stays allowed there, and
 // the composer is not read (--now needs no empty-composer proof).
@@ -94,34 +96,155 @@ export const windowIsBusy = (win) => {
   return titleShowsBusy(win.title);
 };
 
-// The composer box of a screen, found by BOTH rules (see below): `{ rows }` is
-// the box content with the prompt mark stripped, `{ error }` says why the box
-// could not be found. Shared by the typing proof and by `--mode composer`.
-const composerBox = (lines) => {
-  const bottom = lines.findLastIndex((l) => RULE_RE.test(l));
-  if (bottom < 0) return { error: 'no composer box on the screen (no closing rule)' };
-  const at = lines.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
-  if (at < 1 || !TOP_RULE_RE.test(lines[at - 1])) return { error: 'no composer box on the screen (no prompt line under a top rule)' };
-  return { rows: [lines[at].replace(/^[❯>]/, ''), ...lines.slice(at + 1, bottom)] };
+// ---- screen attributes: faint text is not typed input -----------------------
+//
+// When a turn ends Claude Code puts a prompt suggestion in the composer, drawn
+// faint (SGR 2). A plain `get-text` cannot tell it from a draft, so an idle seat
+// showing one refused every typed delivery. The screen is therefore read with
+// `--ansi`, and inside the composer box characters drawn faint are dropped.
+// This is a guard (a false "empty" types into a human's draft), so it fails
+// closed at every step:
+//   - only SGR 2 makes text faint; colour, however grey, never does. SGR 0, 1
+//     and 22 end it (1 too, although a terminal may draw bold and faint at
+//     once: reading less as faint is the safe side);
+//   - the state starts normal on every line, so a run left open at the end of
+//     one line never covers the next;
+//   - the arguments of an extended colour (`38;5;n`, `38;2;r;g;b`) are skipped,
+//     so the 2 in `38;2;…` is never read as faint;
+//   - any escape this parser does not know (a CSI other than SGR, a malformed or
+//     unterminated sequence, a stray control character) marks the line
+//     unparsed, and an unparsed line in the box makes the box unreadable;
+//   - when kitty refuses the `--ansi` option the plain read is used, in which
+//     nothing is faint: the behaviour before attributes were read, which refuses.
+// Outside the box nothing is dropped: the rules, the prompt line and the dialog
+// footers are matched on the full visible text, faint characters included.
+const CSI_RE = /^\x1b\[([0-?]*)([ -/]*)([@-~])/;
+// OSC (kitty emits OSC 8 hyperlinks), terminated by BEL or ST.
+const OSC_RE = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/;
+// A control character other than tab, C1 included: never part of a parsed line.
+const CONTROL_RE = /[\x00-\x08\x0a-\x1f\x7f-\x9f]/;
+// Best effort for an unparsed line, used only to locate rules and footers.
+const ANY_ESC_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b.?|[\x00-\x08\x0a-\x1f\x7f-\x9f]/g;
+
+// The faint state after one SGR parameter list, or null when the list holds a
+// parameter this parser does not read for certain.
+const sgrFaint = (params, faint) => {
+  const ps = params === '' ? ['0'] : params.split(';');
+  for (let k = 0; k < ps.length; k += 1) {
+    const p = ps[k];
+    if (p.includes(':')) {
+      // Sub-parameter form: extended colours and underline styles only.
+      if (!/^(?:38|48|58|4)(?::\d*)+$/.test(p)) return null;
+      continue;
+    }
+    if (!/^\d*$/.test(p)) return null;
+    const n = p === '' ? 0 : Number(p);
+    if (n === 2) faint = true;
+    else if (n === 0 || n === 1 || n === 22) faint = false;
+    else if (n === 38 || n === 48 || n === 58) {
+      const args = ps[k + 1] === '5' ? 1 : ps[k + 1] === '2' ? 3 : -1;
+      if (args < 0 || !ps.slice(k + 2, k + 2 + args).every((a) => /^\d+$/.test(a)) || ps.length < k + 2 + args) return null;
+      k += 1 + args;
+    }
+  }
+  return faint;
 };
 
-// The visible screen as right-trimmed lines, or null when it cannot be read.
-const readScreenLines = (winId) => {
+// One line of `get-text --ansi`: `text` its visible characters (faint ones
+// included, right-trimmed) and `faint[i]` whether text[i] was drawn faint, or
+// `faint: null` when the line holds an escape this parser does not read.
+const parseScreenLine = (raw) => {
+  const unparsed = () => ({ text: raw.replace(ANY_ESC_RE, '').trimEnd(), faint: null });
+  let text = '';
+  const faint = [];
+  let on = false;
+  for (let i = 0; i < raw.length;) {
+    const c = raw[i];
+    if (c === '\x1b') {
+      const rest = raw.slice(i);
+      const csi = CSI_RE.exec(rest);
+      if (csi != null) {
+        if (csi[3] !== 'm' || csi[2] !== '') return unparsed();
+        const next = sgrFaint(csi[1], on);
+        if (next == null) return unparsed();
+        on = next;
+        i += csi[0].length;
+        continue;
+      }
+      const osc = OSC_RE.exec(rest);
+      if (osc == null) return unparsed();
+      i += osc[0].length;
+      continue;
+    }
+    if (CONTROL_RE.test(c)) return unparsed();
+    text += c;
+    faint.push(on);
+    i += 1;
+  }
+  return { text: text.trimEnd(), faint };
+};
+
+// A line of the plain read: nothing on it is faint.
+const plainLine = (raw) => ({ text: raw.trimEnd(), faint: [] });
+
+// A paste or image chip stands for typed input however it is drawn.
+const CHIP_RE = /\[(?:Pasted text|Image) #\d+/;
+
+// The characters of a parsed line from index `from` on that were not drawn
+// faint. `faint` is indexed by UTF-16 unit, like `text`.
+const solidText = (line, from = 0) => {
+  let out = '';
+  for (let i = from; i < line.text.length; i += 1) if (!line.faint[i]) out += line.text[i];
+  return out;
+};
+
+// The composer box of a screen, found by BOTH rules (see below): `{ rows }` is
+// the box content with the prompt mark stripped and faint characters dropped,
+// `{ chip }` whether a paste or image chip sits in it, `{ error }` says why the
+// box could not be found or read. Shared by the typing proof and by `--mode
+// composer`, so the two never read a composer differently.
+const composerBox = (lines) => {
+  const text = lines.map((l) => l.text);
+  const bottom = text.findLastIndex((l) => RULE_RE.test(l));
+  if (bottom < 0) return { error: 'no composer box on the screen (no closing rule)' };
+  const at = text.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
+  if (at < 1 || !TOP_RULE_RE.test(text[at - 1])) return { error: 'no composer box on the screen (no prompt line under a top rule)' };
+  if (lines.slice(at - 1, bottom + 1).some((l) => l.faint == null)) return { error: 'composer could not be read (an escape sequence the proof does not parse)' };
+  const box = lines.slice(at, bottom);
+  // The prompt mark (`❯` or `>`, one UTF-16 unit) is skipped by position.
+  return { rows: box.map((l, k) => solidText(l, k === 0 ? 1 : 0)), chip: box.some((l) => CHIP_RE.test(l.text)) };
+};
+
+// The visible screen as parsed lines (see parseScreenLine), or null when it
+// cannot be read. `get-text --ansi` first. Only a refusal of `--ansi` itself
+// (its error names the option: a kitty without it) falls back to the plain read
+// as before, in which nothing counts as faint. Any other failure is "could not
+// read", as it always was: a transient read error must never turn into a
+// second, luckier read that types. `--ansi` goes last so the arguments before
+// it keep the positions callers and test stand-ins match on.
+const readScreen = (winId) => {
   const kitty = process.env.AGENT_MAILBOX_KITTY ?? 'kitty';
+  const args = ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'];
   try {
-    return execFileSync(kitty, ['@', 'get-text', '--match', `id:${winId}`, '--extent', 'screen'], { encoding: 'utf-8', timeout: 5000 }).split('\n').map((l) => l.trimEnd());
+    return execFileSync(kitty, [...args, '--ansi'], { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).split('\n').map(parseScreenLine);
+  } catch (e) {
+    if (!/ansi/i.test(String(e?.stderr ?? ''))) return null;
+  }
+  try {
+    return execFileSync(kitty, args, { encoding: 'utf-8', timeout: 5000 }).split('\n').map(plainLine);
   } catch { return null; }
 };
+const dialogOnScreen = (lines) => lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l.text));
 
 // Does the composer still hold `text` (whitespace ignored)? true / false, or
 // null when the box cannot be found, a dialog is open or the screen cannot be read: "could not
 // tell" is never "empty". Used by kitty-send to re-press Enter on a slash
 // command whose trailing \r the composer swallowed.
 export const composerHolds = (winId, text) => {
-  const lines = readScreenLines(winId);
+  const lines = readScreen(winId);
   if (lines == null) return null;
   // A dialog on screen: the next Enter would answer it, so never "holds".
-  if (lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l))) return null;
+  if (dialogOnScreen(lines)) return null;
   const box = composerBox(lines);
   if (box.error != null) return null;
   const want = text.replace(/\s+/g, '');
@@ -148,9 +271,9 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   if (!dialogOnly && slashRefusal != null) return slashRefusal;
   const record = proc != null ? sessionRecordOf(proc) : null;
   if (DIALOG_STATUSES.has(record?.status)) return verdict(DIALOG, `session record status ${record.status}: a permission prompt, question or stuck turn is waiting on the human`);
-  const lines = readScreenLines(winId);
+  const lines = readScreen(winId);
   if (lines == null) return verdict(REFUSED, 'screen could not be read');
-  if (lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l))) return verdict(DIALOG, 'a dialog is open on the screen');
+  if (dialogOnScreen(lines)) return verdict(DIALOG, 'a dialog is open on the screen');
   if (dialogOnly) return verdict(PROVEN);
 
   if (titleShowsBusy(win.title)) return verdict(REFUSED, 'title shows a turn in progress');
@@ -168,7 +291,7 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   if (!composer) return verdict(PROVEN);
   const box = composerBox(lines);
   if (box.error != null) return verdict(REFUSED, box.error);
-  if (box.rows.some((l) => l.trim() !== '')) return verdict(REFUSED, 'composer holds text');
+  if (box.chip || box.rows.some((l) => l.trim() !== '')) return verdict(REFUSED, 'composer holds text');
   return verdict(PROVEN);
 };
 
