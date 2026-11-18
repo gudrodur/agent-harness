@@ -55,12 +55,15 @@ before(async () => {
   const stub = [
     '#!/usr/bin/env bash',
     `events=${JSON.stringify(events)}`,
+    `state=${JSON.stringify(stateDir)}`,
     `ls_json=${JSON.stringify(lsJson)}`,
     'case "$1/$2" in',
     '  @/ls) printf "%s\\n" "$ls_json" ;;',
     '  @/send-text)',
-    '    text="${@: -1}"; text="${text%$' + "'\\r'" + '}"',
-    '    jq -cn --arg text "$text" \'{type:"user.message",data:{content:$text}}\' >> "$events" ;;',
+    '    text="${@: -1}";',
+    '    if [ "$text" = $' + "'\\r'" + ' ]; then echo enter >> "$state/calls"; jq -cn --arg text "$(cat "$state/composer")" \'{type:"user.message",data:{content:$text}}\' >> "$events"; rm -f "$state/composer";',
+    '    elif [[ "$text" == *$' + "'\\r'" + ' ]]; then echo burst >> "$state/calls"; printf "%s" "${text%' + "'\\r'" + '}" > "$state/composer";',
+    '    else echo text >> "$state/calls"; printf "%s" "$text" > "$state/composer"; fi ;;',
     '  @/get-text) printf "%s\\n" "copilot prompt" ;;',
     'esac',
     'exit 0',
@@ -93,6 +96,7 @@ test('a Copilot prompt is proved by its new user.message event', async () => {
   }
   assert.equal(result.code ?? 0, 0, `${result.stdout ?? ''}${result.stderr ?? ''}`);
   assert.match(result.stderr, /proved by Copilot session event/);
+  assert.deepEqual((await fs.readFile(path.join(stateDir, 'calls'), 'utf8')).trim().split('\n'), ['text', 'enter']);
 });
 
 test('same-cwd Copilot sessions use the window process lock, not another live process', async () => {

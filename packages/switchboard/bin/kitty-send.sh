@@ -1007,10 +1007,16 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
-if [ "$CLAUDE_TAB" = 1 ] && [ "$SLASH_SEND" = 0 ]; then
+if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$SLASH_SEND" = 0 ]; then
   kitty @ send-text --match "id:$WID" "$TEXT" 2>/dev/null || true
   sleep 1
-  if ! claude_row_landed; then
+  row_landed=1
+  if [ "$CLAUDE_TAB" = 1 ]; then
+    claude_row_landed || row_landed=0
+  elif [ "$COPILOT_TAB" = 1 ]; then
+    copilot_row_landed || row_landed=0
+  fi
+  if [ "$row_landed" = 0 ]; then
     kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
     CLAUDE_ENTERS=1
   fi
@@ -1052,7 +1058,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # a composer that swallowed the first. An Enter in an empty Claude Code
     # composer does nothing, so a first \r that did submit, with its row
     # slow to land (UserPromptSubmit hooks run first), costs nothing.
-    if [ "$CLAUDE_ENTERS" = 1 ] \
+    if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$CLAUDE_ENTERS" = 1 ] \
        && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ]; then
       kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
       CLAUDE_ENTERS=2
