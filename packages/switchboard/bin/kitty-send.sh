@@ -702,10 +702,13 @@ if [ "$CANCEL" = 1 ]; then
 fi
 
 [ -n "$(win_pid "$WID")" ] || die "window $WID is not alive (try --list)" 1
+window_pid=$(win_pid "$WID")
 window_title=$(win_title "$WID")
 copilot_pid=""
-if copilot_pid=$(copilot_process_for_window "$(win_pid "$WID")"); then
+if copilot_pid=$(copilot_process_for_window "$window_pid"); then
   :
+elif copilot_dir=$(copilot_session_for_pid "$window_pid"); then
+  die "Copilot window $WID has no live Copilot process; refusing to type into the shell left behind" 1
 elif printf '%s' "$window_title" | grep -qi 'copilot'; then
   die "Copilot window $WID has no live Copilot process; refusing to type into the shell left behind" 1
 fi
@@ -1134,7 +1137,8 @@ if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$SLASH_SEND" = 0 ]
   elif [ "$COPILOT_TAB" = 1 ]; then
     copilot_row_landed || row_landed=0
   fi
-  if [ "$row_landed" = 0 ] && ! { [ "$CLAUDE_TAB" = 1 ] && [ "$WAS_BUSY_BEFORE_SEND" = 1 ]; }; then
+  if [ "$row_landed" = 0 ] \
+     && { [ "$CLAUDE_TAB" = 0 ] || [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; then
     kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
     CLAUDE_ENTERS=1
   fi
@@ -1176,7 +1180,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # a composer that swallowed the first. An Enter in an empty Claude Code
     # composer does nothing, so a first \r that did submit, with its row
     # slow to land (UserPromptSubmit hooks run first), costs nothing.
-    if { [ "$COPILOT_TAB" = 1 ] || { [ "$CLAUDE_TAB" = 1 ] && [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; } \
+    if { [ "$COPILOT_TAB" = 1 ] || { [ "$CLAUDE_TAB" = 1 ] && { [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; }; } \
        && [ "$CLAUDE_ENTERS" = 1 ] \
        && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ] \
        && { [ "$COPILOT_TAB" = 0 ] || { copilot_composer_holds_text && ! copilot_busy "$WID" && ! copilot_dialog_open "$WID"; }; }; then

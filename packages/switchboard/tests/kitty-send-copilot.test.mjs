@@ -208,6 +208,8 @@ test('a Copilot permission dialog refuses the send', async () => {
 test('a dead Copilot presence pid refuses typing into the shell left behind', async () => {
   await fs.writeFile(presence, JSON.stringify({ beacons: [] }));
   await fs.writeFile(path.join(stateDir, 'no-copilot'), '');
+  await fs.writeFile(path.join(stateDir, 'title'), 'bash');
+  await fs.rm(path.join(stateDir, 'calls'), { force: true });
   let result;
   try {
     result = await run(SCRIPT, ['--to', WID, '--text', MSG], {
@@ -226,4 +228,5 @@ test('a dead Copilot presence pid refuses typing into the shell left behind', as
   }
   assert.equal(result.code, 1);
   assert.match(result.stderr, /no live Copilot process/);
+  assert.equal(await fs.readFile(path.join(stateDir, 'calls'), 'utf8').catch(() => ''), '');
 });

@@ -179,6 +179,14 @@ test('a Claude tab whose session status is busy is refused (exit 7), nothing sen
   assert.deepEqual(await calls(), []);
 });
 
+test('a busy Claude tab accepts --now and still gets the submission Enter', async () => {
+  await reset('enter', 'busy');
+  const r = await runScript(['--to', WID, '--text', MSG, '--now', '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.match(r.err, /proved by transcript row/);
+  assert.deepEqual(await calls(), ['text', 'enter']);
+});
+
 // `waiting` (a permission prompt, a question, a plan approval) and `blocked`
 // are a DIALOG, not a busy turn: keystrokes are hotkeys in the widget and the
 // \r selects the highlighted option. Refused with exit 4 in every mode, --now
