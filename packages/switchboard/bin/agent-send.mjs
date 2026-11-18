@@ -251,7 +251,7 @@ const KITTY_RC_DOWN = 12;
 // 16: a slash command typed into a Claude Code tab still sits in its composer
 // after kitty-send's bounded extra Enters. Typed, not proven submitted, like 10.
 const KITTY_TYPED_UNSUBMITTED = 16;
-const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN]);
+const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN, 17]);
 // kitty-send's 11 and 12 are not agent-send's own 11 (--claim-role refused) and
 // 12 (--release-role refused): both leave as 1, "nothing sent".
 const exitOfKittySend = (st) => (st === 11 || st === KITTY_RC_DOWN ? 1 : (st ?? 1));
@@ -269,6 +269,7 @@ const KITTY_NOTHING_REASON = {
   9: 'composer holds unsubmitted text',
   11: 'screen unreadable or composer not clear',
   12: 'kitty remote control not answering',
+  17: 'Copilot seat with no live Copilot in its foreground',
 };
 // When a re-queued row is delivered. A seat stuck on a selection dialog (4) or
 // holding a draft or an unclear composer (9, 11) takes nothing at a tool call:
@@ -714,11 +715,12 @@ const main = (argv) => {
     // waiter that could keep a pipe open, so it keeps the inherited stderr.
     const holdErr = !verbose && !args.includes('--queue');
     const r = spawnSync(kittySend(), args, { stdio: ['inherit', 'inherit', holdErr ? 'pipe' : 'inherit'] });
-    // Exit 1 and 11 carry kitty-send's own reason (no window, composer not clear),
-    // which the generic re-queue line cannot know: always pass it on.
+    // Exit 1, 11 and 17 carry kitty-send's own reason (no window, composer not
+    // clear, a Copilot seat whose Copilot is gone), which the generic re-queue
+    // line cannot know: always pass it on.
     // On 0, 3, 8 and 10 agent-send prints its own single verdict line (below), so
     // kitty-send's chatter is trace; a failure it cannot explain still shows.
-    if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11) && !(r.status === 7 && midTurnHeld)) process.stderr.write(r.stderr);
+    if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11 && r.status !== 17) && !(r.status === 7 && midTurnHeld)) process.stderr.write(r.stderr);
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
     if (typedKey != null && [0, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !args.includes('--queue')) {
