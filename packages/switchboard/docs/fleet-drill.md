@@ -18,13 +18,15 @@ node bin/fleet-drill.mjs --states idle,busy
 
 A state passes on an ack row with a `deliveredAs` value; when `agent-send` exited non-zero it passes only if a consumer (`prompt`, `tool`, `stop`, `mcp`) wrote the label, not the `typed` fallback.
 
-The seat is started with a short confining brief: one action per message, and never approve a permission itself. The `busy` setup approves only a prompt whose screen shows its own `sleep` command; the `permission` state approves nothing. The seat window is always closed at the end, on a pass, a failure or a signal.
+The seat is started with a short confining brief: one action per message, and never approve a permission itself. The `busy` setup approves only a prompt whose screen shows its own timer command; the `permission` state approves only its own `touch` prompt, after the send, and only when the dialog (below the echo of its setup prompt) proposes exactly that command: the whole command block, so a multi-line proposal that merely starts with it is refused. One dialog layout is read: the command framed by exactly two dashed `╌` rules, recorded from a real seat in `tests/fixtures/permission-dialog-ruled.txt`. Any other layout is refused, never guessed at (an unruled dialog cannot tell a second command line from a description, and approving the wrong one runs it): the state fails with "layout not recorded", and the dialog is closed with Escape. A dialog in the known layout whose command does not match (a command wrapped on a narrow window, another proposal) fails with "dialog was on screen but its command did not match". Any failed state presses Escape afterwards, so an open dialog cannot cascade. `FLEET_DRILL_DUMP_DIR` keeps every dialog screen the drill sees (mode 0600), to record a new layout; a dump can hold private paths and names, so scrub it before it goes into a fixture and never commit one as is. Refusing the prompt with Escape is no way to test delivery: the seat goes idle and the queued message stays unacked until the seat's next prompt (a gap in agent-send's dialog queue, deliberately not asserted here). The seat window is always closed at the end, on a pass, a failure or a signal.
 
 The seat starts with the drill's private store pinned (`AGENT_SWITCHBOARD_DIR` and `AGENT_SWITCHBOARD_DB`): `claude-tab.sh` passes any such pin on to the seat with kitty's `--env`, because kitty starts the tab from its own environment, not the launcher's.
 
 The first turn of the seat reads its brief, and that turn counts against `FLEET_DRILL_READY_S` (180 s by default, ample for a haiku greeting; raise it on a slow machine).
 
-The `merge` state needs the seat's tools (`git`, `gh`, a push) pre-allowed in its Claude Code settings; the drill approves nothing there, so an unapproved tool call leaves it waiting until the limit and the state fails.
+The `merge` state needs the seat's tools pre-allowed, as the drill approves nothing there: it writes `Bash(git:*)` and `Bash(gh:*)` into the seat's folder settings when `merge` runs (a push is a `git` command). Any other tool call prompts and leaves the state waiting until the limit.
+
+The drill writes `.claude/settings.local.json` into the throwaway folder, pinning `defaultMode: default` and `ask` rules for its own `touch fleet-drill-*` command and for the busy timer's `node -e` command (so that prompt is certain, and the drill approves it itself), and nothing allowed, and, only when the `merge` state runs, `Bash(git:*)` and `Bash(gh:*)`: a seat otherwise inherits the user's mode, and in bypass mode no permission prompt can ever appear.
 
 The seat needs the mailbox hooks in its Claude Code config, and the throwaway folder must be one Claude Code trusts (`FLEET_DRILL_CWD_ROOT` points it at a folder under a trusted tree).
 
@@ -34,8 +36,8 @@ The seat needs the mailbox hooks in its Claude Code config, and the throwaway fo
 |---|---|---|---|
 | `idle` | 30 s | seat at the prompt | an ack row with `deliveredAs` |
 | `slash` | 30 s | seat at the prompt; the message is `/context` | the ack row, and the composer is empty and the seat idle afterwards (the command was submitted, not left typed) |
-| `busy` | 90 s | the seat runs `sleep 45` in a tool call | the ack row is not `typed`, and the sleep's tool result is still in the transcript when the turn ends (nothing in flight was discarded) |
-| `permission` | 60 s | the seat shows a permission prompt | an ack row; the prompt is then refused |
+| `busy` | 90 s | the seat runs a 45 s `node -e setTimeout` tool call (not `sleep`: Claude Code refuses a foreground sleep) | the ack row is not `typed`, and the timer's tool result is still in the transcript when the turn ends (nothing in flight was discarded) |
+| `permission` | 60 s | the seat shows a permission prompt for the drill's own `touch fleet-drill-*` | the send is queued (exit 3, not typed into the prompt); after the drill approves its own prompt the ack row arrives within the limit |
 | `merge` | 300 s | the seat opens a PR in the sandbox repo | `gh pr view --json state` says `MERGED` after the merge command ran |
 | `closed` | 30 s | the seat window is closed with `kitty @ close-window` (`claude-tab.sh --close` refuses a `--seat` window) | the send exits 1 with "no kitty window with id", and no ack row exists |
 

@@ -1,0 +1,16 @@
+{{ECHO}}
+
+● Bash({{CMD}})
+  ⎿  Waiting…
+
+────────────────────────────────────────
+ Bash command
+
+ {{CMD}}
+ Create an empty file with touch
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

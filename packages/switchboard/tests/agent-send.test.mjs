@@ -385,6 +385,22 @@ test('a fallback that sends nothing puts the message back in the mailbox ', asyn
   assert.equal(left[0].text, 'bare steer');
 });
 
+// Exit 17 (a Copilot seat whose Copilot is gone) sends nothing too: the row
+// goes back for when Copilot is running in the window again.
+test('a fallback refused at a Copilot seat with no live Copilot (exit 17) puts the message back', async () => {
+  fs.rmSync(fallbackArgv, { force: true });
+  fs.rmSync(mailboxPath(KEY_S1, { dir: mboxDir }), { force: true });
+  const { code, stderr } = await runSend(
+    ['--to', '991001', '--text', 'copilot gone steer', '--deadline', '1'],
+    childEnv({ CLAUDE_CODE_SESSION_ID: 's2', AGENT_SEND_KITTY_SEND: realRulesStub, KITTY_SEND_STUB_EXIT: '17' }),
+  );
+  assert.equal(code, 3);
+  assert.match(stderr, /kitty-send exit 17 sent nothing \(Copilot seat with no live Copilot in its foreground\) for \S+; re-queued as \S+/);
+  const left = readUnacked(KEY_S1, { dir: mboxDir });
+  assert.equal(left.length, 1);
+  assert.equal(left[0].text, 'copilot gone steer');
+});
+
 // Exit 9 (a dirty composer holding a chip kitty-send does not own) also sends
 // nothing, so the withdrawn row must go back too, or the message is lost.
 test('a fallback refused at a dirty composer (exit 9) puts the message back in the mailbox', async () => {
@@ -2150,7 +2166,24 @@ test('--queue types into an idle seat whose last reply asks a question', async (
 
 test('--queue never types onto a multi-line draft whose first line is empty', () => notTyped('multi-line draft', { screen: ['● Done.', '─'.repeat(40), '❯ ', '  second line of a draft', '─'.repeat(40), '  ? for shortcuts'].join('\n') }, /not typed.*composer holds text/));
 test('--queue never types onto a draft with several lines under an empty first line', () => notTyped('multi-line draft', { screen: ['● Done.', '─'.repeat(40), '❯', '', '  third line of a draft', '─'.repeat(40)].join('\n') }, /not typed.*composer holds text/));
-test('--queue never types text that starts with "/": it would run as a command in the seat', () => notTyped('slash text', { text: '/compact now' }, /not typed.*starts with "\/"/));
+// The quiet default printed nothing while a --queue send waited on a refused
+// proof, so a caller reading the last line never learned why it hung. It now
+// says `held: <reason>` once per distinct reason, never once per poll.
+test('a quiet --queue wait says held: <reason> once per distinct reason', async () => {
+  const DRAFT = ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n');
+  const { killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: '✳ claude: idle seat', screen: DRAFT, killAfterMs: 7000, envExtra: { AGENT_SEND_VERBOSE: '' },
+    whileRunning: async () => { await sleep(4500); fs.writeFileSync(path.join(binDir, 'queue-screen'), QUESTION_DIALOG); },
+  });
+  assert.equal(killed, true, stderr);
+  assert.equal(argv, null, `nothing may be typed: ${argv}`);
+  const held = stderr.split('\n').filter((l) => /held: /.test(l));
+  assert.equal(held.length, 2, `one line per distinct reason: ${stderr}`);
+  assert.match(held[0], /held: composer holds text/);
+  assert.match(held[1], /held: a dialog is open on the screen/);
+  assert.doesNotMatch(stderr, /not typed into window/, 'the verbose trace line stays out of the quiet default');
+});
+test('--queue never types text that starts with "/": it would run as a command in the seat',() => notTyped('slash text', { text: '/compact now' }, /not typed.*starts with "\/"/));
 test('after the proof, kitty-send waits only a few seconds for idle, so a seat woken since is not typed into late', async () => {
   const { argv, stderr } = await queueSend(['--to', '991001', '--queue'], { title: 'claude: idle seat' });
   assert.ok(argv, stderr);

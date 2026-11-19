@@ -98,6 +98,7 @@ export const presenceRowToBeacon = (r) => ({
   branch: r.branch,
   repo: r.repo,
   ...(r.mailbox != null ? { mailbox: !!r.mailbox } : {}),
+  ...(r.mailbox_only ? { mailboxOnly: true } : {}),
   ...(r.window_id != null ? { windowId: r.window_id } : {}),
   ...(r.pid != null ? { pid: r.pid } : {}),
   ...(r.last_work_tick != null ? { lastWorkTick: r.last_work_tick } : {}),
@@ -118,6 +119,7 @@ export const recordPresence = ({
   repo = null,
   sessionId = null,
   mailbox = null,
+  mailboxOnly = null,
   windowId = null,
   pid = null,
   work = false,
@@ -138,21 +140,23 @@ export const recordPresence = ({
         if (me) {
           store.run(
             `UPDATE presence_beacons SET last_tick = ?, branch = ?, cwd = ?,
-              home_cwd = COALESCE(?, home_cwd), mailbox = COALESCE(?, mailbox), window_id = COALESCE(?, window_id),
+              home_cwd = COALESCE(?, home_cwd), mailbox = COALESCE(?, mailbox), mailbox_only = COALESCE(?, mailbox_only),
+              window_id = COALESCE(?, window_id),
               pid = COALESCE(?, pid), last_work_tick = COALESCE(?, last_work_tick)
              WHERE session_id = ? AND cwd = ?`,
             iso, branch, cwd,
-            homeCwd, mailbox == null ? null : mailbox ? 1 : 0, windowId == null ? null : Number(windowId),
+            homeCwd, mailbox == null ? null : mailbox ? 1 : 0, mailboxOnly == null ? null : mailboxOnly ? 1 : 0,
+            windowId == null ? null : Number(windowId),
             pid == null ? null : Number(pid), work ? iso : null,
             sid, me.cwd,
           );
         } else {
           store.run(
             `INSERT INTO presence_beacons
-               (session_id, cwd, home_cwd, branch, repo, mailbox, window_id, pid, last_work_tick, last_work_cwd, first_tick, last_tick)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (session_id, cwd, home_cwd, branch, repo, mailbox, mailbox_only, window_id, pid, last_work_tick, last_work_cwd, first_tick, last_tick)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             sid, cwd, homeCwd, branch, repo,
-            mailbox == null ? null : mailbox ? 1 : 0, windowId == null ? null : Number(windowId),
+            mailbox == null ? null : mailbox ? 1 : 0, mailboxOnly == null ? null : mailboxOnly ? 1 : 0, windowId == null ? null : Number(windowId),
             pid == null ? null : Number(pid), work ? iso : null, work ? cwd : inherited,
             iso, iso,
           );
@@ -187,6 +191,8 @@ export const recordPresence = ({
     // an omitted argument must never clear an existing true, since callers
     // that do not know about the flag run every turn.
     if (mailbox !== null) me.mailbox = mailbox;
+    // Poller with no composer to type into: same merge-only rule.
+    if (mailboxOnly !== null) me.mailboxOnly = mailboxOnly;
     // Kitty window id (the mailbox hook sets it from KITTY_WINDOW_ID) so a
     // window id resolves to the session living in that window, not to
     // whoever shares its cwd. Same merge-only rule: never clear once set.
@@ -195,7 +201,7 @@ export const recordPresence = ({
     if (work) me.lastWorkTick = iso;
     if (me.lastWorkCwd == null && inherited !== null) me.lastWorkCwd = inherited;
   } else {
-    kept.push({ sessionId, cwd, ...(homeCwd ? { homeCwd } : {}), branch, repo, ...(mailbox !== null ? { mailbox } : {}), ...(windowId !== null ? { windowId } : {}), ...(pid !== null ? { pid } : {}), ...(work ? { lastWorkTick: iso } : {}), ...(work ? { lastWorkCwd: cwd } : inherited !== null ? { lastWorkCwd: inherited } : {}), firstTick: iso, lastTick: iso });
+    kept.push({ sessionId, cwd, ...(homeCwd ? { homeCwd } : {}), branch, repo, ...(mailbox !== null ? { mailbox } : {}), ...(mailboxOnly ? { mailboxOnly: true } : {}), ...(windowId !== null ? { windowId } : {}), ...(pid !== null ? { pid } : {}), ...(work ? { lastWorkTick: iso } : {}), ...(work ? { lastWorkCwd: cwd } : inherited !== null ? { lastWorkCwd: inherited } : {}), firstTick: iso, lastTick: iso });
   }
   // Work moves the session's latest work tree on every beacon it owns.
   if (work) for (const b of kept) if ((b.sessionId ?? 'anon') === (sessionId ?? 'anon')) b.lastWorkCwd = cwd;

@@ -145,7 +145,10 @@ const onPath = (word) => {
   return onPathMemo.get(key);
 };
 const GIT_READ = new Set(["log", "show", "diff", "rev-parse", "ls-files", "grep", "cat-file", "status", "rev-list", "for-each-ref"]);
-const NODE_SCRIPT_RE = /^(?:\.\/)?scripts\/[\w./-]+\.mjs$/;
+const NODE_SCRIPT_RE = /^(?:~\/\.[\w-]+\/|\.\/)?scripts\/[\w./-]+\.mjs$/;
+const NODE_TEST_FLAG_RE = /^--test-(?:reporter|name-pattern|timeout|concurrency|shard|force-exit)(?:=.*)?$/;
+const NODE_TEST_FILE_RE = /^(?:~\/\.[\w-]+\/|\.\/)?(?:scripts|skills|templates)\/[\w./-]+\.mjs$/;
+const REDIRECT_WORD_RE = /^(?:\d*>&?\d*|>>?|<)$/;
 
 // Output redirected anywhere but /dev/null (or a descriptor, `2>&1`) writes a file.
 const writesFile = (segment) => {
@@ -161,8 +164,20 @@ const writesFile = (segment) => {
 const badArgs = (word, args) => {
   const has = (re) => args.some((a) => re.test(a));
   switch (word) {
-    case "node":
+    case "node": {
+      if (args[0] === "--test") {
+        for (const a of args.slice(1)) {
+          if (REDIRECT_WORD_RE.test(a)) continue;
+          if (a.startsWith("-")) {
+            if (!NODE_TEST_FLAG_RE.test(a)) return `node --test flag not allowed: ${a}`;
+          } else {
+            if (!NODE_TEST_FILE_RE.test(a)) return `node --test only runs test files under scripts/, skills/, templates/: ${a}`;
+          }
+        }
+        return null;
+      }
       return !args[0] || !NODE_SCRIPT_RE.test(args[0]) ? "node only runs scripts/<name>.mjs" : null;
+    }
     case "git": {
       // `-c`, `--config-env` and `--exec-path` run code only as git's own options,
       // before the subcommand; after it, `-c` is the subcommand's (grep counts).

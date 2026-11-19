@@ -68,6 +68,11 @@
 #   12 kitty remote control did not answer (a timeout or an unreachable
 #      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
 #      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
+#   17 the window is a Copilot seat (bound while its Copilot was alive) but no
+#      live Copilot process is in its foreground — NOTHING WAS SENT. The
+#      Copilot exited or was killed and a shell is left behind; typing there
+#      would run the message as a shell command. Restart Copilot in the window
+#      or send elsewhere.
 #
 # A composer echo is NOT delivery. An agent TUI's
 # composer collapses a send-text burst into a `[Pasted text #N +M lines]` chip
@@ -177,6 +182,9 @@ STATE_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tab-state.sh"
 # writes no jsonl and no Claude transcript, only rows in SQLite. Same seam name
 # tab-state.sh and opencode-tab.sh use.
 OPENCODE_TAB_DB="${OPENCODE_TAB_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+# Copilot CLI writes one events.jsonl per session and holds an inuse lock named
+# for its long-lived process. The state directory is overrideable for tests.
+COPILOT_STATE_DIR="${COPILOT_STATE_DIR:-$HOME/.copilot/session-state}"
 # One of busy|idle|exited|unknown. Anything the state script cannot answer —
 # no such window, no session file, unreadable file — is unknown, never fatal
 # here: the spinner fallback below is weaker but still available.
@@ -284,11 +292,87 @@ win_pid() {
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null \
     | head -1
 }
-
 win_title() {
   kitty @ ls 2>/dev/null \
     | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .title // ""' 2>/dev/null \
     | head -1
+}
+copilot_session_for_pid() {
+  local window_pid="$1" session_dir lock lock_pid proc_cmdline
+  for session_dir in "$COPILOT_STATE_DIR"/*; do
+    [ -d "$session_dir" ] || continue
+    lock="$session_dir/inuse.${window_pid}.lock"
+    [ -f "$lock" ] && { printf '%s' "$session_dir"; return 0; }
+  done
+  # kitty may report the launcher pid while the lock belongs to Copilot's child.
+  # Only descendants can belong to this window; cwd alone is ambiguous.
+  for session_dir in "$COPILOT_STATE_DIR"/*; do
+    [ -d "$session_dir" ] || continue
+    for lock in "$session_dir"/inuse.*.lock; do
+      [ -f "$lock" ] || continue
+      lock_pid="${lock##*/inuse.}"; lock_pid="${lock_pid%.lock}"
+      case "$lock_pid" in ''|*[!0-9]*) continue ;; esac
+      pid="$lock_pid"; descendant=0
+      while [ "$pid" -gt 1 ] 2>/dev/null; do
+        [ "$pid" = "$window_pid" ] && { descendant=1; break; }
+        pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || printf '1')
+      done
+      [ "$descendant" = 1 ] || continue
+      proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || true)
+      printf '%s' "$proc_cmdline" | grep -q 'copilot' || continue
+      printf '%s' "$session_dir"
+      return 0
+    done
+  done
+  return 1
+}
+# The live Copilot in the window's foreground, by kitty's own report of the
+# foreground process group: argv[0] is the copilot binary, or a node/bun
+# launcher whose script is the copilot bin or package. A process that only
+# NAMES copilot (an editor or pager on copilot.log) is not one. The title and
+# the session lock say nothing about liveness: a shell left behind resets the
+# title, a clean exit removes the lock, a kill leaves it under a dead pid.
+copilot_process_for_window() {
+  local window_pid="$1" pid
+  [ -n "$window_pid" ] || return 1
+  for pid in $(kitty @ ls 2>/dev/null | jq -r --argjson id "$WID" '
+    def base: tostring | split("/") | last;
+    .[].tabs[].windows[] | select(.id == $id) |
+    (.foreground_processes // [])[] |
+    select((.cmdline // []) as $c |
+      (($c[0] // "") | base) == "copilot"
+      or ((($c[0] // "") | base | test("^(node|nodejs|bun)$"))
+          and ((($c[1] // "") | base) == "copilot"
+               or (($c[1] // "") | test("/@github/copilot/"))))) |
+    .pid // empty
+  ' 2>/dev/null || true); do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    printf '%s' "$pid"
+    return 0
+  done
+  return 1
+}
+# THE COPILOT SEAT BINDING. Once a window is known to run Copilot it stays a
+# Copilot seat for the window's life, so a send after Copilot is gone is
+# refused instead of typed into the shell left behind (exit 17). Two writers:
+# the status-line hook (hooks/copilot/presence.mjs, every refresh while
+# Copilot lives) and this script, whenever it finds a live Copilot in the
+# window's foreground. The file holds the window's own pid as kitty reports
+# it, so a window id reused by a later kitty instance (another pid) is not
+# taken for the old seat. It survives presence pruning and lives in the
+# runtime dir, gone at logout like the windows themselves.
+copilot_binding_file() { printf '%s/copilot-window-%s' "$QUEUE_DIR" "$1"; }
+copilot_bind_window() { # $1 = window id, $2 = window pid
+  local f
+  f=$(copilot_binding_file "$1")
+  [ "$(cat "$f" 2>/dev/null)" = "$2" ] && return 0
+  mkdir -p "$QUEUE_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$2" >"$f.$$" 2>/dev/null && mv -f "$f.$$" "$f" 2>/dev/null || rm -f "$f.$$" 2>/dev/null
+  return 0
+}
+copilot_window_bound() { # $1 = window id, $2 = window pid
+  [ -n "$2" ] && [ "$(cat "$(copilot_binding_file "$1")" 2>/dev/null)" = "$2" ]
 }
 win_created() {
   kitty @ ls 2>/dev/null \
@@ -418,6 +502,7 @@ steerable_screen() {
 # the wait loop and the exit-7 precheck cannot drift apart.
 target_busy() {  # $1 = title, $2 = window id
   steerable_screen "$2" && return 1
+  copilot_busy "$2" && return 0
   case "$(tab_state_of "$2")" in
     busy) return 0 ;;
     idle) return 1 ;;
@@ -429,10 +514,48 @@ target_busy() {  # $1 = title, $2 = window id
   title_busy "$1" || return 1
   return 0
 }
+copilot_event_state() {
+  local events="$1"
+  [ -r "$events" ] || return 1
+  jq -s -r '
+    reduce .[] as $e ({busy:false, dialog:false};
+      if $e.type == "assistant.turn_start" then .busy = true
+      elif $e.type == "assistant.turn_end" then .busy = false
+      elif $e.type == "permission.requested" then .dialog = true
+      elif $e.type == "permission.completed" then .dialog = false
+      else .
+      end
+    ) | "\(.busy|if . then 1 else 0 end) \(.dialog|if . then 1 else 0 end)"
+  ' "$events" 2>/dev/null
+}
+copilot_events_for_window() {
+  local dir
+  dir=$(copilot_session_for_pid "$(win_pid "$1")") || return 1
+  [ -r "$dir/events.jsonl" ] || return 1
+  printf '%s' "$dir/events.jsonl"
+}
+copilot_busy() {
+  local events state
+  events="${COPILOT_EVENTS:-}"
+  [ -n "$events" ] || events=$(copilot_events_for_window "$1") || return 1
+  state=$(copilot_event_state "$events") || return 1
+  [ "${state%% *}" = 1 ]
+}
+copilot_dialog_open() {
+  local events state
+  events="${COPILOT_EVENTS:-}"
+  [ -n "$events" ] || events=$(copilot_events_for_window "$1") || return 1
+  state=$(copilot_event_state "$events") || return 1
+  [ "${state##* }" = 1 ]
+}
 # dialog_open with the read failure turned into the exit this script promises:
 # nothing sent, exit 11 (distinct from exit 3, which means sent but unproven).
 dialog_or_die() {
   local rc=0
+  if copilot_dialog_open "$1"; then
+    PROOF_REASON="Copilot permission dialog is open"
+    return 0
+  fi
   dialog_open "$1" || rc=$?
   case "$rc" in
     0|1) return "$rc" ;;
@@ -579,6 +702,25 @@ if [ "$CANCEL" = 1 ]; then
 fi
 
 [ -n "$(win_pid "$WID")" ] || die "window $WID is not alive (try --list)" 1
+window_pid=$(win_pid "$WID")
+window_title=$(win_title "$WID")
+# A Copilot seat is delivered to only while a live Copilot is in the window's
+# foreground. Any sign that the window is or was a Copilot seat (the binding,
+# a lock named by the window pid, the title) without one is exit 17: the
+# message would otherwise run as a command in the shell left behind.
+copilot_pid=""
+if copilot_pid=$(copilot_process_for_window "$window_pid"); then
+  copilot_bind_window "$WID" "$window_pid"
+elif copilot_window_bound "$WID" "$window_pid" \
+  || copilot_session_for_pid "$window_pid" >/dev/null \
+  || printf '%s' "$window_title" | grep -qi 'copilot'; then
+  die "window $WID is a Copilot seat with no live Copilot process in its foreground; refusing to type into the shell left behind (nothing was sent)" 17
+fi
+COPILOT_TAB=0; COPILOT_EVENTS=""; COPILOT_HEAD=""
+if [ -n "$copilot_pid" ] && copilot_dir=$(copilot_session_for_pid "$copilot_pid"); then
+  COPILOT_EVENTS="$copilot_dir/events.jsonl"
+  [ -r "$COPILOT_EVENTS" ] && COPILOT_TAB=1
+fi
 
 # --queue: hand the wait to a detached waiter and return. The waiter is this
 # same script (run with KITTY_SEND_WAIT_UNBOUNDED=1 when no bound was given,
@@ -698,7 +840,10 @@ if title_busy "$title" && steerable_screen "$WID"; then
   note "window $WID has a spinner in its title but its screen matches --idle-when: treating it as parked, not working."
 fi
 if target_busy "$title" "$WID"; then
-  if [ "$NOW" = 1 ]; then
+  if copilot_busy "$WID"; then
+    note "window $WID is a busy Copilot turn; Copilot sends are held until its turn ends"
+    die "refusing to send into a busy Copilot target (nothing was sent) — pass --wait-idle N or --queue to hold" 7
+  elif [ "$NOW" = 1 ]; then
     note "window $WID is mid-turn (spinner in the title); --now given, so the message lands in its steering queue"
     note "and the tool call in flight will have its result DISCARDED."
   else
@@ -711,7 +856,13 @@ fi
 # Idle at the send or not: the busy-transition proof in the poll
 # loop below only means something when the target was idle here. A target that
 # was already busy (--now) being busy afterwards proves nothing about this send.
-if title_busy "$title" || [ "$(tab_state_of "$WID")" = busy ] || [ "$(claude_state_of "$WID")" = busy ]; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
+if [ "$COPILOT_TAB" = 1 ]; then
+  if copilot_busy "$WID"; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
+elif title_busy "$title" || [ "$(tab_state_of "$WID")" = busy ] || [ "$(claude_state_of "$WID")" = busy ]; then
+  WAS_BUSY_BEFORE_SEND=1
+else
+  WAS_BUSY_BEFORE_SEND=0
+fi
 
 # Proof by state: where the tab's session file is linked, the post-send poll
 # waits for a NEW role:user message row past this line count, and the echo
@@ -750,6 +901,15 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID"); then
     esac
   fi
 fi
+if [ "$CLAUDE_TAB" = 0 ] && [ "$OPENCODE_TAB" = 0 ] \
+  && copilot_dir=$(copilot_session_for_pid "$(win_pid "$WID")"); then
+  COPILOT_EVENTS="$copilot_dir/events.jsonl"
+  if [ -r "$COPILOT_EVENTS" ]; then
+    TAB_LINES=$(wc -l <"$COPILOT_EVENTS")
+    COPILOT_HEAD=$(printf '%s' "$TEXT" | cut -c1-40 | tr -d '[:space:]')
+    STATE_KNOWN=1; COPILOT_TAB=1
+  fi
+fi
 # Does a user row past the pre-send count carry this message's start? The
 # text match is what keeps a tool result or a task notification (also
 # type:user rows) from counting as this send.
@@ -782,6 +942,17 @@ for (const r of rows) {
 }
 process.exit(1);
 JS
+}
+copilot_row_landed() {
+  tail -n "+$((TAB_LINES + 1))" "$COPILOT_EVENTS" 2>/dev/null \
+    | jq -r 'select(.type == "user.message") | .data.content // empty' 2>/dev/null \
+    | tr -d '[:space:]' | grep -qF -- "$COPILOT_HEAD"
+}
+copilot_composer_holds_text() {
+  [ "$COPILOT_TAB" = 1 ] || return 1
+  local screen
+  screen=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]') || return 1
+  [ -n "$COPILOT_HEAD" ] && printf '%s' "$screen" | grep -qF -- "$COPILOT_HEAD"
 }
 # Seconds after the first lone \r before the second (see THE send). A test
 # seam as well.
@@ -961,10 +1132,17 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
-if [ "$CLAUDE_TAB" = 1 ] && [ "$SLASH_SEND" = 0 ]; then
+if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$SLASH_SEND" = 0 ]; then
   kitty @ send-text --match "id:$WID" "$TEXT" 2>/dev/null || true
   sleep 1
-  if ! claude_row_landed; then
+  row_landed=1
+  if [ "$CLAUDE_TAB" = 1 ]; then
+    claude_row_landed || row_landed=0
+  elif [ "$COPILOT_TAB" = 1 ]; then
+    copilot_row_landed || row_landed=0
+  fi
+  if [ "$row_landed" = 0 ] \
+     && { [ "$CLAUDE_TAB" = 0 ] || [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; then
     kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
     CLAUDE_ENTERS=1
   fi
@@ -997,13 +1175,19 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       if claude_row_landed; then
         confirmed=1; where="proved by transcript row (a new user prompt with this text reached the Claude Code session's transcript)"; break
       fi
+    elif [ "$COPILOT_TAB" = 1 ]; then
+      if copilot_row_landed; then
+        confirmed=1; where="proved by Copilot session event (a new user.message reached events.jsonl)"; break
+      fi
     fi
     # One more lone \r, at most, if the transcript still shows no prompt:
     # a composer that swallowed the first. An Enter in an empty Claude Code
     # composer does nothing, so a first \r that did submit, with its row
     # slow to land (UserPromptSubmit hooks run first), costs nothing.
-    if [ "$CLAUDE_ENTERS" = 1 ] \
-       && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ]; then
+    if { [ "$COPILOT_TAB" = 1 ] || { [ "$CLAUDE_TAB" = 1 ] && { [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; }; } \
+       && [ "$CLAUDE_ENTERS" = 1 ] \
+       && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ] \
+       && { [ "$COPILOT_TAB" = 0 ] || { copilot_composer_holds_text && ! copilot_busy "$WID" && ! copilot_dialog_open "$WID"; }; }; then
       kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
       CLAUDE_ENTERS=2
       note "no prompt row in window $WID's transcript yet: sent a second lone Enter"
@@ -1173,6 +1357,9 @@ if [ "$CLAUDE_TAB" = 1 ]; then
   note "The text may still sit in its composer: look at the window before sending again."
 elif [ "$OPENCODE_TAB" = 1 ]; then
   note "sent to window $WID (an OpenCode tab), but no new type:user row with this text reached session $OPENCODE_SID's rows in opencode.db within ${TIMEOUT}s (was seq $TAB_LINES)."
+  note "The text may still sit in its composer: look at the window before sending again."
+elif [ "$COPILOT_TAB" = 1 ]; then
+  note "sent to window $WID (a Copilot tab), but no new user.message with this text reached $COPILOT_EVENTS within ${TIMEOUT}s (was $TAB_LINES lines)."
   note "The text may still sit in its composer: look at the window before sending again."
 else
   note "sent to window $WID but could not observe it on screen within ${TIMEOUT}s."

@@ -27,7 +27,11 @@ const WID = 7001;
 const transcript = P('transcript.jsonl');
 const seat = () => {
   const s = readJson('seat.json', { open: false, status: 'idle' });
-  if (s.status === 'busy' && Date.now() >= s.busyUntil) s.status = 'idle';
+  if (s.status === 'busy' && Date.now() >= s.busyUntil) {
+    // The model composing a tool call reads busy, then the dialog appears.
+    if (s.thenDialog) Object.assign(s, { status: 'waiting', approveTo: true, screen: s.thenDialog, thenDialog: null });
+    else s.status = 'idle';
+  }
   return s;
 };
 const save = (s) => writeJson('seat.json', s);
@@ -55,6 +59,9 @@ if (role === 'claude-tab') {
     process.exit(0);
   }
   writeJson('launch-env.json', { dir: process.env.AGENT_SWITCHBOARD_DIR, db: process.env.AGENT_SWITCHBOARD_DB });
+  // What the real seat would read from its folder before its first turn.
+  const settings = path.join(flag('--cwd') ?? '', '.claude', 'settings.local.json');
+  if (fs.existsSync(settings)) fs.copyFileSync(settings, P('launch-settings.json'));
   needValue('--title', '--model', '--cwd', '--brief');
   if (args.includes('--brief') && !fs.existsSync(flag('--brief'))) process.exit(1);
   fs.writeFileSync(transcript, '');
@@ -76,10 +83,30 @@ if (role === 'claude-tab') {
     const s = seat();
     const keys = args[args.length - 1];
     if (s.status === 'waiting' && keys === '\\r' && s.approveTo) save({ ...s, status: 'busy', busyUntil: Date.now() + 4000, screen: '' });
-    else if (s.status === 'waiting') save({ ...s, status: 'idle' });
+    else if (s.status === 'waiting') {
+      save({ ...s, status: 'idle', screen: '' });
+      // The real agent-send queues a message while a selection dialog is open. A
+      // hook delivers it when the turn goes on (the prompt was approved); after an
+      // Escape the seat sits idle and the queued row is never delivered (measured).
+      if (keys !== '\\r') process.exit(0);
+      const rows = readJson('store.json', []);
+      const pending = rows.filter((r) => r.id && r.queuedForDialog && !rows.some((a) => a.ack === r.id));
+      for (const m of pending) rows.push({ recipient: 'k', ack: m.id, ts: new Date().toISOString(), deliveredAs: process.env.STUB_QUEUED_ACK ?? 'tool' });
+      writeJson('store.json', rows);
+    }
   }
 } else if (role === 'tab-state') {
   const s = seat();
+  // The real script takes a numeric window id: anything else is a usage error
+  // (exit 1, "usage" on stderr), and an id kitty does not list is "no such window".
+  if (!/^\d+$/.test(args[0] ?? '')) {
+    process.stderr.write('tab-state: usage: tab-state.sh <window-id> [--json] [--watch [--interval=S]]\n');
+    process.exit(1);
+  }
+  if (Number(args[0]) !== WID && s.open) {
+    process.stderr.write(`tab-state: no such window: ${args[0]} (try opencode-tab.sh --list)\n`);
+    process.exit(1);
+  }
   if (process.env.STUB_TABSTATE_GARBAGE && !s.open) {
     process.stderr.write('tab-state: boom\n');
     process.exit(2);
@@ -105,17 +132,45 @@ if (role === 'claude-tab') {
   needValue('--to', '--text', '--wait-idle');
   const text = flag('--text') ?? '';
   const s = seat();
-  const m = /DRILL-\$\(\(6\*7\)\)-(\w+)/.exec(text);
+  const m = /DRILL-'\+6\*7\+'-(\w+)/.exec(text);
+  // What Claude Code draws: the echo of the typed prompt (it names the command
+  // whatever the model then proposes), then the dialog with its own command.
+  const echo = `❯ ${text}`;
+  // The dialog screens are fixtures: ruled is a real seat's screen (captured by a live
+  // drill run, command and echo replaced by placeholders); the others (unruled,
+  // unruled-bare, threerules, solid) are layouts the drill must refuse. STUB_LAYOUT picks one.
+  const fixture = fs.readFileSync(new URL(`../fixtures/permission-dialog-${process.env.STUB_LAYOUT || 'ruled'}.txt`, import.meta.url), 'utf8');
+  // STUB_WRAP: a narrow window wraps the command over two lines inside the dialog
+  // (STUB_WRAP=node: only the busy timer's, so a later state is unaffected).
+  const wrapIt = (c) => process.env.STUB_WRAP === '1' || (process.env.STUB_WRAP === 'node' && c.startsWith('node'));
+  const wrap = (c) => (wrapIt(c) ? `${c.slice(0, 20)}\n ${c.slice(20)}` : c);
+  const dialog = (proposed) => fixture
+    .replace(/^ \{\{CMD\}\}$/m, () => ` ${wrap(proposed)}`)
+    .replaceAll('{{ECHO}}', () => echo)
+    .replaceAll('{{RULE}}', () => (proposed.startsWith('touch') ? 'Bash(touch fleet-drill-*)' : 'Bash(node -e:*)'))
+    .replaceAll('{{CMD}}', () => proposed);
+  const other = process.env.STUB_DIALOG_OTHER; // a different dialog under the same echo
   if (m && process.env.STUB_NEVER_BUSY) {
     // typed, nothing happens
-  } else if (m && process.env.STUB_PERMISSION_FIRST) {
-    save({ ...s, status: 'waiting', approveTo: true, screen: process.env.STUB_SCREEN_MISMATCH ? 'rm -rf /' : `Bash(sleep 45 && echo DRILL-$((6*7))-${m[1]})` });
-    fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (m) {
-    save({ ...s, status: 'busy', busyUntil: Date.now() + 4000 });
+    // Default permission mode: the timer prompts, approval (Enter) starts it.
+    const nodeCmd = /node -e .*/.exec(text)[0];
+    const screen = process.env.STUB_SCREEN_MISMATCH ? dialog('rm -rf /')
+      : process.env.STUB_SCREEN_MULTI ? dialog(`${nodeCmd}\n  rm -rf x`) : dialog(nodeCmd);
+    if (process.env.STUB_AUTORUN) {
+      // No dialog: the tool_use row is in the transcript, the call has no result yet.
+      save({ ...s, status: 'busy', busyUntil: Date.now() + 1500, screen: '' });
+      fs.writeFileSync(transcript, `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', input: { command: `DRILL-${m[1]}` } }] } })}\n`);
+      process.exit(0);
+    }
+    if (process.env.STUB_THINK) save({ ...s, status: 'busy', busyUntil: Date.now() + 1500, thenDialog: screen, screen: '' });
+    else save({ ...s, status: 'waiting', approveTo: true, screen });
     fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: `DRILL-42-${m[1]}` }] } })}\n`);
   } else if (text.includes('touch ')) {
-    save({ ...s, status: 'waiting' });
+    const cmd = /touch \S+/.exec(text)[0];
+    const screen = other === 'write' ? `${echo}\n● Write(notes.txt)\n Create file\n  notes.txt\n Do you want to create notes.txt?\n ❯ 1. Yes\n   2. No\n`
+      : dialog(other === 'bash' ? `${cmd} && rm -rf x` : other === 'multi' ? `${cmd}\n  rm -rf x` : cmd);
+    save({ ...s, status: 'waiting', approveTo: false, screen: process.env.STUB_PERM_NO_SCREEN ? `${echo}\n` : screen });
   } else if (text.includes('gh pr create')) {
     writeJson('pr.json', { open: true });
   }
@@ -128,6 +183,15 @@ if (role === 'claude-tab') {
   }
   needValue('--to', '--text');
   let deliveredAs = 'prompt';
+  if (s.status === 'waiting') {
+    // Not typed into the dialog: queued, exit 3 (pending), acked after the dialog clears.
+    const id = randomUUID();
+    const rows = readJson('store.json', []);
+    rows.push({ recipient: 'k', id, ts: new Date().toISOString(), from: 'x', to: 'k', priority: 'now', text, queuedForDialog: true });
+    writeJson('store.json', rows);
+    process.stderr.write(`agent-send: queued for ${WID} (not typed: selection dialog open), delivered only after the seat clears its selection dialog (id ${id}; exit 3: pending, do not resend)\n`);
+    process.exit(3);
+  }
   if (s.status === 'busy') {
     deliveredAs = broken.has('busy') ? 'typed' : 'tool';
     if (broken.has('busy')) fs.writeFileSync(transcript, '');

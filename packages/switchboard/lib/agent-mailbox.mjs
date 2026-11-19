@@ -307,6 +307,8 @@ const recipientOf = (beacon, windowId) => ({
   windowId,
   beaconWindowId: beacon.windowId != null ? Number(beacon.windowId) : null,
   hasConsumer: beacon.mailbox === true,
+  // A poller with no composer: agent-send queues for it and never types.
+  mailboxOnly: beacon.mailboxOnly === true,
 });
 
 const resErr = (code, msg) => Object.assign(new Error(msg), { code });
@@ -342,7 +344,7 @@ const resolveWindowRecipient = (beacons, win, sender, { presenceFile: file } = {
     const idle = aged.length > 0 ? idleBeacons({ presenceFile: file, wins: [win] }).filter((b) => aged.some((a) => a.sessionId === b.sessionId && a.cwd === b.cwd)) : [];
     if (idle.length > 0) {
       const b = idle[0];
-      throw Object.assign(resErr('mailbox-idle', `window ${win.id} is an idle seat (${idleMinutes(b)}m)`), { idleMinutes: idleMinutes(b), sessionId: b.sessionId ?? null, key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) });
+      throw Object.assign(resErr('mailbox-idle', `window ${win.id} is an idle seat (${idleMinutes(b)}m)`), { idleMinutes: idleMinutes(b), sessionId: b.sessionId ?? null, mailboxOnly: b.mailboxOnly === true, key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) });
     }
     if (aged.length > 0) {
       const tick = Date.parse(aged[0].lastTick);
@@ -350,7 +352,7 @@ const resolveWindowRecipient = (beacons, win, sender, { presenceFile: file } = {
       throw Object.assign(resErr(
         'mailbox-stale',
         `window ${win.id} has no LIVE presence beacon (last tick ${aged[0].lastTick ?? 'unknown'}, ${ago} — past the presence window); its consumer is parked or gone`,
-      ), { key: recipientKey({ cwd: aged[0].cwd, sessionId: aged[0].sessionId }) });
+      ), { mailboxOnly: aged[0].mailboxOnly === true, key: recipientKey({ cwd: aged[0].cwd, sessionId: aged[0].sessionId }) });
     }
     throw resErr('mailbox-no-beacon', `window ${win.id} has no live presence beacon`);
   }
