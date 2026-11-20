@@ -49,10 +49,13 @@ before(async () => {
       'case "$1/$2" in',
       '  @/ls) [ -f "$state/nokitty" ] && exit 1',
       '        [ -f "$state/hang" ] && exec /usr/bin/sleep 30',
+      // ls-fail-after-launch holds how many reads after the launch get no
+      // answer (a kitty that stops answering once the tab is open).
+      '        if [ -f "$state/ls-fail-after-launch" ] && [ -f "$state/launched" ]; then n=$(cat "$state/ls-after-count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$state/ls-after-count"; [ "$n" -le "$(cat "$state/ls-fail-after-launch")" ] && { echo "Error: Failed to connect: Connection refused" >&2; exit 1; }; fi',
       '        if [ -f "$state/ls-fail-after" ]; then n=$(cat "$state/ls-count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$state/ls-count"; [ "$n" -gt "$(cat "$state/ls-fail-after")" ] && exit 1; fi',
       '        [ -f "$state/ls.json" ] && { cat "$state/ls.json"; exit 0; }',
       '        if [ -f "$state/gone" ]; then echo "[]"; else printf \'%s\\n\' ' + JSON.stringify(lsJson) + '; fi ;;',
-      '  @/launch) printf \'%s\\n\' "$@" > "$state/launch-args"',
+      '  @/launch) printf \'%s\\n\' "$@" > "$state/launch-args"; : > "$state/launched"',
       '            [ -f "$state/session.jsonl" ] && mkdir -p "$tdir" && cp "$state/session.jsonl" "$tdir/new-session.jsonl"',
       '            [ -x "$state/on-launch" ] && "$state/on-launch"',
       '            echo ' + WID + ' ;;',
@@ -75,7 +78,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  for (const f of ['launch-args', 'closed', 'ls.json', 'ls-fail-after', 'ls-count', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'on-sleep', 'hang', 'kitty-calls', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'closed', 'ls.json', 'ls-fail-after', 'ls-count', 'ls-fail-after-launch', 'ls-after-count', 'launched', 'claim-calls-launch', 'fake-claim-launch.mjs', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'on-sleep', 'hang', 'kitty-calls', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { recursive: true, force: true });
   }
   await fs.rm(projects, { recursive: true, force: true });
@@ -767,7 +770,7 @@ test('--retire when kitty ls fails after the first check refuses, and does not r
   const claims = path.join(stateDir, 'claim-calls-ls');
   await fs.writeFile(path.join(stateDir, 'fake-claim-ls.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(claims)}, 'x\\n');\n`);
   const r = await retire(OTHER_WID, { SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'fake-claim-ls.mjs') });
-  assert.notEqual(r.code, 0, r.err);
+  assert.equal(r.code, 2, `no answer from kitty is exit 2, as an open breaker is: ${r.err}`);
   assert.equal(await exists('claim-calls-ls'), false, 'the live seat\'s claims are not released');
   assert.equal((await handoverRows())[0].retired_at, null);
   assert.equal(await exists('closed'), false);
@@ -1067,4 +1070,65 @@ test('--retire while the kitty ls breaker is open exits 2 at once and asks kitty
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---- kitty stops answering after the launch ----
+// A tab that opened is never "no remote control": exit 2 tells the caller to
+// run the brief headless, and the brief would run twice. The pid read is
+// retried; a kitty that still does not answer leaves the tab open with its row
+// (pid `?`) and its claim, and exits 3 (launched, not proven).
+const launchClaimStub = async () => {
+  const p = path.join(stateDir, 'fake-claim-launch.mjs');
+  await fs.writeFile(p, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(path.join(stateDir, 'claim-calls-launch'))}, process.argv.slice(2).join(' ') + '\\n');\n`);
+  return p;
+};
+const launchClaims = () => fs.readFile(path.join(stateDir, 'claim-calls-launch'), 'utf8').catch(() => '');
+
+test('kitty that stops answering after the launch: never exit 2; the row and the claim are written and the exit is 3', async () => {
+  await session('claude-opus-5-5');
+  await fs.writeFile(path.join(stateDir, 'ls-fail-after-launch'), '1000');
+  const r = await tab(full(), { SWITCHBOARD_TASK_CLAIM: await launchClaimStub() });
+  assert.notEqual(r.code, 2, `exit 2 sends the caller to a headless rerun: ${r.err}`);
+  assert.equal(r.code, 3, r.err);
+  assert.match(r.out, new RegExp(`^WINDOW_ID=${WID}$`, 'm'));
+  assert.match(r.err, /do not relaunch|not fall back/i);
+  assert.match(await stateRows(), new RegExp(`^${WID} \\? @test-launcher claude: test$`, 'm'));
+  assert.match(await launchClaims(), new RegExp(`^--claim ${cwd} brief:brief\\.md --owner kitty:${WID}`, 'm'));
+  assert.equal(await exists('closed'), false, 'the tab is left open');
+});
+
+test('kitty that misses one read after the launch: the read is retried and the start is proven', async () => {
+  await session('claude-opus-5-5');
+  await fs.writeFile(path.join(stateDir, 'ls-fail-after-launch'), '1');
+  const r = await tab(full());
+  assert.equal(r.code, 0, r.err);
+  assert.match(await stateRows(), new RegExp(`^${WID} ${process.pid} @test-launcher claude: test$`, 'm'));
+});
+
+// The slot decides whether a launch may run, so it reads kitty fresh: a list
+// cached before another seat's tab opened would show the slot free. The suite
+// runs with the cache off (TTL 0); this test turns it on.
+test('the slot check reads fresh: a cached list from before the holder opened does not free the slot', async () => {
+  const ttl = { AGENT_KITTY_LS_TTL_MS: '60000' };
+  await fs.writeFile(path.join(stateDir, 'ls.json'), `[{"tabs":[{"windows":[{"id":${WID},"pid":${process.pid}}]}]}]`);
+  const KITTY_LS = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+  const primed = await run('node', [KITTY_LS, '--fresh'], { env: tabEnv({ ...ttl, AGENT_MAILBOX_KITTY: 'kitty' }) });
+  assert.doesNotMatch(primed.stdout, new RegExp(String(OTHER_WID)), 'the cache holds a list without the holder');
+  await fs.rm(path.join(stateDir, 'ls.json'));
+  await holdSlot();
+  await session('claude-opus-5-5');
+  const r = await tab(full(), ttl);
+  assert.equal(r.code, 1, r.err);
+  assert.match(r.err, /holds the package-tab slot/);
+  assert.equal(await exists('launch-args'), false);
+});
+
+// A row whose pid kitty never gave (`?`) still holds the slot while its
+// window is live.
+test('a row with an unknown pid holds the slot while its window is live', async () => {
+  await fs.writeFile(path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid), `${OTHER_WID} ? @other-seat opencode: other\n`);
+  await session('claude-opus-5-5');
+  const r = await tab(full());
+  assert.equal(r.code, 1, r.err);
+  assert.match(r.err, /holds the package-tab slot/);
 });

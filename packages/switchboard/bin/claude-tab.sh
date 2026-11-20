@@ -79,7 +79,9 @@
 #   1  precondition failed (bad args, relative path, missing file, untrusted
 #      folder, slot held)
 #   2  kitty remote control unavailable — CALLER MUST FALL BACK TO HEADLESS AND SAY SO
-#   3  launched but not proven (window id still printed; a wrong model closes it);
+#   3  launched but not proven (window id still printed; a wrong model closes it;
+#      kitty that stops answering after the launch leaves it open, recorded and
+#      claimed: never relaunch or fall back to headless on 3);
 #      with --reseat, also: the role was not claimed or the old window not retired
 #
 # --retire exit codes (0 retired, or the window was already gone; 1 and 2 as above):
@@ -261,46 +263,12 @@ LAUNCHER="${CLAUDE_SESSION_ID:-${KITTY_WINDOW_ID:-}}"
 LAUNCHER=$(printf '%s' "$LAUNCHER" | tr -d ' \t\r\n@')
 [ -n "$LAUNCHER" ] || LAUNCHER=unknown
 
-# The one-slot gate, the same test as opencode-tab.sh's: a live
-# row (id present, pid unchanged) whose launcher is not this one and which is
-# not the caller's own window.
-# True when PID is this script or one of its ancestors: the seat that runs
-# this launcher inside a tab another seat launched sees that tab's row with the
-# other seat as launcher. Walks /proc ppid links.
-is_ancestor() { # $1 = pid
-  local p=$$ n=0
-  while [ -n "$p" ] && [ "$p" != 0 ] && [ $n -lt 64 ]; do
-    [ "$p" = "$1" ] && return 0
-    p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
-    n=$((n + 1))
-  done
-  return 1
-}
-slot_holders() {
-  [ -s "$STATE" ] || return 0
-  local row_launcher now
-  # One listing for every row, ids and pids together. A listing kitty did not
-  # give cannot clear the slot, so the launch stops (exit 2) rather than guess.
-  live_pid_map || die "kitty remote control did not answer the window list (${KITTY_LS_MSG:-no answer}); cannot tell who holds the slot — nothing launched." 2
-  set -f
-  while IFS= read -r row; do
-    # shellcheck disable=SC2086: unquoted split is the parse; globbing off via set -f.
-    set -- $row
-    case "${3:-}" in @*) row_launcher=${3#@} ;; *) row_launcher=unknown ;; esac
-    now=$(live_pid_of "${1:-}") || continue
-    [ "$now" = "${2:-}" ] || continue
-    [ "$row_launcher" = "$LAUNCHER" ] && continue
-    [ -n "${KITTY_WINDOW_ID:-}" ] && [ "$1" = "$KITTY_WINDOW_ID" ] && continue
-    is_ancestor "${2:-}" && continue
-    printf '%s (launcher %s) ' "$1" "$row_launcher"
-  done < "$STATE"
-  set +f
-}
+# The one-slot gate: tab_ledger_slot_holders (lib/tab-ledger.sh).
 BRIEF_REF="brief:$(basename "${BRIEF:-none}")"
 if [ "$SEAT" = 1 ]; then
   : # a seat is not a package tab: it neither checks nor holds the slot
 elif [ -z "$SLOT_OVERRIDE" ]; then
-  holders=$(slot_holders)
+  holders=$(tab_ledger_slot_holders)
   [ -z "$holders" ] || die "another seat holds the package-tab slot — nothing launched.
         live tab(s): $holders
         Re-run with --slot-override \"<reason>\" only when the overlap is deliberate."
@@ -361,19 +329,17 @@ esac
 [ -n "${AGENT_SWITCHBOARD_DB:-}" ] && ENV_ARGS+=(--env "AGENT_SWITCHBOARD_DB=$AGENT_SWITCHBOARD_DB")
 WID=$(kitty @ launch --type=tab --tab-title "$TITLE" --cwd "$CWD" "${ENV_ARGS[@]}" "${ARGS[@]}" 2>/dev/null)
 case "$WID" in *[!0-9]*|"") die "kitty @ launch did not return a plain window id, got: '$WID'" ;; esac
-# One fresh read: the window's pid, then every later liveness check is a
-# signal 0 to it, which asks kitty nothing. A kitty that did not answer here is
-# not a window that exited.
-WRC=0; WPID=$(win_pid "$WID" fresh) || WRC=$?
+# The window's pid, read fresh and retried while kitty does not answer; every
+# later liveness check is a signal 0 to it, which asks kitty nothing. A kitty
+# that never answered here is not a window that exited, and the tab is open.
+WRC=0; tab_ledger_launch_pid "$WID" || WRC=$?
+WPID=$LAUNCH_PID
 if [ "$WRC" = 2 ]; then
-  printf 'WINDOW_ID=%s\n' "$WID"
-  die "kitty remote control did not answer after launching window $WID (${KITTY_LS_MSG:-no answer}); its start is not proven — look at the window" 2
+  [ "$SEAT" = 1 ] || tab_ledger_add_row "$WID" "?" "$TITLE" "$CWD" "$BRIEF_REF"
+  tab_ledger_die_unproven "$WID"
 fi
 [ "$WRC" = 0 ] && [ -n "$WPID" ] || { printf 'WINDOW_ID=%s\n' "$WID"; die "window $WID exited immediately after launch — run $CLAUDE_BIN --model $MODEL by hand" 3; }
-if [ "$SEAT" = 0 ]; then
-  printf '%s %s @%s %s\n' "$WID" "$WPID" "$LAUNCHER" "$TITLE" >> "$STATE"
-  claim_cli --claim "$CWD" "$BRIEF_REF" --owner "kitty:$WID" --note "$TITLE" >/dev/null 2>&1 || true
-fi
+[ "$SEAT" = 1 ] || tab_ledger_add_row "$WID" "$WPID" "$TITLE" "$CWD" "$BRIEF_REF"
 note "launched window $WID (pid $WPID) — $TITLE"
 
 close_it() {

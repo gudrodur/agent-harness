@@ -464,3 +464,25 @@ test('a cached listing never decides the send: a window that is now a Copilot se
     await fs.rm(s.dir, { recursive: true, force: true });
   }
 });
+
+// The idle wait types into the target on the pass that finds it idle, so that
+// read is fresh: a listing cached while the seat was idle, up to the TTL old,
+// would show idle a seat that has just started a turn. The suite runs with the
+// cache off (TTL 0); this test turns it on and primes it with an idle title.
+test('the idle wait reads fresh: a cached idle listing does not let it type into a busy seat', async () => {
+  const s = await slowStub();
+  try {
+    const env = s.env({ AGENT_KITTY_LS_TTL_MS: '600000' });
+    await fs.writeFile(path.join(s.dir, 'title'), 'claude: idle seat');
+    const kls = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+    const primed = await run(process.execPath, [kls, '--fresh'], { env: isolatedEnv({ ...env, AGENT_MAILBOX_KITTY: 'kitty' }) });
+    assert.match(primed.stdout, /claude: idle seat/);
+    await fs.writeFile(path.join(s.dir, 'title'), 'π ⠹ claude: working');
+    const { code, err } = await runIn(env, ['--to', WID, '--text', 'hi', '--wait-idle', '2']);
+    assert.equal(code, 5, err);
+    assert.match(err, /nothing was sent/);
+    assert.equal((await s.read('calls')).split('\n').filter((l) => l.startsWith('@ send-text')).length, 0, 'nothing typed');
+  } finally {
+    await fs.rm(s.dir, { recursive: true, force: true });
+  }
+});

@@ -40,8 +40,9 @@ _kitty_ls() {
   local out rc=0
   KITTY_LS_REASON=""; KITTY_LS_RETRY_MS=0; KITTY_LS_MSG=""; KITTY_LS_DETAIL=""
   if command -v node >/dev/null 2>&1 && [ -f "$_KITTY_LS_MJS" ]; then
-    # Success prints nothing on stderr, so the merge is the JSON alone.
-    out=$(AGENT_MAILBOX_KITTY=kitty node "$_KITTY_LS_MJS" "$@" 2>&1) || rc=$?
+    # stdout alone: the JSON, or the failure lines (the CLI writes them on
+    # both streams). A node warning on stderr must not reach the parse.
+    out=$(AGENT_MAILBOX_KITTY=kitty node "$_KITTY_LS_MJS" "$@" 2>/dev/null) || rc=$?
   elif out=$(kitty @ ls 2>&1); then
     if ! printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1; then
       case " $* " in
@@ -143,7 +144,8 @@ live_pid_of() { # $1 = window id
 }
 
 # The wait curve: attempt 0 sleeps BACKOFF_BASE_MS, each later one twice the
-# last up to BACKOFF_CAP_MS, each spread +/-20% so pollers drift apart.
+# last up to BACKOFF_CAP_MS, each spread +/-20% so pollers drift apart and
+# never past BACKOFF_CAP_MS.
 # backoff_sleep [min_ms] [max_ms]: never less than min_ms (a breaker's
 # retry_in_ms), never more than max_ms (what is left of a bounded wait).
 # BACKOFF_SLEPT_MS is what it slept.
@@ -155,6 +157,7 @@ backoff_sleep() {
   for ((i = 0; i < BACKOFF_ATTEMPT && ms < cap; i++)); do ms=$((ms * 2)); done
   [ "$ms" -le "$cap" ] || ms=$cap
   ms=$(( ms * (800 + RANDOM % 401) / 1000 ))
+  [ "$ms" -le "$cap" ] || ms=$cap
   [ "$ms" -ge "$min" ] || ms=$min
   if [ -n "$max" ] && [ "$ms" -gt "$max" ]; then ms=$max; fi
   [ "$ms" -gt 0 ] || ms=0

@@ -11,12 +11,15 @@
 //            AGENT_KITTY_LS_TTL_MS (default 2000) by a read that allows it.
 //            A `fresh` read only takes an answer whose call started after
 //            the read was asked for. "Gone" is never served from the cache.
-//   lock     an O_EXCL file holding `{pid, at}`: at most one `ls` in flight.
-//            A holder that died, or one older than the timeout plus 2 s, is
-//            moved aside to `.stale.<pid>`; a waiter gives up after the
-//            timeout plus 1 s and reports `busy`.
+//   lock     an O_EXCL file holding `{pid, at}`: at most one full `ls` in
+//            flight, and at most one narrow `ls` per window id (a fan-out to
+//            many windows reads them side by side, not in one queue). A
+//            holder that died, or one older than the timeout plus 2 s, is
+//            moved aside to `.stale.<pid>`; a waiter still without an answer
+//            after the timeout plus 1 s makes its own read, unlocked: a slow
+//            kitty delays a read, it never fails it.
 //   breaker  an `ls` that timed out opens it for 5 s, doubling per repeated
-//            timeout up to 60 s, with +/-20% jitter. While it is open no `ls`
+//            timeout, with +/-20% jitter, never past 60 s. While it is open no `ls`
 //            is sent and the answer is `overloaded` with the time it closes:
 //            a timed-out request is still processed by kitty, so only not
 //            asking lowers its load. A success deletes it.
@@ -32,8 +35,10 @@
 //
 // The state lives in AGENT_KITTY_LS_DIR (default
 // $XDG_RUNTIME_DIR/agent-switchboard/kitty-ls), keyed by the resolved kitty
-// binary and the kitty instance (--to, else KITTY_LISTEN_ON, else the tty's
-// KITTY_PID), so a restarted kitty never sees an older instance's windows.
+// binary and the kitty instance (--to, else KITTY_LISTEN_ON with the socket's
+// inode, or with KITTY_PID for a socket that has no path, else the tty's
+// KITTY_PID), so a restarted kitty never sees an older instance's windows or
+// its breaker.
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -79,9 +84,21 @@ const resolveBin = (bin) => {
   return bin;
 };
 
+// A restarted kitty listens on the same path, so the path alone would hand it
+// the dead instance's breaker. A socket file gets a new inode when kitty
+// binds it again; an abstract or TCP socket has none, and the kitty pid tells
+// the instances apart instead.
 const instanceOf = (to) => {
   if (to) return `to:${to}`;
-  if (process.env.KITTY_LISTEN_ON) return `listen:${process.env.KITTY_LISTEN_ON}`;
+  const listen = process.env.KITTY_LISTEN_ON;
+  if (listen) {
+    const sock = /^unix:([^@].*)$/.exec(listen)?.[1];
+    if (sock) {
+      try { return `listen:${listen}:ino:${fs.statSync(sock).ino}`; } catch { /* unlinked: the path alone */ }
+      return `listen:${listen}`;
+    }
+    return `listen:${listen}:pid:${process.env.KITTY_PID ?? ''}`;
+  }
   return `tty:${process.env.KITTY_PID ?? ''}`;
 };
 
@@ -101,6 +118,7 @@ const filesFor = (key) => {
     full: `${base}.json`,
     narrow: (id) => `${base}.w${id}.json`,
     lock: `${base}.lock`,
+    narrowLock: (id) => `${base}.w${id}.lock`,
     breaker: `${base}.breaker.json`,
   };
 };
@@ -202,20 +220,20 @@ const tripBreaker = (files, reason) => {
 
 // --- lock --------------------------------------------------------------------------
 
-const tryLock = (files) => {
+const tryLock = (lock) => {
   const me = { pid: process.pid, at: Date.now() };
   let fd;
-  try { fd = fs.openSync(files.lock, 'wx', 0o600); } catch (e) {
+  try { fd = fs.openSync(lock, 'wx', 0o600); } catch (e) {
     if (e.code === 'EEXIST') return null;
     return { ...me, unlocked: true }; // cannot lock here at all: go without one
   }
   try { fs.writeSync(fd, JSON.stringify(me)); } finally { fs.closeSync(fd); }
   return me;
 };
-const unlock = (files, me) => {
+const unlock = (lock, me) => {
   if (!me || me.unlocked) return;
-  const cur = readJson(files.lock);
-  if (cur && cur.pid === me.pid && cur.at === me.at) unlinkQuiet(files.lock);
+  const cur = readJson(lock);
+  if (cur && cur.pid === me.pid && cur.at === me.at) unlinkQuiet(lock);
 };
 const pidAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
@@ -223,18 +241,18 @@ const pidAlive = (pid) => {
 // Move a dead or overdue holder's lock aside. Whoever wins the rename may take
 // the lock next; a rename that moved a lock other than the one judged orphaned
 // (it was retaken in between) is put back.
-const breakOrphan = (files, timeout) => {
+const breakOrphan = (lock, timeout) => {
   let st;
-  try { st = fs.statSync(files.lock); } catch { return true; }
-  const held = readJson(files.lock);
+  try { st = fs.statSync(lock); } catch { return true; }
+  const held = readJson(lock);
   const at = Number.isFinite(Number(held?.at)) ? Number(held.at) : st.mtimeMs;
   const dead = Number.isInteger(held?.pid) && held.pid !== process.pid && !pidAlive(held.pid);
   if (!dead && Date.now() - at <= timeout + 2000) return false;
-  const stale = `${files.lock}.stale.${process.pid}`;
-  try { fs.renameSync(files.lock, stale); } catch { return true; }
+  const stale = `${lock}.stale.${process.pid}`;
+  try { fs.renameSync(lock, stale); } catch { return true; }
   const moved = readJson(stale);
   if (held && moved && (moved.pid !== held.pid || moved.at !== held.at)) {
-    try { fs.linkSync(stale, files.lock); } catch { /* a new holder already */ }
+    try { fs.linkSync(stale, lock); } catch { /* a new holder already */ }
   }
   unlinkQuiet(stale);
   return true;
@@ -264,7 +282,7 @@ const fromCache = (files, { id, fresh, requestedAt, ttl }) => {
 
 // --- the read ----------------------------------------------------------------------
 
-const DOWN = new Set(['timeout', 'overloaded', 'busy', 'unreachable', 'bad-output']);
+const DOWN = new Set(['timeout', 'overloaded', 'unreachable', 'bad-output']);
 // The latest read's outcome in this process: null before any read.
 let last = null;
 
@@ -279,7 +297,8 @@ const realRead = (files, { bin, to, id, match, timeout }) => {
   const startedAt = Date.now();
   const r = callKitty(bin, args, timeout);
   if (r.kind === 'failed' && narrowArgs.length > 0 && NO_MATCH.test(r.said)) {
-    if (files) unlinkQuiet(files.breaker);
+    // The window is gone: no cached answer may still show it.
+    if (files) { unlinkQuiet(files.breaker); unlinkQuiet(files.full); }
     if (files && id != null) unlinkQuiet(files.narrow(id));
     return { ok: true, data: [] };
   }
@@ -315,7 +334,7 @@ const remember = (r) => { last = r; return r; };
 
 // { ok: true, data } or { ok: false, reason, retryAt?, detail? }, with reason
 // one of overloaded (the breaker is open), timeout (this read opened it),
-// unreachable, busy (the lock was not free in time), no-kitty, bad-output.
+// unreachable, no-kitty, bad-output.
 // `data: []` from a narrow read means the window is gone.
 export const kittyList = ({ match = null, fresh = false, to = null, maxAgeMs } = {}) => {
   const requestedAt = Date.now();
@@ -326,13 +345,15 @@ export const kittyList = ({ match = null, fresh = false, to = null, maxAgeMs } =
   const files = filesFor(cacheKey({ to, bin }));
   const deadline = requestedAt + timeout + 1000;
   const opts = { bin, to, id, match, timeout };
+  const lockFor = () => (files && id != null && !matchRejected ? files.narrowLock(id) : files?.lock);
   for (;;) {
     const hit = fromCache(files, { id, fresh, requestedAt, ttl });
     if (hit) return remember({ ok: true, data: hit, cached: true });
     const b = openBreaker(files);
     if (b) return remember(overloaded(b));
     if (!files) return remember(realRead(null, opts));
-    const me = tryLock(files);
+    const lock = lockFor();
+    const me = tryLock(lock);
     if (me) {
       try {
         const again = fromCache(files, { id, fresh, requestedAt, ttl });
@@ -340,12 +361,12 @@ export const kittyList = ({ match = null, fresh = false, to = null, maxAgeMs } =
         const b2 = openBreaker(files);
         if (b2) return remember(overloaded(b2));
         return remember(realRead(files, opts));
-      } finally { unlock(files, me); }
+      } finally { unlock(lock, me); }
     }
-    if (breakOrphan(files, timeout)) continue;
-    if (Date.now() >= deadline) {
-      return remember({ ok: false, reason: 'busy', detail: `another process held the kitty ls lock for over ${timeout + 1000} ms` });
-    }
+    if (breakOrphan(lock, timeout)) continue;
+    // The holder is alive and kitty is slow: ask it ourselves rather than
+    // fail a send that only had to wait.
+    if (Date.now() >= deadline) return remember(realRead(files, opts));
     sleepSync(nextDelay(0, { baseMs: LOCK_POLL_MS, capMs: LOCK_POLL_MS, jitter: 0.4 }));
   }
 };
@@ -391,7 +412,6 @@ export const overloadMessage = (r) =>
 export const kittyDownMessage = (r = last) => {
   if (!r || r.ok) return 'kitty remote control answered';
   if (r.reason === 'overloaded' || r.reason === 'timeout') return overloadMessage(r);
-  if (r.reason === 'busy') return `kitty remote control is busy (${r.detail})`;
   if (r.reason === 'no-kitty') return `kitty is not installed here (${r.detail})`;
   return `kitty remote control is not answering (${r.reason}${r.detail ? `: ${r.detail}` : ''})`;
 };
@@ -400,7 +420,9 @@ export const kittyDownMessage = (r = last) => {
 // [--probe] [--to S]`. Exit 0 with the JSON on stdout (`[]` from a narrow
 // read: the window is gone) and nothing on stderr; 2 when kitty did not
 // answer; 75 while the breaker is open. A failure prints its message, then
-// `reason=`, `retry_in_ms=` and `detail=` lines, on stderr.
+// `reason=`, `retry_in_ms=` and `detail=` lines, on stderr and on stdout:
+// lib/kitty-ls.sh reads stdout alone, so a node warning on stderr never
+// lands in what it parses.
 if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   const argv = process.argv.slice(2);
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] ?? null : null);
@@ -417,6 +439,8 @@ if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathS
     process.exit(0);
   }
   const retryIn = Number.isFinite(r.retryAt) ? Math.max(0, r.retryAt - Date.now()) : 0;
-  process.stderr.write(`${kittyDownMessage(r)}\nreason=${r.reason}\nretry_in_ms=${retryIn}\ndetail=${String(r.detail ?? '').replace(/\n/g, ' ')}\n`);
+  const report = `${kittyDownMessage(r)}\nreason=${r.reason}\nretry_in_ms=${retryIn}\ndetail=${String(r.detail ?? '').replace(/\n/g, ' ')}\n`;
+  process.stderr.write(report);
+  process.stdout.write(report);
   process.exit(r.reason === 'overloaded' || r.reason === 'timeout' ? 75 : 2);
 }

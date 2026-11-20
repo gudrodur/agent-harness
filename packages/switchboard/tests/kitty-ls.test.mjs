@@ -110,7 +110,8 @@ test('4. a timeout opens the breaker: five more readers add no call and return a
   assert.equal(c.code, 75, c.err);
   assert.match(c.err, /overloaded.*backing off until/);
   assert.match(c.err, /^retry_in_ms=\d+$/m);
-  assert.equal(c.out, '');
+  assert.match(c.out, /^reason=overloaded$/m, 'the failure lines are on stdout too, for the shell reader');
+  assert.doesNotMatch(c.out, /^\[/m, 'and nothing that parses as a list');
   assert.equal(fx.stub.lsCalls().length, 1);
 });
 
@@ -237,7 +238,7 @@ test('13. nextDelay follows the doubling curve to the cap, within the jitter bou
   const opts = { baseMs: 2000, capMs: 10_000 };
   assert.deepEqual([0, 1, 2, 3, 4, 5].map((a) => nextDelay(a, { ...opts, rand: () => 0.5 })), [2000, 4000, 8000, 10_000, 10_000, 10_000]);
   assert.deepEqual([0, 1, 2, 3].map((a) => nextDelay(a, { ...opts, rand: () => 0 })), [1600, 3200, 6400, 8000]);
-  assert.deepEqual([0, 1, 2, 3].map((a) => nextDelay(a, { ...opts, rand: () => 1 })), [2400, 4800, 9600, 12_000]);
+  assert.deepEqual([0, 1, 2, 3].map((a) => nextDelay(a, { ...opts, rand: () => 1 })), [2400, 4800, 9600, 10_000], 'the jitter never passes the cap');
   assert.equal(nextDelay(2, { baseMs: 5000, capMs: 60_000, factor: 3, jitter: 0, rand: () => 0.9 }), 45_000);
   for (let i = 0; i < 200; i += 1) {
     const d = nextDelay(1, opts);
@@ -281,4 +282,94 @@ test('created_at keeps every digit: kitty gives nanoseconds past 2^53, and a win
     { env: f.env({ PATH: `${f.stub.dir}:${process.env.PATH}` }), encoding: 'utf-8' });
   assert.equal(sh.stdout.trim(), `rc=0 created=${BIG}`, sh.stderr);
   fs.rmSync(f.root, { recursive: true, force: true });
+});
+
+// A fan-out (a broadcast, a wind-down) sends to many windows at once, each
+// asking for its own window fresh. Against a kitty that takes 1.2 s a call,
+// one lock for every read queued them past the waiters' deadline and failed
+// the late ones with "busy"; each window id has its own lock, so they run side
+// by side.
+test('14. eight concurrent fresh reads of eight windows against a slow kitty all answer', async () => {
+  const wins = Array.from({ length: 8 }, (_, i) => ({ id: 11 + i, title: `w${i}`, pid: 101 + i }));
+  const fx = fixture({ windows: wins });
+  fx.stub.setMode('slow:1.2');
+  const env = fx.env({ AGENT_KITTY_LS_TTL_MS: '2000' });
+  const rs = await Promise.all(wins.map((w) => importer(`m.kittyList({ match: "id:${w.id}", fresh: true })`, env)));
+  rs.forEach((r, i) => {
+    assert.equal(r.r?.ok, true, `window ${wins[i].id}: ${JSON.stringify(r.r)} ${r.err}`);
+    assert.deepEqual(ids(r.r.data), [wins[i].id]);
+  });
+});
+
+// A waiter whose holder is alive but has not answered by the waiter's
+// deadline (the read timeout plus 1 s) makes its own read, unlocked, rather
+// than fail with "busy": a slow kitty delays a send, it never fails it.
+test('15. a waiter past its deadline behind a live holder reads kitty itself; it is never "busy"', async () => {
+  const fx = fixture();
+  const env = fx.env({ AGENT_KITTY_LS_TIMEOUT_MS: '500' });
+  const key = (await importer('m.cacheKey()', env)).r;
+  fs.mkdirSync(fx.stateDir, { recursive: true });
+  // A live holder (this test process) that took the lock just now.
+  fs.writeFileSync(path.join(fx.stateDir, `${key}.lock`), JSON.stringify({ pid: process.pid, at: Date.now() }));
+  const r = await importer('m.kittyList({ fresh: true })', env);
+  assert.equal(r.r?.ok, true, `${JSON.stringify(r.r)} ${r.err}`);
+  assert.deepEqual(ids(r.r.data), [11, 12]);
+  assert.ok(r.ms >= 1400 && r.ms < 2500, `waited ${r.ms} ms: past the 1.5 s deadline, before the lock counts as orphaned`);
+  assert.equal(fx.stub.lsCalls().length, 1);
+});
+
+test('16. "no such window" drops the window from the full cache too: a later cached read does not find it', async () => {
+  const fx = fixture();
+  const env = fx.env({ AGENT_KITTY_LS_TTL_MS: '60000' });
+  assert.deepEqual(ids((await importer('m.kittyLs()', env)).r), [11, 12]);
+  fx.stub.setMode('nomatch');
+  assert.deepEqual((await importer('m.kittyLs({ match: "id:11", fresh: true })', env)).r, []);
+  assert.deepEqual((await importer('m.kittyLs({ match: "id:11" })', env)).r, [], 'not served from the older full answer');
+});
+
+test('17. a restarted kitty on the same socket path is another instance: its breaker and cache are not shared', async () => {
+  const fx = fixture();
+  const sock = path.join(fx.root, 'kitty.sock');
+  fs.writeFileSync(sock, '');
+  const env = fx.env({ KITTY_LISTEN_ON: `unix:${sock}` });
+  const before = (await importer('m.cacheKey()', env)).r;
+  assert.equal((await importer('m.cacheKey()', env)).r, before, 'the same socket keeps its key');
+  fs.rmSync(sock);
+  fs.writeFileSync(sock, '');
+  assert.notEqual((await importer('m.cacheKey()', env)).r, before, 'a new socket inode is a new key');
+  const abstract = fx.env({ KITTY_LISTEN_ON: 'unix:@kitty-test', KITTY_PID: '4242' });
+  const k1 = (await importer('m.cacheKey()', abstract)).r;
+  const k2 = (await importer('m.cacheKey()', { ...abstract, KITTY_PID: '4343' })).r;
+  assert.notEqual(k1, k2, 'an abstract socket is told apart by the kitty pid');
+});
+
+test('18. the jitter never takes a delay past the cap, in node and in the shell', async () => {
+  const { nextDelay } = await import(BACKOFF);
+  assert.equal(nextDelay(9, { baseMs: 5000, capMs: 60_000, rand: () => 1 }), 60_000);
+  assert.equal(nextDelay(0, { baseMs: 5000, capMs: 60_000, rand: () => 1 }), 6000, 'below the cap the jitter still spreads up');
+  const fx = fixture();
+  const bin = path.join(fx.root, 'nosleep');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const lib = fileURLToPath(new URL('../lib/kitty-ls.sh', import.meta.url));
+  const sh = spawnSync('bash', ['-c', `. ${JSON.stringify(lib)}; BACKOFF_ATTEMPT=5; for i in $(seq 60); do backoff_sleep; echo "$BACKOFF_SLEPT_MS"; done`],
+    { env: fx.env({ PATH: `${bin}:${process.env.PATH}`, BACKOFF_BASE_MS: '1000', BACKOFF_CAP_MS: '4000' }), encoding: 'utf-8' });
+  const slept = sh.stdout.trim().split('\n').map(Number);
+  assert.equal(slept.length, 60, sh.stderr);
+  for (const ms of slept) assert.ok(ms >= 3200 && ms <= 4000, `slept ${ms} ms past the 4000 ms cap`);
+});
+
+// The shell reader takes stdout alone: a node warning on stderr (a deprecation,
+// a NODE_OPTIONS preload) must not turn a found window into "gone".
+test('19. a warning on node\'s stderr does not change what the shell reader sees', () => {
+  const fx = fixture();
+  const warn = path.join(fx.root, 'warn.cjs');
+  fs.writeFileSync(warn, 'process.stderr.write("(node) Warning: something deprecated\\n");\n');
+  const lib = fileURLToPath(new URL('../lib/kitty-ls.sh', import.meta.url));
+  const env = fx.env({ PATH: `${fx.stub.dir}:${process.env.PATH}`, NODE_OPTIONS: `--require ${warn}` });
+  const sh = spawnSync('bash', ['-c', `. ${JSON.stringify(lib)}; win_record 11 fresh; echo "rc=$? pid=$WREC_PID"; live_pid_map fresh; echo "map=$? $(live_pid_of 12)"`], { env, encoding: 'utf-8' });
+  assert.equal(sh.stdout.trim(), 'rc=0 pid=101\nmap=0 102', sh.stderr);
+  fx.stub.setMode('refused');
+  const down = spawnSync('bash', ['-c', `. ${JSON.stringify(lib)}; win_record 11 fresh; echo "rc=$? reason=$KITTY_LS_REASON"`], { env, encoding: 'utf-8' });
+  assert.equal(down.stdout.trim(), 'rc=2 reason=unreachable', down.stderr);
 });

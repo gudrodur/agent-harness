@@ -809,8 +809,9 @@ if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   waited_ms=0; waited=0
   heartbeat_every=${KITTY_SEND_HEARTBEAT_S:-300}
   next_beat=$(( $(date +%s) + heartbeat_every ))
-  # One window read per pass, a cached answer allowed, its record handed on
-  # to the busy check. The gap between passes grows from 2 s to 10 s
+  # One fresh window read per pass, its record handed on to the busy check:
+  # the pass that finds the target idle types into it, so a cached record
+  # up to the TTL old could show idle a seat that just started a turn. The gap between passes grows from 2 s to 10 s
   # (KITTY_SEND_POLL_MS, KITTY_SEND_POLL_CAP_MS) while nothing changes and
   # starts over when the title (less its first character) or kitty's
   # availability changes; it never runs past a bounded wait's end,
@@ -819,7 +820,7 @@ if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   BACKOFF_BASE_MS=${KITTY_SEND_POLL_MS:-2000}; BACKOFF_CAP_MS=${KITTY_SEND_POLL_CAP_MS:-10000}
   backoff_reset; prev_snap=""; kitty_down=0
   while :; do
-    wrc=0; win_record "$WID" || wrc=$?
+    wrc=0; win_record "$WID" fresh || wrc=$?
     [ "$wrc" != 1 ] || die "window $WID died while waiting for it to go idle (nothing was sent)" 1
     min_ms=0
     if [ "$wrc" = 2 ]; then
@@ -1328,8 +1329,9 @@ if [ "$SLASH_SEND" = 1 ] && [ "$CLAUDE_TAB" = 1 ] && win_record "$WID"; then
     _src=0; slash_composer_rc || _src=$?
     [ "$_src" = 2 ] || break  # clear, a dialog is open, or could not tell: no Enter
     # A spinner in the title means the command was submitted and a turn runs:
-    # another Enter could queue it a second time.
-    if title_busy "$(win_title "$WID" 2>/dev/null || true)"; then break; fi
+    # another Enter could queue it a second time. Read fresh: a title cached
+    # from before the send shows no spinner.
+    if title_busy "$(win_title "$WID" fresh 2>/dev/null || true)"; then break; fi
     if [ "$_slash_tries" -ge "$SLASH_ENTER_TRIES" ]; then
       note "typed the slash command into window $WID, but its composer still holds the text after $SLASH_ENTER_TRIES extra Enter(s): typed, not proven submitted. Look at the window before resending (exit 16)."
       exit 16

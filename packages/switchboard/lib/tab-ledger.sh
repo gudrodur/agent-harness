@@ -20,6 +20,20 @@
 #                                                launched, once its seat sent its LOKA-DONE marker and is idle
 #   tab_ledger_retire <id> <taker-session>       --retire: close the window a takeover displaced,
 #                                                on the strength of a handover row (below)
+#   tab_ledger_slot_holders                      the one-slot gate: print the live rows of
+#                                                other launchers (empty: the slot is free)
+#   tab_ledger_launch_pid <id>                   the pid of a window just launched, the read
+#                                                retried while kitty does not answer
+#   tab_ledger_add_row <id> <pid> <title> <cwd> <brief-ref>
+#                                                record a launched window and claim its brief
+#
+# A row's pid is `?` when the window was launched but kitty did not answer the
+# pid read. Such a row holds the slot while its id is live, --list records the
+# live pid into it, and --close closes on the id alone.
+#
+# Every read here whose answer prunes a row, releases a claim or decides the
+# slot is fresh: a cached list from before a window opened would show a live
+# seat as gone.
 #
 # Brief claims (the companion repo task-claim CLI). Two seats on ONE brief is the
 # race task claims exist for: once two overseer windows ran the
@@ -65,7 +79,7 @@ tab_ledger_list() {
   # One `ls` for the whole listing, ids and pids together, not one per row:
   # this file is append-only, so a per-row read cost a kitty call per
   # historical entry. A listing kitty did not give prunes nothing.
-  live_pid_map || die "kitty remote control did not answer the window list (${KITTY_LS_MSG:-no answer}); nothing pruned." 2
+  live_pid_map fresh || die "kitty remote control did not answer the window list (${KITTY_LS_MSG:-no answer}); nothing pruned." 2
   # Gone rows are pruned on every list, not kept: a gone id can never be acted
   # on again (--close on one just deletes the row and says "already gone"), and
   # without pruning the append-only file grows forever. Only ids ABSENT from
@@ -91,7 +105,11 @@ tab_ledger_list() {
     if [ -n "$id" ] && now=$(live_pid_of "$id"); then
       # An id can be REUSED: kitty's counter restarts with a new instance while
       # this file survives in tmpfs. Same id + different pid is a stranger.
-      if [ "$now" = "$pid" ]; then s=live; else s="REUSED"; fi
+      if [ "$pid" = "?" ]; then
+        # Launched while kitty did not answer the pid read: record it now.
+        sed -i "s/^$id ? /$id $now /" "$STATE" 2>/dev/null
+        s=live
+      elif [ "$now" = "$pid" ]; then s=live; else s="REUSED"; fi
     else
       s=gone
     fi
@@ -149,6 +167,10 @@ tab_ledger_close() {
         closing it interrupts work you cannot see.${CLOSE_HINT:-}"
 
   want_pid=$(printf '%s' "$row" | awk '{print $2}')
+  if [ "$want_pid" = "?" ]; then
+    note "window $id's row has no pid (kitty did not answer when it was launched); closing on the id alone"
+    want_pid=$now_pid
+  fi
 
   if [ "$rc" = 1 ]; then
     # Not an error worth an exit code, but it must not be reported as a closure.
@@ -185,9 +207,9 @@ tab_ledger_close() {
 #   _tab_ledger_numeric_id <flag> <id>   the id is a number
 #   _tab_ledger_target <flag> <id>       sets LS (the window's fresh `kitty @ ls` record)
 #                                        and NOW_PID (empty: the window is gone); refuses
-#                                        the caller's own window (22), no remote control or
-#                                        a backing-off breaker (2) and a listing that is not
-#                                        a JSON array
+#                                        the caller's own window (22), no answer from kitty
+#                                        (2, a backing-off breaker included) and a listing
+#                                        that is not a JSON array (1)
 #   _tab_ledger_release_gone <id>        drop the row and release the claims of a gone window
 #   _tab_ledger_require_idle <id> <why>  refuse unless the seat is idle (23)
 #   _tab_ledger_close_window <id> <ok>   close it, then drop the row and release the claims
@@ -206,7 +228,9 @@ _tab_ledger_target() {
   win_record "$id" fresh || rc=$?
   if [ "$rc" = 2 ]; then
     [ "$KITTY_LS_RC" != 75 ] || die "$(kitty_backoff_line) — nothing closed" 2
-    die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
+    [ "$KITTY_LS_REASON" != bad-output ] \
+      || die "kitty @ ls returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
+    die "kitty remote control did not answer for window $id (${KITTY_LS_MSG:-no answer}) — cannot tell whether it is still there; nothing closed" 2
   fi
   LS=$WREC; NOW_PID=$WREC_PID
 }
@@ -342,4 +366,76 @@ tab_ledger_close_finished() {
   _tab_ledger_require_idle "$id" "the seat is still working after its LOKA-DONE marker"
   _tab_ledger_close_window "$id" "closed finished window $id (session $sid sent its LOKA-DONE marker)"
   return 0
+}
+
+# True when PID is this script or one of its ancestors: the seat that runs a
+# launcher inside a tab another seat launched sees that tab's row with the
+# other seat as launcher. Walks /proc ppid links.
+tab_ledger_is_ancestor() { # $1 = pid
+  local p=$$ n=0
+  while [ -n "$p" ] && [ "$p" != 0 ] && [ $n -lt 64 ]; do
+    [ "$p" = "$1" ] && return 0
+    p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+    n=$((n + 1))
+  done
+  return 1
+}
+
+# The one-slot gate, the same for every launcher: a live row (id present, pid
+# unchanged, or pid `?` with the id present) whose launcher is not this one
+# ($LAUNCHER) and which is not the caller's own window. One fresh listing for
+# every row: the answer grants the slot. A listing kitty did not give cannot
+# clear the slot, so the launch stops (exit 2) rather than guess.
+tab_ledger_slot_holders() {
+  [ -s "$STATE" ] || return 0
+  local row row_launcher now
+  live_pid_map fresh || die "kitty remote control did not answer the window list (${KITTY_LS_MSG:-no answer}); cannot tell who holds the slot — nothing launched." 2
+  set -f
+  while IFS= read -r row; do
+    # shellcheck disable=SC2086: unquoted split is the parse; globbing off via set -f.
+    set -- $row
+    case "${3:-}" in @*) row_launcher=${3#@} ;; *) row_launcher=unknown ;; esac
+    now=$(live_pid_of "${1:-}") || continue
+    [ "${2:-}" = "?" ] || [ "$now" = "${2:-}" ] || continue
+    [ "$row_launcher" = "$LAUNCHER" ] && continue
+    [ -n "${KITTY_WINDOW_ID:-}" ] && [ "$1" = "$KITTY_WINDOW_ID" ] && continue
+    [ "${2:-}" != "?" ] && tab_ledger_is_ancestor "${2:-}" && continue
+    printf '%s (launcher %s) ' "$1" "$row_launcher"
+  done < "$STATE"
+  set +f
+}
+
+# The pid of a window this script just launched, read fresh; LAUNCH_PID holds
+# it. 0 found, 1 gone, 2 kitty never answered. `kitty @ launch` returned an
+# id, so a tab is open: a read with no answer is retried, up to
+# AGENT_LAUNCH_PID_TRIES reads (default 6) on the backoff curve and never
+# sooner than an open breaker allows, before the caller gives up proving it.
+LAUNCH_PID=""
+tab_ledger_launch_pid() { # $1 = window id
+  local id="$1" tries="${AGENT_LAUNCH_PID_TRIES:-6}" n=1 rc
+  case "$tries" in ''|*[!0-9]*|0) tries=6 ;; esac
+  LAUNCH_PID=""
+  backoff_reset
+  while :; do
+    rc=0; win_record "$id" fresh || rc=$?
+    LAUNCH_PID=$WREC_PID
+    [ "$rc" = 2 ] || return "$rc"
+    [ "$n" -lt "$tries" ] || return 2
+    backoff_sleep "$WREC_RETRY_MS"
+    n=$((n + 1))
+  done
+}
+
+# Record a launched window (`?` for a pid kitty did not give) and claim its
+# brief for it.
+tab_ledger_add_row() { # $1 = id, $2 = pid, $3 = title, $4 = cwd, $5 = brief ref
+  printf '%s %s @%s %s\n' "$1" "$2" "$LAUNCHER" "$3" >> "$STATE"
+  claim_cli --claim "$4" "$5" --owner "kitty:$1" --note "$3" >/dev/null 2>&1 || true
+}
+
+# The exit after a launch whose pid read kitty never answered. Never 2: the tab
+# is open, and 2 sends the caller to a headless run of the same brief.
+tab_ledger_die_unproven() { # $1 = id
+  printf 'WINDOW_ID=%s\n' "$1"
+  die "window $1 was launched, but kitty remote control did not answer after it (${KITTY_LS_MSG:-no answer}), so its start is not proven. Do not relaunch and do not fall back to headless: the tab is open, recorded with an unknown pid and its brief claimed. Look at the window, or run --list once kitty answers." 3
 }

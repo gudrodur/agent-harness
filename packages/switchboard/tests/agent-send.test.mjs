@@ -1124,6 +1124,20 @@ test('a bare send to a busy recipient with no mailbox is held by kitty-send --qu
   assertHeld(await bareSendArgv([], '\u2807 claude: working', holdEnv()));
 });
 
+// The busy guard decides whether text is typed, so it reads kitty fresh: a
+// record cached while the seat was idle, up to the TTL old, would let a send
+// type into a seat that has just started a turn. The suite runs with the
+// cache off (TTL 0); this test turns it on and primes it with the idle title.
+test('the busy guard reads fresh: an idle record cached before the turn started does not let a send type', async () => {
+  const ttl = { AGENT_KITTY_LS_TTL_MS: '60000' };
+  const titleKitty = path.join(binDir, 'kitty-title-stub');
+  fs.writeFileSync(titleKitty, `#!/usr/bin/env bash\necho '[{"tabs":[{"windows":[{"id":991002,"title":"claude: idle seat","cwd":"/repo/b"}]}]}]'\n`, { mode: 0o755 });
+  const KITTY_LS = new URL('../lib/kitty-ls.mjs', import.meta.url).pathname;
+  const primed = spawnSync('node', [KITTY_LS, '--match', 'id:991002', '--fresh'], { env: childEnv({ ...ttl, AGENT_MAILBOX_KITTY: titleKitty }), encoding: 'utf-8' });
+  assert.match(primed.stdout, /claude: idle seat/, primed.stderr);
+  assertHeld(await bareSendArgv([], '\u2807 claude: working', { ...holdEnv(), ...ttl }), 'cached idle record: ');
+});
+
 // A session record that says busy is trusted however old it is (README: no
 // staleness bound). A seat that sits idle behind such a record is therefore
 // held by kitty-send --queue, never typed into with --now and never reported as

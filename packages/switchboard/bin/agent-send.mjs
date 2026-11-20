@@ -756,7 +756,9 @@ const main = (argv) => {
   // Idle = the window exists and is not busy. Unreadable kitty or an unknown
   // window is "not idle": callers then keep the cautious (busy) behaviour.
   // `rec` is a record the caller already read (one read serves a whole poll pass).
-  const windowRecord = (winId) => flattenWindows(kittyLs({ match: `id:${winId}` })).find((w) => w.id === Number(winId)) ?? null;
+  // Both reads are fresh: their answer decides whether text is typed, and a
+  // cached record up to the TTL old can show idle a seat that just started a turn.
+  const windowRecord = (winId) => flattenWindows(kittyLs({ match: `id:${winId}`, fresh: true })).find((w) => w.id === Number(winId)) ?? null;
   const windowIsIdle = (winId, rec = windowRecord(winId)) => rec != null && !recordIsBusy(rec);
   // The opposite is NOT "not idle": busy means the window was read and it is
   // busy. An unreadable window is neither, and a caller that must never type
@@ -765,7 +767,7 @@ const main = (argv) => {
   // counts.
   const windowIsBusy = (target) => {
     const numeric = /^\d+$/.test(String(target));
-    const wins = flattenWindows(kittyLs(numeric ? { match: `id:${target}` } : {}));
+    const wins = flattenWindows(kittyLs(numeric ? { match: `id:${target}`, fresh: true } : { fresh: true }));
     const hit = numeric
       ? wins.filter((w) => w.id === Number(target))
       : wins.filter((w) => (w.title ?? '').toLowerCase().includes(String(target).toLowerCase()));
