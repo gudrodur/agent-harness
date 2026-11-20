@@ -142,13 +142,19 @@ test("runCommand failOnStderr: exit 0 with stderr is not ok; without the option 
   assert.match(r.output, /^stderr: x/);
 });
 
-test("runCommand deadStages: a failed earlier stage is not ok; a no-match grep stage is", () => {
+test("runCommand deadStages: exit 2+ on an earlier stage is dead; exit 1 and SIGPIPE are not", () => {
   const opts = { root: ".", timeoutMs: 5000, deadStages: true };
-  const dead = runCommand("false | wc -w", opts);
+  const dead = runCommand("sh -c 'exit 2' | wc -w", opts);
   assert.equal(dead.ok, false);
-  assert.match(dead.output, /stage 1 \(false\) exited 1/);
-  assert.equal(runCommand("sh -c 'exit 2' 2>/dev/null | wc -w", opts).ok, false);
+  assert.match(dead.output, /stage 1 \(sh\) exited 2/);
+  const compound = runCommand("for i in 1; do sh -c 'exit 3'; done | wc -w", opts);
+  assert.equal(compound.ok, false);
+  assert.match(compound.output, /^stage 1 exited 3/, "no keyword label");
+  assert.equal(runCommand("false | wc -w", opts).ok, true, "exit 1 is not death");
   assert.equal(runCommand("printf a | grep zzz | wc -l", opts).ok, true);
+  assert.equal(runCommand("awk 'END{exit !f}' </dev/null | wc -l", opts).ok, true);
+  assert.equal(runCommand("for i in 1 2; do test -f nope; done | wc -l", opts).ok, true);
+  assert.equal(runCommand("yes | head -1 | wc -l", opts).ok, true, "SIGPIPE 141");
   assert.equal(runCommand("printf 'a b' | wc -w", opts).stdout.trim(), "2");
-  assert.equal(runCommand("false | wc -w", { root: ".", timeoutMs: 5000 }).ok, true, "off unless asked");
+  assert.equal(runCommand("sh -c 'exit 2' | wc -w", { root: ".", timeoutMs: 5000 }).ok, true, "off unless asked");
 });

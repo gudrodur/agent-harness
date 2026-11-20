@@ -65,8 +65,8 @@ store lives (`--store-health` reports whether it is being kept).
 
 A `word` or `int` query is could-not-check (exit 3), never a value, when it
 writes to stderr on exit 0, or when an earlier stage of its last pipeline died
-(exit 2 or more, or exit 1 from anything but `grep`, `rg`, `diff`, `cmp`,
-`test`). A dead first stage would otherwise leave `| wc -w` printing a
+(exit 2 or more, except 141, SIGPIPE from `head -1`; exit 1 never counts, it
+is "no match" for `grep`, `git grep`, `jq -e` and more). A dead first stage would otherwise leave `| wc -w` printing a
 confident 0, as BSD `grep -oP` does on macOS (no `-P`). Write queries with
 POSIX tools (`sed -n 's/…/\1/p'`, `grep -E`, `[[:space:]]`), not GNU flags, and
 do not hide a stage's failure with `2>/dev/null`: the exit status still counts.

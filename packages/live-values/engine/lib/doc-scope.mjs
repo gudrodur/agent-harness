@@ -308,10 +308,6 @@ export const checkQuerySegments = (run, tools = LOCAL_TOOLS) => {
 
 export const clip200 = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
 
-// Stages that exit 1 for "nothing matched", not for failure: an earlier stage
-// of these at 1 is a real empty result (`grep zzz | wc -l` is a true 0).
-const NO_MATCH_TOOLS = new Set(["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "["]);
-
 // The stages of the command's LAST pipeline, in order (the one PIPESTATUS reports).
 const lastPipelineStages = (run) => {
   const segs = splitSegmentsDetailed(run).filter((s) => s.text.trim() !== "");
@@ -320,18 +316,23 @@ const lastPipelineStages = (run) => {
   return segs.slice(start).map((s) => s.text.trim());
 };
 
+// 141 = 128 + SIGPIPE: a stage whose reader (`head -1`) closed early. Not a failure.
+const SIGPIPE_STATUS = 141;
+
 // The first earlier stage whose status says it died, as a report line, else "".
 // A pipeline's own exit code is its LAST stage's, so a dead first stage leaves
-// `| wc -w` printing a confident 0. Exit 2 or more always counts; exit 1 counts
-// unless the stage is a tool that exits 1 for "no match".
+// `| wc -w` printing a confident 0. Only exit 2 or more counts, minus SIGPIPE:
+// exit 1 is "no match" or "false" for too many tools (grep, git grep, git diff
+// --quiet, jq -e, awk 'END{exit !f}', a loop whose last test was false) to read
+// as death. A compound stage (`done`, `fi`, `}`) is labelled by nothing.
 const deadStage = (run, statuses) => {
   const stages = lastPipelineStages(run);
   const known = stages.length === statuses.length;
   for (let i = 0; i < statuses.length - 1; i++) {
     const st = statuses[i];
-    if (st === 0) continue;
-    const cmd = known ? commandWord(shellWords(stages[i])) : "";
-    if (st === 1 && (!known || NO_MATCH_TOOLS.has(cmd.replace(/^.*\//, "")))) continue;
+    if (st < 2 || st === SIGPIPE_STATUS) continue;
+    const word = known ? commandWord(shellWords(stages[i])) : "";
+    const cmd = LIST_KEYWORDS.has(word) || CLOSERS.has(word) ? "" : word;
     return `stage ${i + 1}${cmd ? ` (${cmd})` : ""} exited ${st}`;
   }
   return "";

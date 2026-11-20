@@ -375,7 +375,6 @@ var checkQuerySegments = (run, tools = LOCAL_TOOLS) => {
   return { ok: true };
 };
 var clip200 = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-var NO_MATCH_TOOLS = new Set(["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "["]);
 var lastPipelineStages = (run) => {
   const segs = splitSegmentsDetailed(run).filter((s) => s.text.trim() !== "");
   let start = segs.length - 1;
@@ -383,16 +382,16 @@ var lastPipelineStages = (run) => {
     start--;
   return segs.slice(start).map((s) => s.text.trim());
 };
+var SIGPIPE_STATUS = 141;
 var deadStage = (run, statuses) => {
   const stages = lastPipelineStages(run);
   const known = stages.length === statuses.length;
   for (let i = 0;i < statuses.length - 1; i++) {
     const st = statuses[i];
-    if (st === 0)
+    if (st < 2 || st === SIGPIPE_STATUS)
       continue;
-    const cmd = known ? commandWord(shellWords(stages[i])) : "";
-    if (st === 1 && (!known || NO_MATCH_TOOLS.has(cmd.replace(/^.*\//, ""))))
-      continue;
+    const word = known ? commandWord(shellWords(stages[i])) : "";
+    const cmd = LIST_KEYWORDS.has(word) || CLOSERS.has(word) ? "" : word;
     return `stage ${i + 1}${cmd ? ` (${cmd})` : ""} exited ${st}`;
   }
   return "";

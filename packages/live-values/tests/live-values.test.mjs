@@ -141,7 +141,7 @@ test("a dead first pipeline stage is could-not-check, never a confident 0 (BSD g
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
 });
 
-test("a dead earlier stage is could-not-check even when stderr is silent (false | wc -w reads 0)", () => {
+test("a dead earlier stage is could-not-check even when stderr is silent (a dead stage under wc -w reads 0)", () => {
   const shim = trackTemp(fs.mkdtempSync(path.join(os.tmpdir(), "lv-shim-")));
   // BSD grep with -P: complains, prints nothing, exits 2. The author silenced stderr.
   fs.writeFileSync(path.join(shim, "grep"), "#!/bin/sh\necho 'grep: invalid option -- P' >&2\nexit 2\n", { mode: 0o755 });
@@ -152,14 +152,25 @@ test("a dead earlier stage is could-not-check even when stderr is silent (false 
     return spawnSync(process.execPath, [SCRIPT, "--snapshot", "--format=json"], { encoding: "utf8", env });
   };
   for (const format of ["word", "int"]) {
-    const dead = check("false | wc -w", format, "3");
+    const dead = check("cat /nonexistent | wc -w", format, "3");
     assert.equal(dead.status, 1, `${format}: ${dead.stdout}${dead.stderr}`);
-    assert.match(dead.stdout, /exited 1/);
+    assert.match(dead.stdout, /stderr:/);
     const silenced = check("grep -oP 'a' f.txt 2>/dev/null | wc -w", format, "3", true);
     assert.equal(silenced.status, 1, `${format} silenced: ${silenced.stdout}${silenced.stderr}`);
     assert.match(silenced.stdout, /exited 2/);
   }
-  // grep exits 1 for no match, so an earlier grep stage at 1 is a real zero; a dead last stage still fails.
+  // Exit 1 from an earlier stage is "no match" or "false", never death: grep, awk 'END{exit !f}',
+  // a loop whose last test was false (git grep, git diff --quiet and jq -e behave the same).
+  for (const run of [
+    "awk 'END{exit !f}' f.txt | wc -l | tr -d ' '",
+    "for i in 1 2; do test -f nope; done | wc -l | tr -d ' '",
+  ]) {
+    const r = check(run, "int", "0");
+    assert.equal(r.status, 0, `${run}: ${r.stdout}${r.stderr}`);
+  }
+  // SIGPIPE (141) on a stage whose reader closed early is not death, however much it wrote.
+  const piped = check("yes | head -1 | wc -l | tr -d ' '", "int", "1");
+  assert.equal(piped.status, 0, piped.stdout + piped.stderr);
   const none = check("cat f.txt | grep zzz | wc -l | tr -d ' '", "int", "0");
   assert.equal(none.status, 0, none.stdout + none.stderr);
   const lastDead = check("cat f.txt | false", "int", "0");
