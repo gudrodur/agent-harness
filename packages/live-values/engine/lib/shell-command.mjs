@@ -14,20 +14,26 @@
 // the redirect target (`cat > <target> <<EOF`) is still judged. `<<<`
 // herestrings carry their word on the same line and are left alone (the
 // quote strip below handles their prose).
+//
+// Linear in the command: the open tags are a queue read through an index
+// (`shift()` on a long array is linear, so a line of many openers made the
+// walk quadratic), and tags are pushed one at a time (a spread of 120 000
+// arguments overflows the call stack).
 export const stripHeredocBodies = (command) => {
   const lines = String(command ?? '').split('\n');
   const kept = [];
-  let pending = [];
+  const pending = [];
+  let next = 0;
   for (const line of lines) {
-    if (pending.length > 0) {
-      if (pending[0] === line.trim()) pending.shift();
+    if (next < pending.length) {
+      if (pending[next] === line.trim()) next++;
       continue;
     }
-    const tags = [];
+    pending.length = 0;
+    next = 0;
     const re = /<<(?![<])-?~?\s*['"]?([A-Za-z_]\w*)['"]?/g;
     let m;
-    while ((m = re.exec(line)) !== null) tags.push(m[1]);
-    if (tags.length > 0) pending.push(...tags);
+    while ((m = re.exec(line)) !== null) pending.push(m[1]);
     kept.push(line);
   }
   return kept.join('\n');
@@ -246,26 +252,33 @@ export const commandWord = (words) => {
 // stripHeredocBodies, which drops exactly these lines; a gate that has to
 // READ a body (a message passed as `-F - <<EOF` or `-m "$(cat <<EOF)"`)
 // pairs a segment with the entry whose head line carries it.
+// Linear, as stripHeredocBodies is: an index into the queue, never `shift()`.
 export const heredocBodies = (command) => {
   const lines = String(command ?? '').split('\n');
   const out = [];
-  let pending = [];
+  const pending = [];
+  let next = 0;
   for (const line of lines) {
-    if (pending.length > 0) {
-      const cur = pending[0];
+    if (next < pending.length) {
+      const cur = pending[next];
       if (cur.tag === line.trim()) {
         out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
-        pending.shift();
+        next++;
       } else {
         cur.body.push(line);
       }
       continue;
     }
+    pending.length = 0;
+    next = 0;
     const re = /<<(?![<])-?~?\s*['"]?([A-Za-z_]\w*)['"]?/g;
     let m;
     while ((m = re.exec(line)) !== null) pending.push({ head: line, tag: m[1], body: [] });
   }
-  for (const cur of pending) out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
+  for (let k = next; k < pending.length; k++) {
+    const cur = pending[k];
+    out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
+  }
   return out;
 };
 // Is the text at `index` an actual command, or is it sitting inside a quoted
