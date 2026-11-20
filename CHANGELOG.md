@@ -21,7 +21,7 @@ All notable changes to the agent-harness workspace are documented here. The form
 
 - `packages/live-values`:
   - `stripHeredocBodies` and `heredocBodies` in `engine/lib/shell-command.mjs` are linear: a line of many heredoc openers no longer makes them quadratic or throws a `RangeError`.
-  - The heredoc readers no longer read a `<<<word` herestring as a heredoc, accept a `<<\TAG` delimiter, and `heredocBodies` says whether each delimiter is quoted.
+  - The heredoc readers find heredocs where bash does: never inside quotes, a comment, arithmetic or backticks, never at a `<<<word` herestring; the delimiter is the whole quote-removed word (`<<\TAG`, `<<E"OF"`); a body starts once the command line ends. `heredocBodies` says whether each delimiter is quoted.
 - `packages/switchboard`:
   - Typing proof: the composer is read with `get-text --ansi`, so the faint prompt suggestion Claude Code shows after a turn no longer blocks typed delivery to an idle seat; normal text, chips and unparsable escapes still refuse. A quiet `--queue` wait now prints `held: <reason>` once per distinct reason.
 
