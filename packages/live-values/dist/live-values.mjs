@@ -375,16 +375,47 @@ var checkQuerySegments = (run, tools = LOCAL_TOOLS) => {
   return { ok: true };
 };
 var clip200 = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-var runCommand = (run, { root, timeoutMs, failOnStderr = false }) => {
-  const r = spawnSync("bash", ["-c", run], {
+var lastPipelineStages = (run) => {
+  const segs = splitSegmentsDetailed(run).filter((s) => s.text.trim() !== "");
+  let start = segs.length - 1;
+  while (start > 0 && segs[start].sep === "|")
+    start--;
+  return segs.slice(start).map((s) => s.text.trim());
+};
+var SIGPIPE_STATUS = 141;
+var deadStage = (run, statuses) => {
+  const stages = lastPipelineStages(run);
+  const known = stages.length === statuses.length;
+  for (let i = 0;i < statuses.length - 1; i++) {
+    const st = statuses[i];
+    if (st < 2 || st === SIGPIPE_STATUS)
+      continue;
+    const word = known ? commandWord(shellWords(stages[i])) : "";
+    const cmd = LIST_KEYWORDS.has(word) || CLOSERS.has(word) ? "" : word;
+    return `stage ${i + 1}${cmd ? ` (${cmd})` : ""} exited ${st}`;
+  }
+  return "";
+};
+var runCommand = (run, { root, timeoutMs, failOnStderr = false, deadStages = false }) => {
+  const script = deadStages ? `${run}
+__lv_ps=("\${PIPESTATUS[@]}")
+printf '%s ' "\${__lv_ps[@]}" >&3
+exit "\${__lv_ps[$((\${#__lv_ps[@]} - 1))]}"` : run;
+  const r = spawnSync("bash", ["-c", script], {
     cwd: root,
     encoding: "utf8",
     timeout: timeoutMs,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe", ...deadStages ? ["pipe"] : []]
   });
   if (!r.error && r.status === 0) {
     if (failOnStderr && r.stderr.trim())
       return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`) };
+    if (deadStages) {
+      const statuses = String(r.output?.[3] ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
+      const dead = statuses.length ? deadStage(run, statuses) : "";
+      if (dead)
+        return { ok: false, timedOut: false, output: clip200(dead) };
+    }
     return { ok: true, stdout: r.stdout };
   }
   const message = r.error ? r.error.message : `Command failed: ${run}
@@ -553,7 +584,7 @@ var NUMERIC = new Set(["int", "word"]);
 var resolveFileValues = (names, entries, { root, timeoutMs }) => {
   const out = new Map;
   for (const name of names) {
-    const r = runCommand(entries[name].run, { root, timeoutMs, failOnStderr: NUMERIC.has(entries[name].format) });
+    const r = runCommand(entries[name].run, { root, timeoutMs, failOnStderr: NUMERIC.has(entries[name].format), deadStages: NUMERIC.has(entries[name].format) });
     out.set(name, r.ok ? { raw: r.stdout } : { error: `query failed: ${r.output}`, code: 3 });
   }
   return out;
@@ -619,7 +650,7 @@ var runSnapshots = ({ root, timeoutMs = 60000, now = Date.now() }) => {
   const report = { measured: [], kept: [], failed: [], missing: [] };
   for (const name of names) {
     const e = reg.entries[name];
-    const r = runCommand(e.run, { root, timeoutMs, failOnStderr: NUMERIC.has(e.format) });
+    const r = runCommand(e.run, { root, timeoutMs, failOnStderr: NUMERIC.has(e.format), deadStages: NUMERIC.has(e.format) });
     if (!r.ok) {
       if (store[name]?.value) {
         report.kept.push(name);

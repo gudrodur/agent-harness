@@ -39,7 +39,13 @@ capitalisation), `text` (the query's one line, verbatim).
 
 - `--check`: read-only verdict. Exit 0 every span equals its value; 1 drift,
   unknown, unused, stale, malformed or misplaced; 2 bad argument or registry;
-  3 could not check.
+  3 could not check. A `word` or `int` query is also could-not-check (not a
+  value) when it exits 0 but wrote to stderr, or when an EARLIER stage of its
+  last pipeline died: exit 2 or more, except 141 (SIGPIPE from `head -1`).
+  Exit 1 never counts: `grep`, `git grep`, `git diff --quiet`, `jq -e`, `awk
+  'END{exit !f}'` and a loop whose last test was false all use it for "no".
+  So `sh -c 'exit 2' | wc -w` and a BSD `grep -oP … 2>/dev/null | wc -w` fail instead of reading 0. A real
+  empty result (`grep zzz | wc -l`) is still 0. Text values are unchanged.
 - `--write`: rewrite drifted spans from their sources (atomic, per file).
 - `--hook`: pre-commit mode — `--write`, then `git add` exactly the rewritten
   files. Refuses a file with unstaged changes, because staging would sweep

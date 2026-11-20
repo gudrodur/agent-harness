@@ -219,14 +219,14 @@ const render = (raw, format, current) => {
   return { value: v };
 };
 
-// int and word values are numbers: a stage that wrote to stderr means the count is not trustworthy.
+// int and word values are numbers: a stage that wrote to stderr, or an earlier pipeline stage that died, means the count is not trustworthy.
 const NUMERIC = new Set(["int", "word"]);
 
 // Run each used kind:file query once: { raw } or { error, code: 3 }.
 const resolveFileValues = (names, entries, { root, timeoutMs }) => {
   const out = new Map();
   for (const name of names) {
-    const r = runCommand(entries[name].run, { root, timeoutMs, failOnStderr: NUMERIC.has(entries[name].format) });
+    const r = runCommand(entries[name].run, { root, timeoutMs, failOnStderr: NUMERIC.has(entries[name].format), deadStages: NUMERIC.has(entries[name].format) });
     out.set(name, r.ok ? { raw: r.stdout } : { error: `query failed: ${r.output}`, code: 3 });
   }
   return out;
@@ -302,7 +302,7 @@ export const runSnapshots = ({ root, timeoutMs = 60000, now = Date.now() }) => {
   const report = { measured: [], kept: [], failed: [], missing: [] };
   for (const name of names) {
     const e = reg.entries[name];
-    const r = runCommand(e.run, { root, timeoutMs, failOnStderr: NUMERIC.has(e.format) });
+    const r = runCommand(e.run, { root, timeoutMs, failOnStderr: NUMERIC.has(e.format), deadStages: NUMERIC.has(e.format) });
     if (!r.ok) {
       if (store[name]?.value) {
         report.kept.push(name);

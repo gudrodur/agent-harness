@@ -133,3 +133,28 @@ test("checkQuerySegments reads the command past exec options, not the -a name", 
   assert.deepEqual(checkQuerySegments("exec -a ugrep grep -c x a.md"), { ok: true });
   assert.deepEqual(checkQuerySegments("exec -a name gh api x"), { ok: false, reason: "command not allowed: gh", word: "gh" });
 });
+
+test("runCommand failOnStderr: exit 0 with stderr is not ok; without the option it is", () => {
+  const run = 'echo x >&2; printf 7';
+  assert.deepEqual(runCommand(run, { root: ".", timeoutMs: 5000 }), { ok: true, stdout: "7" });
+  const r = runCommand(run, { root: ".", timeoutMs: 5000, failOnStderr: true });
+  assert.equal(r.ok, false);
+  assert.match(r.output, /^stderr: x/);
+});
+
+test("runCommand deadStages: exit 2+ on an earlier stage is dead; exit 1 and SIGPIPE are not", () => {
+  const opts = { root: ".", timeoutMs: 5000, deadStages: true };
+  const dead = runCommand("sh -c 'exit 2' | wc -w", opts);
+  assert.equal(dead.ok, false);
+  assert.match(dead.output, /stage 1 \(sh\) exited 2/);
+  const compound = runCommand("for i in 1; do sh -c 'exit 3'; done | wc -w", opts);
+  assert.equal(compound.ok, false);
+  assert.match(compound.output, /^stage 1 exited 3/, "no keyword label");
+  assert.equal(runCommand("false | wc -w", opts).ok, true, "exit 1 is not death");
+  assert.equal(runCommand("printf a | grep zzz | wc -l", opts).ok, true);
+  assert.equal(runCommand("awk 'END{exit !f}' </dev/null | wc -l", opts).ok, true);
+  assert.equal(runCommand("for i in 1 2; do test -f nope; done | wc -l", opts).ok, true);
+  assert.equal(runCommand("yes | head -1 | wc -l", opts).ok, true, "SIGPIPE 141");
+  assert.equal(runCommand("printf 'a b' | wc -w", opts).stdout.trim(), "2");
+  assert.equal(runCommand("sh -c 'exit 2' | wc -w", { root: ".", timeoutMs: 5000 }).ok, true, "off unless asked");
+});
