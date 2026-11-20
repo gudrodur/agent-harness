@@ -107,7 +107,7 @@ test("BSD wc -l padding: a space-padded count is read as the bare integer; real 
     assert.equal(cli(root, "--write").status, 0);
     assert.match(doc(root), format === "word" ? /zero/ : /\b0\b/);
   }
-  for (const bad of ["-1", "abc", "1 2", "+3", "1.5"]) {
+  for (const bad of ["", "   ", "-1", "abc", "1 2", "+3", "1.5"]) {
     for (const format of ["int", "word"]) {
       const r = cli(sandbox({ doc: `Has ${M("n", "two")} routes.\n`, registry: reg(`printf '   ${bad}  '`, format) }), "--snapshot");
       assert.notEqual(r.status, 0, `${format} ${JSON.stringify(bad)} must fail`);
