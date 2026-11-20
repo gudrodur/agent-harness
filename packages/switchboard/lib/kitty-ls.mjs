@@ -105,7 +105,18 @@ const filesFor = (key) => {
   };
 };
 
-const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return null; } };
+// kitty's created_at is nanoseconds since the epoch, past 2^53: a plain
+// JSON.parse rounds it, and a window-identity record written from kitty's own
+// output (pid plus created_at) would no longer match. An integer a double
+// cannot hold is kept as its exact text, which JSON.stringify writes back
+// unchanged. Nothing in node reads created_at as a number.
+const keepExact = (key, value, ctx) => (
+  typeof value === 'number' && !Number.isSafeInteger(value) && /^-?\d+$/.test(ctx?.source ?? '') && typeof JSON.rawJSON === 'function'
+    ? JSON.rawJSON(ctx.source)
+    : value
+);
+const parseExact = (text) => JSON.parse(text, keepExact);
+const readJson = (p) => { try { return parseExact(fs.readFileSync(p, 'utf-8')); } catch { return null; } };
 const writeAtomic = (p, obj) => {
   const tmp = `${p}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   try {
@@ -165,7 +176,7 @@ const callKitty = (bin, args, timeout) => {
     return { kind: 'failed', said, detail: firstLine(r.stderr) || firstLine(r.stdout) || (r.signal ? `killed by ${r.signal}` : `exit ${r.status}`) };
   }
   let parsed;
-  try { parsed = JSON.parse(r.stdout); } catch { parsed = undefined; }
+  try { parsed = parseExact(r.stdout); } catch { parsed = undefined; }
   // Anything but an array (an error object, text) is not an answer to `ls`.
   if (!Array.isArray(parsed)) return { kind: 'bad-output', detail: `not a JSON array: ${firstLine(r.stdout).slice(0, 120) || '<empty>'}` };
   return { kind: 'ok', data: parsed };

@@ -260,3 +260,25 @@ test('the probe: a narrow read of this window; "no such window" and unreadable o
   assert.equal(down.code, 2);
   assert.match(down.err, /^detail=.*Connection refused/m);
 });
+
+test('created_at keeps every digit: kitty gives nanoseconds past 2^53, and a window id is matched on it', () => {
+  const f = fixture();
+  const BIG = '1795198327834963891';
+  fs.writeFileSync(path.join(f.stub.dir, 'ls.json'), `[{"id":1,"tabs":[{"id":1,"title":"tab","windows":[{"id":11,"title":"one","pid":101,"created_at":${BIG}}]}]}]`);
+  const cached = f.env({ AGENT_KITTY_LS_TTL_MS: '60000' });
+  for (const [label, args, env] of [
+    ['full', ['--fresh'], f.env()],
+    ['narrow', ['--match', 'id:11', '--fresh'], f.env()],
+    ['cache fill', [], cached],
+    ['from the cache', [], cached],
+  ]) {
+    const r = cli(args, env);
+    assert.equal(r.code, 0, `${label}: ${r.err}`);
+    assert.match(r.out, new RegExp(`"created_at":${BIG}\\b`), `${label}: ${r.out}`);
+  }
+  // The shell reader, which every window-identity record goes through.
+  const sh = spawnSync('bash', ['-c', `. ${JSON.stringify(fileURLToPath(new URL('../lib/kitty-ls.sh', import.meta.url)))}; win_record 11 fresh; echo "rc=$? created=$WREC_CREATED"`],
+    { env: f.env({ PATH: `${f.stub.dir}:${process.env.PATH}` }), encoding: 'utf-8' });
+  assert.equal(sh.stdout.trim(), `rc=0 created=${BIG}`, sh.stderr);
+  fs.rmSync(f.root, { recursive: true, force: true });
+});
