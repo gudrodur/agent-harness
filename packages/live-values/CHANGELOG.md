@@ -19,6 +19,18 @@ All notable changes to this project are documented here. The format follows
   quadratic (`shift()` on the open-tag queue), and about 120 000 openers threw
   a `RangeError` (the tags were pushed with a spread). Output is unchanged; the
   bundle does not use them, so `dist/` is unchanged.
+- The heredoc readers (`stripHeredocBodies`, `heredocBodies`) share one
+  scanner that finds heredocs where bash does. A `<<` inside quotes, a
+  comment, arithmetic (`$((a<<b))`, `$[a<<b]`, the subscript in
+  `a[1<<2]=3`), `${…}` or a backtick span no longer opens
+  a heredoc that hid every later line from the gates; one inside `$(…)` still
+  does. A `<<<word` herestring opens none. The delimiter is the whole shell
+  word, quote-removed (`<<\TAG`, `<<E"OF"`, `<<'EOF bar'`, `<<END-OF`), and a
+  body starts only once the command line ends, after a quote or a `\`
+  continuation left open on the opener's line. `heredocBodies` entries carry
+  `quoted`: true when any part of the delimiter is quoted, so the shell leaves
+  the body unexpanded. A test runs random commands through bash and checks
+  that no line the strip drops is one bash runs. `dist/` is unchanged.
 
 ## [1.0.0] - Unreleased
 

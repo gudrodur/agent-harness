@@ -9,33 +9,277 @@
 // listing plus quoted "deploy" prose claimed a deploy). The same shape a
 // command gate strips before judging.
 
-// Drop heredoc bodies: from a line carrying `<<TAG` (also `<<-TAG`, quoted
-// tags) through the terminating line `TAG`. Head lines are kept verbatim so
-// the redirect target (`cat > <target> <<EOF`) is still judged. `<<<`
-// herestrings carry their word on the same line and are left alone (the
-// quote strip below handles their prose).
+// Heredocs, read the way bash reads them. An opener counts only where bash
+// sees one: outside quotes, comments, `${…}` and arithmetic (`$((a<<b))`,
+// `$[a<<b]` and the subscript in `a[1<<2]=3` shift), and inside `$(…)` and
+// `(…)`, which hold commands again
+// (`git commit -m "$(cat <<'EOF'` opens one). A `<<<` herestring opens none,
+// and neither does a backtick span: bash takes it whole, quotes and all, up to
+// the next backtick, so a heredoc in it never reaches past it.
+// The delimiter is the shell word after `<<` or `<<-`, quote-removed:
+// `<<'EOF'`, `<<"EOF"`, `<<\EOF`, `<<E"OF"` and `<<'EOF bar'` each end at the
+// line holding that word, and any quoting in it leaves the body unexpanded.
+// A body starts below the line on which the command line ends, so a quote or
+// a `\` continuation still open at the end of the opener's line defers it.
 //
-// Linear in the command: the open tags are a queue read through an index
-// (`shift()` on a long array is linear, so a line of many openers made the
-// walk quadratic), and tags are pushed one at a time (a spread of 120 000
-// arguments overflows the call stack).
+// A body is text the gates do not judge, so an opener read where bash sees
+// none would hide every command after it. Each doubt therefore reads as no
+// opener, and a terminator is matched trimmed, so a body never runs past the
+// line bash ends it on. So every `name[` at a word start is read as a
+// subscript, though bash reads one only in an assignment: after `declare`, or
+// as a plain argument, its heredoc stays visible to the gates.
+//
+// Linear in the command: each character outside a body is looked at once,
+// each body line once.
+
+// Characters that end an unquoted word; a `#` after one opens a comment.
+const WORD_END = /[\s;&|()<>]/;
+// The contexts that hold commands: `<<` is an operator there, and a newline
+// ends the command line.
+const isCommandContext = (t) => t === 'top' || t === 'sub' || t === 'paren';
+
+// The delimiter word of a heredoc, read from `line[i]` past `<<`/`<<-` and
+// blanks: { tag, quoted, end }, or null when no word bash would take whole
+// starts there (none, a quote left open, or an expansion inside it).
+const readDelimiter = (line, i) => {
+  let tag = '';
+  let quoted = false;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === "'") {
+      const close = line.indexOf("'", i + 1);
+      if (close < 0) return null;
+      tag += line.slice(i + 1, close);
+      quoted = true;
+      i = close + 1;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < line.length && line[j] !== '"') {
+        if (line[j] === '`' || (line[j] === '$' && (line[j + 1] === '(' || line[j + 1] === '{'))) return null;
+        if (line[j] === '\\' && /["\\$`]/.test(line[j + 1] ?? '')) j++;
+        tag += line[j];
+        j++;
+      }
+      if (j >= line.length) return null;
+      quoted = true;
+      i = j + 1;
+    } else if (c === '\\') {
+      if (i + 1 >= line.length) return null;
+      tag += line[i + 1];
+      quoted = true;
+      i += 2;
+    } else if (c === '`' || (c === '$' && (line[i + 1] === '(' || line[i + 1] === '{' || line[i + 1] === "'"))) {
+      return null;
+    } else if (WORD_END.test(c)) {
+      break;
+    } else {
+      tag += c;
+      i++;
+    }
+  }
+  return tag === '' && !quoted ? null : { tag, quoted, end: i };
+};
+
+// `case` and `esac` as words, so a pattern's `)` inside `$(…)` does not close it.
+const keywordAt = (line, j, word, wordStart) =>
+  wordStart && line.startsWith(word, j) && (j + word.length === line.length || /[\s;&|()]/.test(line[j + word.length]));
+
+// An arithmetic context: `((`/`$((` closes at `))`, `$[` and a subscript at
+// the matching `]`.
+const arith = (close) => ({ t: 'arith', open: close === ']' ? '[' : '(', close, depth: 0 });
+
+// `name[` at a word start: an array subscript.
+const SUBSCRIPT = /[A-Za-z_]\w*\[/y;
+
+// `$(`, `$((`, `$[`, `${` and a backtick open a context; any other character
+// is passed over. Returns the next index.
+const expansion = (line, j, stack, inDq) => {
+  const c = line[j];
+  if (c === '$' && line[j + 1] === '[') {
+    stack.push(arith(']'));
+    return j + 2;
+  }
+  if (c === '$' && line[j + 1] === '(') {
+    if (line[j + 2] === '(') {
+      stack.push(arith(')'));
+      return j + 3;
+    }
+    stack.push({ t: 'sub', cases: 0 });
+    return j + 2;
+  }
+  if (c === '$' && line[j + 1] === '{') {
+    stack.push({ t: 'param', inDq });
+    return j + 2;
+  }
+  if (c === '`') {
+    stack.push({ t: 'bq' });
+    return j + 1;
+  }
+  return j + 1;
+};
+
+// Scan one line outside a body, carrying the context stack across lines and
+// pushing each opener found to `found`. `firstStartsWord` says whether the
+// line's first character starts a word (false after a `\` continuation glued
+// to a word). Returns { ends, nextStartsWord }: `ends` is true when the line's
+// newline ends the command line, so pending bodies start below it.
+const scanLine = (line, stack, found, firstStartsWord) => {
+  const n = line.length;
+  const wordStart = (j) => (j === 0 ? firstStartsWord : WORD_END.test(line[j - 1]));
+  let continued = false;
+  let j = 0;
+  while (j < n) {
+    const ctx = stack[stack.length - 1];
+    const c = line[j];
+    if (ctx.t === 'sq') {
+      if (c === "'") stack.pop();
+      j++;
+    } else if (ctx.t === 'bq') {
+      if (c === '\\') j += 2;
+      else {
+        if (c === '`') stack.pop();
+        j++;
+      }
+    } else if (ctx.t === 'ansi') {
+      if (c === '\\') j += 2;
+      else {
+        if (c === "'") stack.pop();
+        j++;
+      }
+    } else if (ctx.t === 'arith') {
+      if (c === ctx.open) {
+        ctx.depth++;
+        j++;
+      } else if (c === ctx.close) {
+        if (ctx.depth > 0) {
+          ctx.depth--;
+          j++;
+        } else {
+          stack.pop();
+          j += c === ')' && line[j + 1] === ')' ? 2 : 1;
+        }
+      } else if (c === "'") {
+        stack.push({ t: 'sq' });
+        j++;
+      } else if (c === '"') {
+        stack.push({ t: 'dq' });
+        j++;
+      } else if (c === '\\') j += 2;
+      else j = expansion(line, j, stack, false);
+    } else if (ctx.t === 'dq') {
+      if (c === '\\') j += 2;
+      else if (c === '"') {
+        stack.pop();
+        j++;
+      } else j = expansion(line, j, stack, true);
+    } else if (ctx.t === 'param') {
+      if (c === '\\') j += 2;
+      else if (c === '}') {
+        stack.pop();
+        j++;
+      } else if (c === '"') {
+        stack.push({ t: 'dq' });
+        j++;
+      } else if (c === "'" && !ctx.inDq) {
+        stack.push({ t: 'sq' });
+        j++;
+      } else j = expansion(line, j, stack, ctx.inDq);
+    } else if (c === '\\') {
+      // From here on a command context: top level, `$(…)` or `(…)`.
+      if (j + 1 >= n) continued = true;
+      j += 2;
+    } else if (c === '$' && line[j + 1] === "'") {
+      stack.push({ t: 'ansi' });
+      j += 2;
+    } else if (c === "'") {
+      stack.push({ t: 'sq' });
+      j++;
+    } else if (c === '"') {
+      stack.push({ t: 'dq' });
+      j++;
+    } else if (c === '#' && wordStart(j)) {
+      j = n;
+    } else if (wordStart(j) && ((SUBSCRIPT.lastIndex = j), SUBSCRIPT.test(line))) {
+      // `a[1 << 2]=3` is arithmetic up to the `]`.
+      stack.push(arith(']'));
+      j = SUBSCRIPT.lastIndex;
+    } else if (c === '(' && line[j + 1] === '(') {
+      // `(( a << 2 ))` is arithmetic.
+      stack.push(arith(')'));
+      j += 2;
+    } else if (c === '(') {
+      stack.push({ t: 'paren', cases: 0 });
+      j++;
+    } else if (c === ')') {
+      if (ctx.cases === 0 && (ctx.t === 'sub' || ctx.t === 'paren')) stack.pop();
+      j++;
+    } else if (c === '<' && line[j + 1] === '<') {
+      if (line[j + 2] === '<') {
+        j += 3;
+        continue;
+      }
+      let k = j + 2;
+      if (line[k] === '-') k++;
+      while (line[k] === ' ' || line[k] === '\t') k++;
+      const d = readDelimiter(line, k);
+      if (d) {
+        found.push({ head: line, tag: d.tag, quoted: d.quoted });
+        j = d.end;
+      } else j += 2;
+    } else if (keywordAt(line, j, 'case', wordStart(j))) {
+      ctx.cases++;
+      j += 4;
+    } else if (keywordAt(line, j, 'esac', wordStart(j))) {
+      ctx.cases = Math.max(0, ctx.cases - 1);
+      j += 4;
+    } else j = expansion(line, j, stack, false);
+  }
+  return {
+    ends: !continued && isCommandContext(stack[stack.length - 1].t),
+    nextStartsWord: !continued || n < 2 || WORD_END.test(line[n - 2]),
+  };
+};
+
+// Every heredoc in the command, in order: { head, tag, quoted, from, to },
+// where `head` is the line holding the opener and lines [from, to) are its
+// body; `to` is the terminator's index, or the line count when it is unclosed.
+// An opener whose command line never ends (a quote left open) has no body.
+const scanHeredocs = (lines) => {
+  const out = [];
+  const stack = [{ t: 'top', cases: 0 }];
+  const found = [];
+  let startsWord = true;
+  let i = 0;
+  while (i < lines.length) {
+    const { ends, nextStartsWord } = scanLine(lines[i], stack, found, startsWord);
+    startsWord = nextStartsWord;
+    i++;
+    if (!ends || found.length === 0) continue;
+    for (const h of found) {
+      const from = i;
+      while (i < lines.length && lines[i].trim() !== h.tag) i++;
+      out.push({ head: h.head, tag: h.tag, quoted: h.quoted, from, to: i });
+      if (i < lines.length) i++;
+    }
+    found.length = 0;
+  }
+  for (const h of found) out.push({ head: h.head, tag: h.tag, quoted: h.quoted, from: lines.length, to: lines.length });
+  return out;
+};
+
+// Drop heredoc bodies and their terminator lines. Head lines are kept verbatim
+// so the redirect target (`cat > <target> <<EOF`) is still judged; a
+// herestring's word stays on its line (the quote strip below handles its
+// prose).
 export const stripHeredocBodies = (command) => {
   const lines = String(command ?? '').split('\n');
   const kept = [];
-  const pending = [];
-  let next = 0;
-  for (const line of lines) {
-    if (next < pending.length) {
-      if (pending[next] === line.trim()) next++;
-      continue;
-    }
-    pending.length = 0;
-    next = 0;
-    const re = /<<(?![<])-?~?\s*['"]?([A-Za-z_]\w*)['"]?/g;
-    let m;
-    while ((m = re.exec(line)) !== null) pending.push(m[1]);
-    kept.push(line);
+  let at = 0;
+  for (const h of scanHeredocs(lines)) {
+    for (; at < h.from; at++) kept.push(lines[at]);
+    at = Math.min(lines.length, h.to + 1);
   }
+  for (; at < lines.length; at++) kept.push(lines[at]);
   return kept.join('\n');
 };
 
@@ -247,40 +491,24 @@ export const commandWord = (words) => {
   return index < 0 ? '' : words[index].replace(OPENERS_RE, '');
 };
 
-// Heredoc bodies in the RAW command, one entry per `<<TAG`, in order: the
+// Heredoc bodies in the RAW command, one entry per opener, in order: the
 // head line that opened it and the body lines up to the terminator. Mirrors
 // stripHeredocBodies, which drops exactly these lines; a gate that has to
 // READ a body (a message passed as `-F - <<EOF` or `-m "$(cat <<EOF)"`)
-// pairs a segment with the entry whose head line carries it.
-// Linear, as stripHeredocBodies is: an index into the queue, never `shift()`.
+// pairs a segment with the entry whose head line carries it. `quoted` is true
+// when any part of the delimiter is quoted (`<<'TAG'`, `<<"TAG"`, `<<\TAG`),
+// so the shell leaves the body unexpanded and a substitution in it never runs.
+// An unclosed body runs to the end of the command.
 export const heredocBodies = (command) => {
   const lines = String(command ?? '').split('\n');
-  const out = [];
-  const pending = [];
-  let next = 0;
-  for (const line of lines) {
-    if (next < pending.length) {
-      const cur = pending[next];
-      if (cur.tag === line.trim()) {
-        out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
-        next++;
-      } else {
-        cur.body.push(line);
-      }
-      continue;
-    }
-    pending.length = 0;
-    next = 0;
-    const re = /<<(?![<])-?~?\s*['"]?([A-Za-z_]\w*)['"]?/g;
-    let m;
-    while ((m = re.exec(line)) !== null) pending.push({ head: line, tag: m[1], body: [] });
-  }
-  for (let k = next; k < pending.length; k++) {
-    const cur = pending[k];
-    out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
-  }
-  return out;
+  return scanHeredocs(lines).map((h) => ({
+    head: h.head,
+    tag: h.tag,
+    body: lines.slice(h.from, h.to).join('\n'),
+    quoted: h.quoted,
+  }));
 };
+
 // Is the text at `index` an actual command, or is it sitting inside a quoted
 // string or a comment? Shared by gates that refuse a command string: without
 // this a gate refuses an `echo` of a command in quotes, which does nothing —
