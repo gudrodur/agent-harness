@@ -530,7 +530,7 @@ var scanFile = (content, file) => {
   return found;
 };
 var render = (raw, format, current) => {
-  const v = raw.replace(/\s+$/u, "");
+  const v = format === "int" || format === "word" ? raw.trim() : raw.replace(/\s+$/u, "");
   if (format === "int")
     return /^\d+$/.test(v) ? { value: v } : { error: `not an int: ${JSON.stringify(v.slice(0, 60))}` };
   if (format === "word") {

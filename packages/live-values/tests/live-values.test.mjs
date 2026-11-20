@@ -97,6 +97,24 @@ test("word with a non-integer value is an error, and a 31 snapshot stays checked
   assert.equal(cli(root, "--check").status, 0);
 });
 
+test("BSD wc -l padding: a space-padded count is read as the bare integer; real garbage still fails", () => {
+  // macOS `wc -l` prints "       0"; the parser must trim both ends before validating.
+  const reg = (run, format) => ({ n: { run, kind: "snapshot", format, maxAgeDays: 7 } });
+  for (const format of ["int", "word"]) {
+    const root = sandbox({ doc: `Has ${M("n", "two")} routes.\n`, registry: reg("printf '       0\\n'", format) });
+    const r = cli(root, "--snapshot");
+    assert.equal(r.status, 0, `${format}: ${r.stderr}${r.stdout}`);
+    assert.equal(cli(root, "--write").status, 0);
+    assert.match(doc(root), format === "word" ? /zero/ : /\b0\b/);
+  }
+  for (const bad of ["-1", "abc", "1 2", "+3", "1.5"]) {
+    for (const format of ["int", "word"]) {
+      const r = cli(sandbox({ doc: `Has ${M("n", "two")} routes.\n`, registry: reg(`printf '   ${bad}  '`, format) }), "--snapshot");
+      assert.notEqual(r.status, 0, `${format} ${JSON.stringify(bad)} must fail`);
+    }
+  }
+});
+
 test("an unknown NAME is exit 1, and a registered name no doc shows is exit 1", () => {
   const unknown = sandbox({ doc: `We run ${M("nope", "3")} servers.\n` });
   assert.deepEqual(rows(cli(unknown, "--check", "--format=json")).map((r) => r.result), ["UNKNOWN", "UNUSED"]);

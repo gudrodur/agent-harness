@@ -14,6 +14,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A space-padded count is read as the bare integer. BSD (macOS) `wc -l` prints
+  `       0`, which `int` and `word` formats rejected as not a non-negative int.
+  Both ends are trimmed before validating; only `^\s*\d+\s*$` passes, so `-1`
+  and `abc` still fail. `text` format is unchanged.
 - `stripHeredocBodies` and `heredocBodies` (`engine/lib/shell-command.mjs`) are
   linear in the command. A line holding many heredoc openers made them
   quadratic (`shift()` on the open-tag queue), and about 120 000 openers threw
