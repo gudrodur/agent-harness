@@ -141,6 +141,40 @@ test("a dead first pipeline stage is could-not-check, never a confident 0 (BSD g
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
 });
 
+test("a dead earlier stage is could-not-check even when stderr is silent (false | wc -w reads 0)", () => {
+  const shim = trackTemp(fs.mkdtempSync(path.join(os.tmpdir(), "lv-shim-")));
+  // BSD grep with -P: complains, prints nothing, exits 2. The author silenced stderr.
+  fs.writeFileSync(path.join(shim, "grep"), "#!/bin/sh\necho 'grep: invalid option -- P' >&2\nexit 2\n", { mode: 0o755 });
+  const check = (run, format, shown, withShim = false) => {
+    const root = sandbox({ doc: `Has ${M("n", shown)} things.\n`, registry: { n: { run, kind: "snapshot", format, maxAgeDays: 7 } } });
+    fs.writeFileSync(path.join(root, "f.txt"), "a b c\n");
+    const env = { ...process.env, PATH: withShim ? `${shim}${path.delimiter}${process.env.PATH}` : process.env.PATH, CLAUDE_CONFIG_ROOT: root, LIVE_VALUES_STORE: storeOf(root) };
+    return spawnSync(process.execPath, [SCRIPT, "--snapshot", "--format=json"], { encoding: "utf8", env });
+  };
+  for (const format of ["word", "int"]) {
+    const dead = check("false | wc -w", format, "3");
+    assert.equal(dead.status, 1, `${format}: ${dead.stdout}${dead.stderr}`);
+    assert.match(dead.stdout, /exited 1/);
+    const silenced = check("grep -oP 'a' f.txt 2>/dev/null | wc -w", format, "3", true);
+    assert.equal(silenced.status, 1, `${format} silenced: ${silenced.stdout}${silenced.stderr}`);
+    assert.match(silenced.stdout, /exited 2/);
+  }
+  // grep exits 1 for no match, so an earlier grep stage at 1 is a real zero; a dead last stage still fails.
+  const none = check("cat f.txt | grep zzz | wc -l | tr -d ' '", "int", "0");
+  assert.equal(none.status, 0, none.stdout + none.stderr);
+  const lastDead = check("cat f.txt | false", "int", "0");
+  assert.equal(lastDead.status, 1);
+});
+
+test("--snapshot: an int query that writes to stderr keeps the old value and exits 1", () => {
+  const reg = { n: { run: "printf 9; echo oops >&2", kind: "snapshot", format: "int", maxAgeDays: 7 } };
+  const root = sandbox({ doc: "No markers.\n", registry: reg, snapshot: { n: { value: "7", measuredAt: new Date().toISOString() } } });
+  const r = cli(root, "--snapshot", "--format=json");
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout).kept, ["n"]);
+  assert.equal(JSON.parse(fs.readFileSync(storeOf(root), "utf8")).n.value, "7", "old value kept");
+});
+
 test("an unknown NAME is exit 1, and a registered name no doc shows is exit 1", () => {
   const unknown = sandbox({ doc: `We run ${M("nope", "3")} servers.\n` });
   assert.deepEqual(rows(cli(unknown, "--check", "--format=json")).map((r) => r.result), ["UNKNOWN", "UNUSED"]);

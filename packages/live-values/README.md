@@ -26,7 +26,7 @@ commit here, so a commit or a PR must not fail on it.
 
 ## This repo checks itself
 
-The engine is <!-- live:engine-lines -->1617<!-- /live --> lines in `engine/`,
+The engine is <!-- live:engine-lines -->1657<!-- /live --> lines in `engine/`,
 covered by <!-- live:test-files -->7<!-- /live --> test files under `tests/`.
 CI runs `node dist/live-values.mjs --check` over this repo's docs on every push.
 
@@ -60,6 +60,17 @@ engine header (`node dist/live-values.mjs --help` here; `node scripts/live-value
 Unset means "the repo I'm in". `kind: file` entries never touch the store;
 `kind: snapshot` entries need a scheduled daily `--snapshot` run wherever the
 store lives (`--store-health` reports whether it is being kept).
+
+## Writing a query that runs everywhere
+
+A `word` or `int` query is could-not-check (exit 3), never a value, when it
+writes to stderr on exit 0, or when an earlier stage of its last pipeline died
+(exit 2 or more, or exit 1 from anything but `grep`, `rg`, `diff`, `cmp`,
+`test`). A dead first stage would otherwise leave `| wc -w` printing a
+confident 0, as BSD `grep -oP` does on macOS (no `-P`). Write queries with
+POSIX tools (`sed -n 's/…/\1/p'`, `grep -E`, `[[:space:]]`), not GNU flags, and
+do not hide a stage's failure with `2>/dev/null`: the exit status still counts.
+Grammar: `docs/grammar.md`.
 
 ## Requirements
 

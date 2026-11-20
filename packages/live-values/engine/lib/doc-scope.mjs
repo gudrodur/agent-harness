@@ -22,7 +22,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { commandStart, commandWord, shellWords, splitSegments } from "./shell-command.mjs";
+import { commandStart, commandWord, shellWords, splitSegments, splitSegmentsDetailed } from "./shell-command.mjs";
 
 // live-values' scope, portable to any repo it is copied into:
 // collectFiles plus the agent-facing docs of a project repo - root CLAUDE.md,
@@ -308,22 +308,62 @@ export const checkQuerySegments = (run, tools = LOCAL_TOOLS) => {
 
 export const clip200 = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
 
+// Stages that exit 1 for "nothing matched", not for failure: an earlier stage
+// of these at 1 is a real empty result (`grep zzz | wc -l` is a true 0).
+const NO_MATCH_TOOLS = new Set(["grep", "egrep", "fgrep", "rg", "diff", "cmp", "test", "["]);
+
+// The stages of the command's LAST pipeline, in order (the one PIPESTATUS reports).
+const lastPipelineStages = (run) => {
+  const segs = splitSegmentsDetailed(run).filter((s) => s.text.trim() !== "");
+  let start = segs.length - 1;
+  while (start > 0 && segs[start].sep === "|") start--;
+  return segs.slice(start).map((s) => s.text.trim());
+};
+
+// The first earlier stage whose status says it died, as a report line, else "".
+// A pipeline's own exit code is its LAST stage's, so a dead first stage leaves
+// `| wc -w` printing a confident 0. Exit 2 or more always counts; exit 1 counts
+// unless the stage is a tool that exits 1 for "no match".
+const deadStage = (run, statuses) => {
+  const stages = lastPipelineStages(run);
+  const known = stages.length === statuses.length;
+  for (let i = 0; i < statuses.length - 1; i++) {
+    const st = statuses[i];
+    if (st === 0) continue;
+    const cmd = known ? commandWord(shellWords(stages[i])) : "";
+    if (st === 1 && (!known || NO_MATCH_TOOLS.has(cmd.replace(/^.*\//, "")))) continue;
+    return `stage ${i + 1}${cmd ? ` (${cmd})` : ""} exited ${st}`;
+  }
+  return "";
+};
+
 // Run one command with bash -c in `root`. Never throws: a non-zero exit, a
 // timeout or a spawn error comes back as { ok: false, timedOut, output }, where
 // output is the text a report prints (clipped stdout + the error), never empty.
-// failOnStderr: a command that exits 0 but wrote to stderr also comes back
-// { ok: false }. A pipeline reports only its LAST stage's status, so a dead
-// first stage (BSD grep has no -P: it complains and prints nothing) leaves
-// `| wc -w` printing a confident 0; the stderr is the only trace it leaves.
-export const runCommand = (run, { root, timeoutMs, failOnStderr = false }) => {
-  const r = spawnSync("bash", ["-c", run], {
+// Two opt-in checks for a numeric value, both about an exit-0 run that should
+// not be trusted (a pipeline reports only its LAST stage):
+//   failOnStderr: the command wrote to stderr (BSD grep has no -P: it
+//     complains and prints nothing, so `| wc -w` prints 0);
+//   deadStages: an earlier pipeline stage exited non-zero (see deadStage), which
+//     catches the same dead stage when the author wrote 2>/dev/null.
+export const runCommand = (run, { root, timeoutMs, failOnStderr = false, deadStages = false }) => {
+  // PIPESTATUS of the last pipeline goes out on fd 3; `exit` keeps the last stage's status.
+  const script = deadStages
+    ? `${run}\n__lv_ps=("\${PIPESTATUS[@]}")\nprintf '%s ' "\${__lv_ps[@]}" >&3\nexit "\${__lv_ps[$((\${#__lv_ps[@]} - 1))]}"`
+    : run;
+  const r = spawnSync("bash", ["-c", script], {
     cwd: root,
     encoding: "utf8",
     timeout: timeoutMs,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe", ...(deadStages ? ["pipe"] : [])],
   });
   if (!r.error && r.status === 0) {
     if (failOnStderr && r.stderr.trim()) return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`) };
+    if (deadStages) {
+      const statuses = String(r.output?.[3] ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
+      const dead = statuses.length ? deadStage(run, statuses) : "";
+      if (dead) return { ok: false, timedOut: false, output: clip200(dead) };
+    }
     return { ok: true, stdout: r.stdout };
   }
   const message = r.error ? r.error.message : `Command failed: ${run}\n${r.stderr ?? ""}`;

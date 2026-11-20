@@ -14,6 +14,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A `word` or `int` query whose earlier pipeline stage died is could-not-check, even with
+  stderr silenced: `false | wc -w` and `grep -oP … 2>/dev/null | wc -w` no longer read
+  0. Exit 2 or more, or exit 1 from a non-`grep`-like tool, counts; a no-match `grep`
+  stage is a real 0. `runCommand` takes `deadStages`. Documented in `docs/grammar.md`
+  and the README; snapshot-path and `runCommand` unit tests added. (#51)
 - A `word` or `int` query that writes to stderr is `QUERY_FAILED` (could not check), not a
   value. A pipeline reports only its last stage's status, so `grep -oP ... | wc -w` on
   BSD grep (no `-P`) printed `0` and read as a confident "zero" (samtak-vefur#970).
