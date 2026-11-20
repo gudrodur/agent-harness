@@ -10,8 +10,9 @@
 // command gate strips before judging.
 
 // Heredocs, read the way bash reads them. An opener counts only where bash
-// sees one: outside quotes, comments, `${…}` and arithmetic (`$((a<<b))` is a
-// shift), and inside `$(…)` and `(…)`, which hold commands again
+// sees one: outside quotes, comments, `${…}` and arithmetic (`$((a<<b))`,
+// `$[a<<b]` and the subscript in `a[1<<2]=3` shift), and inside `$(…)` and
+// `(…)`, which hold commands again
 // (`git commit -m "$(cat <<'EOF'` opens one). A `<<<` herestring opens none,
 // and neither does a backtick span: bash takes it whole, quotes and all, up to
 // the next backtick, so a heredoc in it never reaches past it.
@@ -24,7 +25,9 @@
 // A body is text the gates do not judge, so an opener read where bash sees
 // none would hide every command after it. Each doubt therefore reads as no
 // opener, and a terminator is matched trimmed, so a body never runs past the
-// line bash ends it on.
+// line bash ends it on. So every `name[` at a word start is read as a
+// subscript, though bash reads one only in an assignment: after `declare`, or
+// as a plain argument, its heredoc stays visible to the gates.
 //
 // Linear in the command: each character outside a body is looked at once,
 // each body line once.
@@ -81,13 +84,24 @@ const readDelimiter = (line, i) => {
 const keywordAt = (line, j, word, wordStart) =>
   wordStart && line.startsWith(word, j) && (j + word.length === line.length || /[\s;&|()]/.test(line[j + word.length]));
 
-// `$(`, `$((`, `${` and a backtick open a context; any other character is
-// passed over. Returns the next index.
+// An arithmetic context: `((`/`$((` closes at `))`, `$[` and a subscript at
+// the matching `]`.
+const arith = (close) => ({ t: 'arith', open: close === ']' ? '[' : '(', close, depth: 0 });
+
+// `name[` at a word start: an array subscript.
+const SUBSCRIPT = /[A-Za-z_]\w*\[/y;
+
+// `$(`, `$((`, `$[`, `${` and a backtick open a context; any other character
+// is passed over. Returns the next index.
 const expansion = (line, j, stack, inDq) => {
   const c = line[j];
+  if (c === '$' && line[j + 1] === '[') {
+    stack.push(arith(']'));
+    return j + 2;
+  }
   if (c === '$' && line[j + 1] === '(') {
     if (line[j + 2] === '(') {
-      stack.push({ t: 'arith', depth: 0 });
+      stack.push(arith(')'));
       return j + 3;
     }
     stack.push({ t: 'sub', cases: 0 });
@@ -133,16 +147,16 @@ const scanLine = (line, stack, found, firstStartsWord) => {
         j++;
       }
     } else if (ctx.t === 'arith') {
-      if (c === '(') {
+      if (c === ctx.open) {
         ctx.depth++;
         j++;
-      } else if (c === ')') {
+      } else if (c === ctx.close) {
         if (ctx.depth > 0) {
           ctx.depth--;
           j++;
         } else {
           stack.pop();
-          j += line[j + 1] === ')' ? 2 : 1;
+          j += c === ')' && line[j + 1] === ')' ? 2 : 1;
         }
       } else if (c === "'") {
         stack.push({ t: 'sq' });
@@ -185,9 +199,13 @@ const scanLine = (line, stack, found, firstStartsWord) => {
       j++;
     } else if (c === '#' && wordStart(j)) {
       j = n;
+    } else if (wordStart(j) && ((SUBSCRIPT.lastIndex = j), SUBSCRIPT.test(line))) {
+      // `a[1 << 2]=3` is arithmetic up to the `]`.
+      stack.push(arith(']'));
+      j = SUBSCRIPT.lastIndex;
     } else if (c === '(' && line[j + 1] === '(') {
       // `(( a << 2 ))` is arithmetic.
-      stack.push({ t: 'arith', depth: 0 });
+      stack.push(arith(')'));
       j += 2;
     } else if (c === '(') {
       stack.push({ t: 'paren', cases: 0 });

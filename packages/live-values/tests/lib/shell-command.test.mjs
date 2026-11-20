@@ -71,6 +71,33 @@ test("a `<<` inside quotes, a comment or arithmetic opens no heredoc", () => {
   }
 });
 
+// `$[…]` and a subscript are arithmetic: `a[1<<2]=3` shifts. Main kept these
+// lines because it took only an identifier as the delimiter; reading the
+// whole word, `2]=3` would end the body nowhere and hide every later line
+// (round 2 of #44). After `declare` or as a plain argument bash does read a
+// heredoc there; keeping its body visible to the gates is the safe side.
+test("a `<<` inside `$[…]` or an array subscript opens no heredoc", () => {
+  for (const head of [
+    "echo $[1<<2]",
+    'echo "$[1<<2]"',
+    "a[1<<2]=3",
+    "a[1<<2]+=3",
+    "x=1 a[1<<2]=3",
+    "a[$((1))<<2]=3",
+    "a[b[1]<<2]=3",
+    "echo ${a[1<<2]}",
+    "f() { a[1<<2]=3; }; f",
+    "declare a[1<<2]=3",
+  ]) {
+    const command = `${head}\necho RAN\n2\nls`;
+    assert.equal(stripHeredocBodies(command), command, head);
+    assert.deepEqual(heredocBodies(command), [], head);
+  }
+  // After the `]` the line is a command line again.
+  assert.equal(stripHeredocBodies("a[1<<2]=3 cat <<EOF\nb\nEOF\nls"), "a[1<<2]=3 cat <<EOF\nls");
+  assert.equal(stripHeredocBodies("echo $[1<<2] <<EOF\nb\nEOF\nls"), "echo $[1<<2] <<EOF\nls");
+});
+
 test("an opener inside a command substitution still opens, also within double quotes", () => {
   const command = "git commit -m \"$(cat <<'EOF'\nmsg $(rm x)\nEOF\n)\"\nls";
   assert.equal(stripHeredocBodies(command), "git commit -m \"$(cat <<'EOF'\n)\"\nls");
@@ -138,6 +165,10 @@ const SHAPES = [
   () => ": $'a\\'<<EOF'",
   () => "x=`: <<EOF",
   () => "`",
+  () => ": $[1<<EOF]",
+  () => "a[1<<EOF]=3",
+  () => "a[1<<2]=3",
+  () => "declare a[1<<EOF]=3 2>/dev/null",
 ];
 const SUFFIXES = [(n) => ` ; echo @@L${n}@@`, () => " <<EOF", () => " <<\\EOF", () => " 'q<<EOF'", () => " # <<EOF", () => ""];
 

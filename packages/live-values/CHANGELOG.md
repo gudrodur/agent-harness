@@ -21,7 +21,8 @@ All notable changes to this project are documented here. The format follows
   bundle does not use them, so `dist/` is unchanged.
 - The heredoc readers (`stripHeredocBodies`, `heredocBodies`) share one
   scanner that finds heredocs where bash does. A `<<` inside quotes, a
-  comment, arithmetic (`$((a<<b))`), `${…}` or a backtick span no longer opens
+  comment, arithmetic (`$((a<<b))`, `$[a<<b]`, the subscript in
+  `a[1<<2]=3`), `${…}` or a backtick span no longer opens
   a heredoc that hid every later line from the gates; one inside `$(…)` still
   does. A `<<<word` herestring opens none. The delimiter is the whole shell
   word, quote-removed (`<<\TAG`, `<<E"OF"`, `<<'EOF bar'`, `<<END-OF`), and a
