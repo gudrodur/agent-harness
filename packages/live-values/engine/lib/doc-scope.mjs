@@ -18,7 +18,7 @@
 // markers as the block's end, so everything after it read as hand-written, and
 // a claim placed there reported `ok` when it should be MISPLACED.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -311,22 +311,27 @@ export const clip200 = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 200
 // Run one command with bash -c in `root`. Never throws: a non-zero exit, a
 // timeout or a spawn error comes back as { ok: false, timedOut, output }, where
 // output is the text a report prints (clipped stdout + the error), never empty.
-export const runCommand = (run, { root, timeoutMs }) => {
-  try {
-    const stdout = execFileSync("bash", ["-c", run], {
-      cwd: root,
-      encoding: "utf8",
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true, stdout };
-  } catch (err) {
-    const out = clip200((err.stdout ?? "") + " " + (err.message ?? ""));
-    const timedOut = /ETIMEDOUT|timed out/i.test(String(err.message ?? ""));
-    return {
-      ok: false,
-      timedOut,
-      output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : (out || "exit without output"),
-    };
+// failOnStderr: a command that exits 0 but wrote to stderr also comes back
+// { ok: false }. A pipeline reports only its LAST stage's status, so a dead
+// first stage (BSD grep has no -P: it complains and prints nothing) leaves
+// `| wc -w` printing a confident 0; the stderr is the only trace it leaves.
+export const runCommand = (run, { root, timeoutMs, failOnStderr = false }) => {
+  const r = spawnSync("bash", ["-c", run], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (!r.error && r.status === 0) {
+    if (failOnStderr && r.stderr.trim()) return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`) };
+    return { ok: true, stdout: r.stdout };
   }
+  const message = r.error ? r.error.message : `Command failed: ${run}\n${r.stderr ?? ""}`;
+  const out = clip200((r.stdout ?? "") + " " + message);
+  const timedOut = /ETIMEDOUT|timed out/i.test(String(r.error?.message ?? ""));
+  return {
+    ok: false,
+    timedOut,
+    output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : (out || "exit without output"),
+  };
 };

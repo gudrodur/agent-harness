@@ -14,6 +14,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A `word` or `int` query that writes to stderr is `QUERY_FAILED` (could not check), not a
+  value. A pipeline reports only its last stage's status, so `grep -oP ... | wc -w` on
+  BSD grep (no `-P`) printed `0` and read as a confident "zero" (samtak-vefur#970).
+  `runCommand` takes `failOnStderr`; text formats are unchanged. (#49)
 - A space-padded count is read as the bare integer. BSD (macOS) `wc -l` prints
   `       0`, which `int` and `word` formats rejected as not a non-negative int.
   Both ends are trimmed before validating; only `^\s*\d+\s*$` passes, so `-1`
