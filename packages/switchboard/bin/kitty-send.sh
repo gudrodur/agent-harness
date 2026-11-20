@@ -188,16 +188,18 @@ COPILOT_STATE_DIR="${COPILOT_STATE_DIR:-$HOME/.copilot/session-state}"
 # One of busy|idle|exited|unknown. Anything the state script cannot answer —
 # no such window, no session file, unreadable file — is unknown, never fatal
 # here: the spinner fallback below is weaker but still available.
-tab_state_of() { # $1 = window id
+# $2, when given, is a kitty @ ls record of the window just read: tab-state
+# uses it instead of asking kitty again (TAB_STATE_LS_JSON).
+tab_state_of() { # $1 = window id, $2 = optional kitty @ ls record
   [ -x "$STATE_SH" ] || { printf 'unknown'; return 0; }
-  out=$("$STATE_SH" "$1" --json 2>/dev/null) || { printf 'unknown'; return 0; }
+  out=$(TAB_STATE_LS_JSON="${2:-}" "$STATE_SH" "$1" --json 2>/dev/null) || { printf 'unknown'; return 0; }
   printf '%s' "$out" | jq -r '.state // "unknown"' 2>/dev/null || printf 'unknown'
 }
 # The full --json verdict, or nothing with exit 1. The send proof below reads
 # .session and .lines off it.
-tab_state_json() { # $1 = window id
+tab_state_json() { # $1 = window id, $2 = optional kitty @ ls record
   [ -x "$STATE_SH" ] || return 1
-  "$STATE_SH" "$1" --json 2>/dev/null || return 1
+  TAB_STATE_LS_JSON="${2:-}" "$STATE_SH" "$1" --json 2>/dev/null || return 1
 }
 
 # CLAUDE CODE TABS (#38). The session record and transcript readers live in
@@ -278,24 +280,21 @@ KITTY_SEND_USAGE
 }
 
 
-kitty_up() { kitty @ ls >/dev/null 2>&1; }
+# kitty_up, win_record, win_pid, win_title, win_created, kitty_ls_full and the
+# backoff come from lib/kitty-ls.sh (sourced by lib/claude-session.sh above):
+# one cache, lock and breaker for every window read. A read returning 2 means
+# kitty did not answer; it is never taken for a gone window.
 
-# Every window as: <id>\t<window title>\t<tab title>
+# Every window as: <id>\t<window title>\t<tab title>, from the listing the
+# caller just read with kitty_ls_full (KITTY_LS_OUT).
 win_table() {
-  kitty @ ls 2>/dev/null | jq -r '
+  printf '%s' "$KITTY_LS_OUT" | jq -r '
     .[].tabs[] as $t | $t.windows[] |
     [ (.id|tostring), (.title // ""), ($t.title // "") ] | @tsv' 2>/dev/null
 }
-
-win_pid() {
-  kitty @ ls 2>/dev/null \
-    | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null \
-    | head -1
-}
-win_title() {
-  kitty @ ls 2>/dev/null \
-    | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .title // ""' 2>/dev/null \
-    | head -1
+# The message for a read that kitty did not answer, naming an overload.
+kitty_down_text() {
+  if [ "$KITTY_LS_RC" = 75 ]; then kitty_backoff_line; else printf '%s' "${KITTY_LS_MSG:-kitty remote control did not answer}"; fi
 }
 copilot_session_for_pid() {
   local window_pid="$1" session_dir lock lock_pid proc_cmdline
@@ -332,10 +331,10 @@ copilot_session_for_pid() {
 # NAMES copilot (an editor or pager on copilot.log) is not one. The title and
 # the session lock say nothing about liveness: a shell left behind resets the
 # title, a clean exit removes the lock, a kill leaves it under a dead pid.
-copilot_process_for_window() {
+copilot_process_for_window() { # $1 = window pid, $2 = the window's fresh kitty @ ls record
   local window_pid="$1" pid
   [ -n "$window_pid" ] || return 1
-  for pid in $(kitty @ ls 2>/dev/null | jq -r --argjson id "$WID" '
+  for pid in $(printf '%s' "${2:-}" | jq -r --argjson id "$WID" '
     def base: tostring | split("/") | last;
     .[].tabs[].windows[] | select(.id == $id) |
     (.foreground_processes // [])[] |
@@ -373,11 +372,6 @@ copilot_bind_window() { # $1 = window id, $2 = window pid
 }
 copilot_window_bound() { # $1 = window id, $2 = window pid
   [ -n "$2" ] && [ "$(cat "$(copilot_binding_file "$1")" 2>/dev/null)" = "$2" ]
-}
-win_created() {
-  kitty @ ls 2>/dev/null \
-    | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .created_at // empty' 2>/dev/null \
-    | head -1
 }
 
 # The one Enter the chip branches press. kitty before 0.33.0 ignored --match on
@@ -500,14 +494,14 @@ steerable_screen() {
 # spinner; Unknown (no session record, or the link is unproven) keeps the
 # existing spinner logic, which is the weaker proof. Kept as one function so
 # the wait loop and the exit-7 precheck cannot drift apart.
-target_busy() {  # $1 = title, $2 = window id
+target_busy() {  # $1 = title, $2 = window id, $3 = optional kitty @ ls record of it
   steerable_screen "$2" && return 1
   copilot_busy "$2" && return 0
-  case "$(tab_state_of "$2")" in
+  case "$(tab_state_of "$2" "${3:-}")" in
     busy) return 0 ;;
     idle) return 1 ;;
   esac
-  case "$(claude_state_of "$2")" in
+  case "$(claude_state_of "$2" "${3:-}")" in
     busy) return 0 ;;
     idle) return 1 ;;
   esac
@@ -529,8 +523,12 @@ copilot_event_state() {
   ' "$events" 2>/dev/null
 }
 copilot_events_for_window() {
-  local dir
-  dir=$(copilot_session_for_pid "$(win_pid "$1")") || return 1
+  local dir pid
+  # The target's pid was read fresh at the start (window_pid): a window keeps
+  # its pid for its whole life, so it is not asked for again.
+  if [ "$1" = "${WID:-}" ] && [ -n "${window_pid:-}" ]; then pid=$window_pid
+  else pid=$(win_pid "$1") || return 1; fi
+  dir=$(copilot_session_for_pid "$pid") || return 1
   [ -r "$dir/events.jsonl" ] || return 1
   printf '%s' "$dir/events.jsonl"
 }
@@ -583,7 +581,8 @@ case "${1:-}" in
 esac
 
 if [ "${1:-}" = "--list" ]; then
-  kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 12
+  kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)$KITTY_DIAG" 12
+  kitty_ls_full fresh || die "$(kitty_down_text) (nothing listed)" 12
   printf '%-6s %s\n' "ID" "TITLE"
   win_table | while IFS=$'\t' read -r id wtitle ttitle; do
     printf '%-6s %s\n' "$id" "${ttitle:-$wtitle}"
@@ -633,7 +632,8 @@ if [ "$NOW" = 1 ]; then
   [ "$WAIT_IDLE" = 0 ] || die "--now and --wait-idle/--deadline are mutually exclusive (one sends into a busy target, the other waits for it)"
 fi
 
-kitty_up || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 12
+# No separate probe here: the target read below is the first window read, and
+# a kitty that does not answer it exits 12 with the same diagnosis.
 
 if [ -n "$FILE" ]; then
   case "$FILE" in /*) : ;; *) die "--file must be an absolute path: a relative one resolves against the TARGET's cwd, not yours" ;; esac
@@ -666,6 +666,7 @@ esac
 # sending an instruction to the wrong agent is worse than not sending it.
 case "$TO" in
   ''|*[!0-9]*)
+    kitty_ls_full fresh || { kitty_diag; die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?) — cannot resolve --to $TO (nothing was sent)$KITTY_DIAG" 12; }
     matches=$(win_table | awk -F'\t' -v pat="$TO" 'index($2, pat) || index($3, pat) { print $1 "\t" ($3 == "" ? $2 : $3) }')
     n=$(printf '%s' "$matches" | grep -c . || true)
     [ "$n" -ge 1 ] || die "no kitty window matches '$TO' (try --list)"
@@ -701,15 +702,20 @@ if [ "$CANCEL" = 1 ]; then
   exit 0
 fi
 
-[ -n "$(win_pid "$WID")" ] || die "window $WID is not alive (try --list)" 1
-window_pid=$(win_pid "$WID")
-window_title=$(win_title "$WID")
+# One fresh read of the target, never a cached one: the pid, the title and the
+# foreground processes the Copilot check below reads are what kitty says now.
+wrc=0; win_record "$WID" fresh || wrc=$?
+[ "$wrc" != 1 ] || die "window $WID is not alive (try --list)" 1
+[ "$wrc" = 0 ] || { kitty_diag; die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?) — cannot tell whether window $WID is alive (nothing was sent)$KITTY_DIAG" 12; }
+window_pid=$WREC_PID
+window_title=$WREC_TITLE
+last_rec=$WREC; last_title=$WREC_TITLE
 # A Copilot seat is delivered to only while a live Copilot is in the window's
 # foreground. Any sign that the window is or was a Copilot seat (the binding,
 # a lock named by the window pid, the title) without one is exit 17: the
 # message would otherwise run as a command in the shell left behind.
 copilot_pid=""
-if copilot_pid=$(copilot_process_for_window "$window_pid"); then
+if copilot_pid=$(copilot_process_for_window "$window_pid" "$WREC"); then
   copilot_bind_window "$WID" "$window_pid"
 elif copilot_window_bound "$WID" "$window_pid" \
   || copilot_session_for_pid "$window_pid" >/dev/null \
@@ -800,25 +806,56 @@ unbounded_proof_refuses() {
 }
 if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   idle_deadline=$(( $(date +%s) + WAIT_IDLE ))
-  waited=0
+  waited_ms=0; waited=0
   heartbeat_every=${KITTY_SEND_HEARTBEAT_S:-300}
   next_beat=$(( $(date +%s) + heartbeat_every ))
+  # One window read per pass, a cached answer allowed, its record handed on
+  # to the busy check. The gap between passes grows from 2 s to 10 s
+  # (KITTY_SEND_POLL_MS, KITTY_SEND_POLL_CAP_MS) while nothing changes and
+  # starts over when the title (less its first character) or kitty's
+  # availability changes; it never runs past a bounded wait's end,
+  # and while kitty is backing off it is at least the breaker's own retry
+  # time. kitty not answering is not the window dying.
+  BACKOFF_BASE_MS=${KITTY_SEND_POLL_MS:-2000}; BACKOFF_CAP_MS=${KITTY_SEND_POLL_CAP_MS:-10000}
+  backoff_reset; prev_snap=""; kitty_down=0
   while :; do
-    title=$(win_title "$WID")
-    [ -n "$(win_pid "$WID")" ] || die "window $WID died while waiting for it to go idle (nothing was sent)" 1
-    if ! target_busy "$title" "$WID" && ! dialog_or_die "$WID" && ! unbounded_proof_refuses; then
-      [ "$waited" -eq 0 ] || note "target went idle after ${waited}s: $title"
-      break
-    fi
-    if [ "$WAIT_UNBOUNDED" != 1 ] && [ "$(date +%s)" -ge "$idle_deadline" ]; then
-      if dialog_or_die "$WID"; then
-        die "target still shows a selection dialog after ${WAIT_IDLE}s (nothing was sent) — a dialog is the human's to answer" 5
+    wrc=0; win_record "$WID" || wrc=$?
+    [ "$wrc" != 1 ] || die "window $WID died while waiting for it to go idle (nothing was sent)" 1
+    min_ms=0
+    if [ "$wrc" = 2 ]; then
+      kitty_down=1; min_ms=$WREC_RETRY_MS; snap="kitty-unavailable"
+      if [ "$WAIT_UNBOUNDED" != 1 ] && [ "$(date +%s)" -ge "$idle_deadline" ]; then
+        die "kitty remote control did not answer for window $WID within the ${WAIT_IDLE}s wait: $(kitty_down_text) (nothing was sent)" 12
       fi
-      die "target still busy after ${WAIT_IDLE}s (nothing was sent): $title" 5
+    else
+      kitty_down=0; title=$WREC_TITLE; snap="${title#?}"
+      last_rec=$WREC; last_title=$title
+      if ! target_busy "$title" "$WID" "$WREC" && ! dialog_or_die "$WID" && ! unbounded_proof_refuses; then
+        [ "$waited" -eq 0 ] || note "target went idle after ${waited}s: $title"
+        break
+      fi
+      if [ "$WAIT_UNBOUNDED" != 1 ] && [ "$(date +%s)" -ge "$idle_deadline" ]; then
+        if dialog_or_die "$WID"; then
+          die "target still shows a selection dialog after ${WAIT_IDLE}s (nothing was sent) — a dialog is the human's to answer" 5
+        fi
+        die "target still busy after ${WAIT_IDLE}s (nothing was sent): $title" 5
+      fi
     fi
-    sleep 2; waited=$((waited + 2))
+    [ "$snap" = "$prev_snap" ] || backoff_reset
+    prev_snap=$snap
+    max_ms=""
+    if [ "$WAIT_UNBOUNDED" != 1 ]; then
+      max_ms=$(( (idle_deadline - $(date +%s)) * 1000 ))
+      [ "$max_ms" -gt 0 ] || max_ms=0
+    fi
+    backoff_sleep "$min_ms" "$max_ms"
+    waited_ms=$((waited_ms + BACKOFF_SLEPT_MS)); waited=$((waited_ms / 1000))
     if [ "$WAIT_UNBOUNDED" = 1 ] && [ "$(date +%s)" -ge "$next_beat" ]; then
-      note "still waiting for window $WID to go idle after ${waited}s (nothing sent yet) — the queued send is still held; cancel with: kitty-send.sh --cancel --to $WID"
+      if [ "$kitty_down" = 1 ]; then
+        note "still waiting for window $WID after ${waited}s (nothing sent yet): $(kitty_down_text) — the queued send is still held; cancel with: kitty-send.sh --cancel --to $WID"
+      else
+        note "still waiting for window $WID to go idle after ${waited}s (nothing sent yet) — the queued send is still held; cancel with: kitty-send.sh --cancel --to $WID"
+      fi
       next_beat=$(( $(date +%s) + heartbeat_every ))
     fi
   done
@@ -835,11 +872,15 @@ fi
 # caller can weigh, so it is never paid by default: refuse unless the
 # command line says --now. `die` prints regardless of --quiet, so a caller that
 # silenced the notes still sees why nothing went out.
-title=$(win_title "$WID")
+# The record read last (the fresh one at the start, or the wait loop's last
+# pass, which judged the window idle) serves the busy checks and the session
+# lookup below; it is not asked for again.
+title=$last_title
+pre_rec=$last_rec
 if title_busy "$title" && steerable_screen "$WID"; then
   note "window $WID has a spinner in its title but its screen matches --idle-when: treating it as parked, not working."
 fi
-if target_busy "$title" "$WID"; then
+if target_busy "$title" "$WID" "$pre_rec"; then
   if copilot_busy "$WID"; then
     note "window $WID is a busy Copilot turn; Copilot sends are held until its turn ends"
     die "refusing to send into a busy Copilot target (nothing was sent) — pass --wait-idle N or --queue to hold" 7
@@ -858,7 +899,7 @@ fi
 # was already busy (--now) being busy afterwards proves nothing about this send.
 if [ "$COPILOT_TAB" = 1 ]; then
   if copilot_busy "$WID"; then WAS_BUSY_BEFORE_SEND=1; else WAS_BUSY_BEFORE_SEND=0; fi
-elif title_busy "$title" || [ "$(tab_state_of "$WID")" = busy ] || [ "$(claude_state_of "$WID")" = busy ]; then
+elif title_busy "$title" || [ "$(tab_state_of "$WID" "$pre_rec")" = busy ] || [ "$(claude_state_of "$WID" "$pre_rec")" = busy ]; then
   WAS_BUSY_BEFORE_SEND=1
 else
   WAS_BUSY_BEFORE_SEND=0
@@ -876,14 +917,14 @@ OPENCODE_TAB=0; OPENCODE_SID=""; OPENCODE_HEAD=""
 # session, which writes it with the first prompt: that is line count 0, not
 # unknown.
 CLAUDE_TAB=0; CLAUDE_HEAD=""
-if claude_json=$(claude_session_json "$WID"); then
+if claude_json=$(claude_session_json "$WID" "$pre_rec"); then
   TAB_SESSION=$(claude_transcript_of "$claude_json")
   TAB_LINES=0
   [ -f "$TAB_SESSION" ] && TAB_LINES=$(wc -l < "$TAB_SESSION")
   STATE_KNOWN=1; CLAUDE_TAB=1
   CLAUDE_HEAD=$(printf '%s' "$TEXT" | cut -c1-40 | tr -d '[:space:]')
 fi
-if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID"); then
+if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID" "$pre_rec"); then
   st=$(printf '%s' "$state_json" | jq -r '.state' 2>/dev/null)
   if [ "$st" = "busy" ] || [ "$st" = "idle" ]; then
     TAB_SESSION=$(printf '%s' "$state_json" | jq -r '.session' 2>/dev/null)
@@ -902,7 +943,7 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID"); then
   fi
 fi
 if [ "$CLAUDE_TAB" = 0 ] && [ "$OPENCODE_TAB" = 0 ] \
-  && copilot_dir=$(copilot_session_for_pid "$(win_pid "$WID")"); then
+  && copilot_dir=$(copilot_session_for_pid "$window_pid"); then
   COPILOT_EVENTS="$copilot_dir/events.jsonl"
   if [ -r "$COPILOT_EVENTS" ]; then
     TAB_LINES=$(wc -l <"$COPILOT_EVENTS")
@@ -1062,7 +1103,10 @@ if [ "$STATE_KNOWN" = 0 ] && printf '%s' "$before_screen" | grep -qF -- '[Pasted
     _rec_created=$(grep -E '^created=' "$_rec" 2>/dev/null | cut -d= -f2)
     _owned_chips=$(grep -E '^chips=' "$_rec" 2>/dev/null | cut -d= -f2-)
   fi
-  _cur_pid=$(win_pid "$WID"); _cur_created=$(win_created "$WID")
+  # Read fresh: a stale record could match a reused id. No answer leaves both
+  # empty, which reads as not ours: nothing is pressed.
+  win_record "$WID" fresh || true
+  _cur_pid=$WREC_PID; _cur_created=$WREC_CREATED
   _owned=1
   if [ -z "$_rec_pid" ] || [ "$_rec_pid" != "$_cur_pid" ] || [ "$_rec_created" != "$_cur_created" ]; then
     _owned=0
@@ -1079,7 +1123,8 @@ if [ "$STATE_KNOWN" = 0 ] && printf '%s' "$before_screen" | grep -qF -- '[Pasted
     _cleared=0
     while [ "$(date +%s)" -lt "$_rec_deadline" ]; do
       sleep 1
-      if [ -z "$(win_pid "$WID")" ]; then break; fi
+      _wrc=0; win_record "$WID" || _wrc=$?
+      if [ "$_wrc" = 1 ]; then break; fi
       _s=$(kitty @ get-text --match "id:$WID" --extent all 2>/dev/null | tr -d '[:space:]' || true)
       if ! printf '%s' "$_s" | grep -qF -- '[Pastedtext#'; then _cleared=1; before_screen="$_s"; break; fi
     done
@@ -1159,7 +1204,9 @@ confirmed=0
 ENTER_SENT=0; saw_chip=0; chip_now=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 1
-  if [ -z "$(win_pid "$WID")" ]; then
+  # Only kitty saying the window is gone ends the wait; no answer is not a death.
+  _wrc=0; win_record "$WID" || _wrc=$?
+  if [ "$_wrc" = 1 ]; then
     note "window $WID died after the message was sent"
     break
   fi
@@ -1275,7 +1322,7 @@ slash_composer_rc() { # 0 clear, 2 still holds the text, anything else: could no
   printf '%s' "$TEXT" | node "$TYPING_PROOF" --window "$WID" --mode composer --stdin >/dev/null 2>&1 || rc=$?
   return "$rc"
 }
-if [ "$SLASH_SEND" = 1 ] && [ "$CLAUDE_TAB" = 1 ] && [ -n "$(win_pid "$WID")" ]; then
+if [ "$SLASH_SEND" = 1 ] && [ "$CLAUDE_TAB" = 1 ] && win_record "$WID"; then
   _slash_tries=0
   while :; do
     _src=0; slash_composer_rc || _src=$?
@@ -1315,7 +1362,8 @@ if [ "$saw_chip" = 1 ]; then
   _final_chips=$(screen_chips "$WID" | tr '\n' ' ' || true)
   [ -n "$_final_chips" ] || _final_chips="$chip_now"
   mkdir -p "$(dirname "$(stranded_file "$WID")")"
-  printf 'pid=%s\ncreated=%s\ntime=%s\nchips=%s\n' "$(win_pid "$WID")" "$(win_created "$WID")" "$(date +%s)" "$_final_chips" > "$(stranded_file "$WID")"
+  win_record "$WID" fresh || true
+  printf 'pid=%s\ncreated=%s\ntime=%s\nchips=%s\n' "$WREC_PID" "$WREC_CREATED" "$(date +%s)" "$_final_chips" > "$(stranded_file "$WID")"
   note "sent to window $WID but its composer still holds unsubmitted pasted text (chips ${_final_chips}) — the message reached the text box and was never submitted (this stranding is recorded for the next send)."
   note "Do NOT send it again blind: a second send is what enqueues an empty steering"
   note "message and wedges an agent. Look at the window first."

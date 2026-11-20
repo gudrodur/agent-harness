@@ -43,6 +43,8 @@ before(async () => {
     '#!/usr/bin/env bash',
     `state=${JSON.stringify(sessDir)}`,
     'if [ "$1/$2" = "@ /ls" ] || [ "$1" = "@" -a "$2" = "ls" ]; then',
+    '  echo ls >> "$state/ls-calls"',
+    '  if [ -f "$state/down" ]; then echo "Error: Failed to connect to unix:/nowhere" >&2; exit 1; fi',
     '  if [ -f "$state/no-window" ]; then printf \'[]\\n\'; exit 0; fi',
     '  pid=$(cat "$state/pid")',
     '  created=$(cat "$state/created" 2>/dev/null || date +%s%N)',
@@ -65,7 +67,7 @@ after(async () => {
 
 const clearLinks = async () => {
   for (const f of await fs.readdir(sessDir)) {
-    if (f === 'no-window' || f === 'claude-pid') await fs.rm(path.join(sessDir, f), { force: true });
+    if (f === 'no-window' || f === 'claude-pid' || f === 'down' || f === 'ls-calls') await fs.rm(path.join(sessDir, f), { force: true });
   }
 };
 
@@ -355,4 +357,44 @@ test('--watch reads a claude window through the same path', async () => {
   const lines = out.trim().split('\n');
   assert.deepEqual(lines.map((l) => /state=([a-z]+)/.exec(l)?.[1]), ['idle', 'busy']);
   assert.ok(lines.every((l) => l.includes(claudeTranscript())), out);
+});
+// ---- the caller's record and an unavailable kitty ----------------------------
+
+const lsCalls = async () => (await fs.readFile(path.join(sessDir, 'ls-calls'), 'utf8').catch(() => '')).split('\n').filter(Boolean).length;
+const recordOf = (pid) => JSON.stringify([{ tabs: [{ title: 'mock', windows: [{ id: Number(WID), title: 'mock', pid, cwd: WCWD, created_at: Number(createdNs()) }] }] }]);
+
+test('TAB_STATE_LS_JSON holding the window stands in for the read: kitty is not asked', async () => {
+  await clearLinks();
+  await fs.writeFile(path.join(sessDir, 'no-window'), '');
+  const r = await runScript([WID, '--json'], { TAB_STATE_LS_JSON: recordOf(process.pid) });
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.equal(JSON.parse(r.out).pid, process.pid);
+  assert.equal(await lsCalls(), 0);
+});
+
+test('a TAB_STATE_LS_JSON without the window is not used: kitty is asked', async () => {
+  await clearLinks();
+  await fs.writeFile(path.join(sessDir, 'no-window'), '');
+  const r = await runScript([WID, '--json'], { TAB_STATE_LS_JSON: '[{"tabs":[{"windows":[{"id":5}]}]}]' });
+  assert.equal(r.code, 1, `${r.out}${r.err}`);
+  assert.equal(await lsCalls(), 1);
+});
+
+test('--watch while kitty does not answer reports state=unknown reason=kitty-unavailable, never gone', async () => {
+  await clearLinks();
+  await fs.writeFile(path.join(sessDir, 'down'), '');
+  const child = spawn(SCRIPT, [WID, '--watch', '--interval=1'], {
+    env: isolatedEnv({ PATH: `${binDir}:${process.env.PATH}`, OPENCODE_TAB_DB: NO_OPENCODE_DB() }),
+  });
+  const closed = new Promise((r) => child.on('close', r));
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  await new Promise((r) => setTimeout(r, 3000));
+  const alive = child.exitCode === null;
+  child.kill();
+  await closed;
+  await clearLinks();
+  assert.ok(alive, `the watch ended: ${out}`);
+  assert.doesNotMatch(out, /state=gone/);
+  assert.deepEqual(out.trim().split('\n'), [`window ${WID} state=unknown reason=kitty-unavailable`]);
 });

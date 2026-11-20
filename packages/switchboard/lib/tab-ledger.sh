@@ -10,7 +10,8 @@
 # name is absent, which keeps the rows of tabs that are still open.
 #
 # Provided here so the two launchers cannot drift:
-#   kitty_up, config_root, claim_cli, win_pid   helpers
+#   config_root, claim_cli                       helpers (kitty_up and win_pid come
+#                                                from lib/kitty-ls.sh)
 #   tab_ledger_list                              --list: print live rows, prune gone ones,
 #                                                release a gone window's brief claims
 #   tab_ledger_close <id>                        --close: close only a window this ledger
@@ -37,28 +38,10 @@ if [ ! -e "$STATE" ] && [ -e "$_OLD_STATE" ]; then
   mv "$_OLD_STATE" "$STATE" 2>/dev/null || true
 fi
 
-# kitty_up keeps kitty's own error: on 2026-10-02 a /tmp sweep deleted the live
-# socket and the bare "unavailable" sent a session tracing the launcher instead
-# of reading "no such file or directory". On failure
-# KITTY_DIAG holds that error, $KITTY_LISTEN_ON, and whether the socket path
-# still exists; --list and --close append it to their refusal.
-KITTY_DIAG=""
-kitty_up() {
-  local err sock
-  err=$(kitty @ ls 2>&1 >/dev/null) && return 0
-  KITTY_DIAG=$'\n        kitty said: '"${err:-<nothing>}"
-  KITTY_DIAG+=$'\n        KITTY_LISTEN_ON='"${KITTY_LISTEN_ON:-<unset>}"
-  case "${KITTY_LISTEN_ON:-}" in
-    unix:@*) ;;  # abstract socket: no path to check
-    unix:*)
-      sock=${KITTY_LISTEN_ON#unix:}
-      if [ ! -e "$sock" ]; then
-        KITTY_DIAG+=$'\n        The socket path does not exist: something deleted it while kitty kept'
-        KITTY_DIAG+=$'\n        listening on the unlinked inode; only restart kitty restores it (it closes every window).'
-      fi ;;
-  esac
-  return 1
-}
+# kitty_up, win_record, win_pid, live_pid_map: the window reads, through the
+# shared cache, lock and breaker (lib/kitty-ls.sh). A read that returns 2 means
+# kitty did not answer, never that a window is gone.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kitty-ls.sh"
 
 config_root() {
   if [ -n "${AGENT_CONFIG_HOME:-}" ]; then printf "%s" "$AGENT_CONFIG_HOME"
@@ -73,26 +56,16 @@ claim_cli() {
   node "$CLAIM_CLI" "$@"
 }
 
-# WINDOW id -> its pid, empty if the window is gone.
-# `--match id:N` is AMBIGUOUS: kitty numbers tabs and windows in one space and
-# they overlap (measured 2026-08-28: tab ids 5,20 and window ids 5,20 on this
-# machine). So identity is resolved here against `.tabs[].windows[]` only, never
-# by a grep over the whole JSON, which would match a tab as readily as a window.
-win_pid() {
-  kitty @ ls 2>/dev/null \
-    | jq -r --argjson id "$1" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null \
-    | head -1
-}
-
 # --list. Each live row also carries the tab's state (bin/tab-state.sh).
 tab_ledger_list() {
-  local live_ids pruned line id pid launcher title now s stab stline st tl ag
+  local pruned line id pid launcher title now s stab stline st tl ag
   local state_tab; state_tab="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/tab-state.sh"
   kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
   [ -s "$STATE" ] || { echo "(no windows launched by this script)"; return 0; }
-  # One `ls` for the whole listing, not one per row: this file is append-only,
-  # so the per-row form cost a kitty subprocess per historical entry.
-  live_ids=$(kitty @ ls 2>/dev/null | jq -r '.[].tabs[].windows[].id' 2>/dev/null | tr '\n' ' ')
+  # One `ls` for the whole listing, ids and pids together, not one per row:
+  # this file is append-only, so a per-row read cost a kitty call per
+  # historical entry. A listing kitty did not give prunes nothing.
+  live_pid_map || die "kitty remote control did not answer the window list (${KITTY_LS_MSG:-no answer}); nothing pruned." 2
   # Gone rows are pruned on every list, not kept: a gone id can never be acted
   # on again (--close on one just deletes the row and says "already gone"), and
   # without pruning the append-only file grows forever. Only ids ABSENT from
@@ -115,14 +88,13 @@ tab_ledger_list() {
       @*) launcher=${3#@}; shift 3; title="$*" ;;
       *) launcher=unknown; shift 2 2>/dev/null; title="$*" ;;
     esac
-    case " $live_ids " in
-      *" $id "*)
-        now=$(win_pid "$id")
-        # An id can be REUSED: kitty's counter restarts with a new instance while
-        # this file survives in tmpfs. Same id + different pid is a stranger.
-        if [ "$now" = "$pid" ]; then s=live; else s="REUSED"; fi ;;
-      *) s=gone ;;
-    esac
+    if [ -n "$id" ] && now=$(live_pid_of "$id"); then
+      # An id can be REUSED: kitty's counter restarts with a new instance while
+      # this file survives in tmpfs. Same id + different pid is a stranger.
+      if [ "$now" = "$pid" ]; then s=live; else s="REUSED"; fi
+    else
+      s=gone
+    fi
     # Gone ids are dropped, not displayed; the stderr count below keeps the signal.
     if [ "$s" = "gone" ]; then
       [ -n "$id" ] && sed -i "/^$id /d" "$STATE" 2>/dev/null && pruned=$((pruned + 1))
@@ -151,17 +123,22 @@ tab_ledger_list() {
 # --close <id>. Returns 0 when the window was closed or was already gone; dies
 # (exit 1) for a window this ledger did not record or whose id was reused.
 tab_ledger_close() {
-  local id="${1:-}" row want_pid now_pid
+  local id="${1:-}" row want_pid now_pid rc=0
   [ -n "$id" ] || die "--close needs a window id"
   case "$id" in *[!0-9]*|"") die "--close takes a numeric window id, got: $id" ;; esac
   kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
 
   # The whole point: only ever close what a launcher here started.
   row=$(grep "^$id " "$STATE" 2>/dev/null | head -1)
+  # The pid now in that window, read fresh: 1 is gone, 2 is no answer, and no
+  # answer is never taken for gone.
+  win_record "$id" fresh || rc=$?
+  [ "$rc" != 2 ] || die "kitty remote control did not answer for window $id (${KITTY_LS_MSG:-no answer}) — cannot tell whether it is still there; nothing closed" 2
+  now_pid=$WREC_PID
   # No row but no window either (the row was pruned by --list after a hand
   # close): nothing can be closed, so the refusal guards nothing, but the
   # window's brief claims would outlive it. Release them and say so.
-  if [ -z "$row" ] && [ -z "$(win_pid "$id")" ]; then
+  if [ -z "$row" ] && [ "$rc" = 1 ]; then
     claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
     note "window $id is gone and has no state row — nothing to close; released its kitty:$id claims"
     return 0
@@ -172,9 +149,8 @@ tab_ledger_close() {
         closing it interrupts work you cannot see.${CLOSE_HINT:-}"
 
   want_pid=$(printf '%s' "$row" | awk '{print $2}')
-  now_pid=$(win_pid "$id")
 
-  if [ -z "$now_pid" ]; then
+  if [ "$rc" = 1 ]; then
     # Not an error worth an exit code, but it must not be reported as a closure.
     sed -i "/^$id /d" "$STATE" 2>/dev/null
     claim_cli --release-owner "kitty:$id" >/dev/null 2>&1 || true
@@ -207,10 +183,11 @@ tab_ledger_close() {
 # Guards shared by --retire and --close --after-loka, the two paths that close a
 # window this ledger never launched. One copy, so a fix lands in both.
 #   _tab_ledger_numeric_id <flag> <id>   the id is a number
-#   _tab_ledger_target <flag> <id>       sets LS (the parsed `kitty @ ls`) and NOW_PID
-#                                        (empty: the window is gone); refuses the caller's
-#                                        own window (22), no remote control (2) and a
-#                                        listing that is not a JSON array
+#   _tab_ledger_target <flag> <id>       sets LS (the window's fresh `kitty @ ls` record)
+#                                        and NOW_PID (empty: the window is gone); refuses
+#                                        the caller's own window (22), no remote control or
+#                                        a backing-off breaker (2) and a listing that is not
+#                                        a JSON array
 #   _tab_ledger_release_gone <id>        drop the row and release the claims of a gone window
 #   _tab_ledger_require_idle <id> <why>  refuse unless the seat is idle (23)
 #   _tab_ledger_close_window <id> <ok>   close it, then drop the row and release the claims
@@ -222,11 +199,16 @@ _tab_ledger_target() {
   [ "$id" != "${KITTY_WINDOW_ID:-}" ] \
     || die "window $id is this session's own window — refusing to close it." 22
   kitty_up || die "kitty remote control unavailable.$KITTY_DIAG" 2
-  # The listing must parse as an array: output that exits 0 but is not JSON
-  # would otherwise read as "no such window" and release a live seat's claims.
-  LS=$(kitty @ ls 2>/dev/null) && [ -n "$LS" ] && printf '%s' "$LS" | jq -e 'type == "array"' >/dev/null 2>&1 \
-    || die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
-  NOW_PID=$(printf '%s' "$LS" | jq -r --argjson id "$id" '.[].tabs[].windows[] | select(.id == $id) | .pid' 2>/dev/null | head -1)
+  # One fresh read of the window. The listing must parse as an array: output
+  # that exits 0 but is not JSON would otherwise read as "no such window" and
+  # release a live seat's claims. While the breaker is open nothing asks kitty.
+  local rc=0
+  win_record "$id" fresh || rc=$?
+  if [ "$rc" = 2 ]; then
+    [ "$KITTY_LS_RC" != 75 ] || die "$(kitty_backoff_line) — nothing closed" 2
+    die "kitty @ ls failed or returned something that is not a JSON array — cannot tell whether window $id is still there; nothing closed"
+  fi
+  LS=$WREC; NOW_PID=$WREC_PID
 }
 _tab_ledger_release_gone() {
   sed -i "/^$1 /d" "$STATE" 2>/dev/null

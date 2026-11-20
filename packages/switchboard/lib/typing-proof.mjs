@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { kittyLs, flattenWindows } from './kitty-ls.mjs';
+import { kittyList, kittyDownMessage, flattenWindows } from './kitty-ls.mjs';
 
 // Verdict kinds. `dialog` is its own kind, never folded into "busy": a seat
 // that waits on a permission prompt or a question must not be typed into in
@@ -251,16 +251,23 @@ export const composerHolds = (winId, text) => {
   return want !== '' && box.rows.join('').replace(/\s+/g, '').includes(want);
 };
 
-export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true } = {}) => {
+export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true, win: given = null } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
   // `/` would run as a slash command in the seat (`/compact` compacts it)
   // instead of arriving as a message. Only an idle-claiming send refuses it:
   // an explicit --now keeps its slash-command use.
   const slashRefusal = idleMode && text != null && /^\s*\//.test(text) ? verdict(REFUSED, 'the text starts with "/", which would run as a command in the seat') : null;
-  const lsOut = kittyLs();
-  if (lsOut == null) return verdict(REFUSED, 'window list could not be read');
-  const win = flattenWindows(lsOut).find((w) => w.id === Number(winId));
+  // The proof is the last read before keys are typed: always fresh, and only
+  // this window (kitty walks one window's processes, not every one). `win`, a
+  // record the caller just read, replaces the read only where the verdict is
+  // advisory (agent-send's queue poll): every typing path reads fresh here.
+  let win = given;
+  if (win == null) {
+    const ls = kittyList({ match: `id:${winId}`, fresh: true });
+    if (!ls.ok) return verdict(REFUSED, `window list could not be read: ${kittyDownMessage(ls)}`);
+    win = flattenWindows(ls.data).find((w) => w.id === Number(winId));
+  }
   if (win == null) return verdict(REFUSED, 'window not found');
   const proc = claudeProcOf(win);
   // otherTabs (kitty-send, which also delivers to pi and opencode tabs): a tab

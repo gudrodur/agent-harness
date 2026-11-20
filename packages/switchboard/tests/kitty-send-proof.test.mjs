@@ -246,6 +246,11 @@ const ocAppendUser = async (text, seq) => {
     .run(`m-${seq}`, OC_SID, 'user', seq, now, now, JSON.stringify({ time: { created: now }, text }));
   db.close();
 };
+const sentBy = async (ms = 20_000) => {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 50))) {
+    if (await fs.access(path.join(stateDir, 'sent')).then(() => true, () => false)) return;
+  }
+};
 const ocIdleRow = { type: 'idle', seq: 12, data: { time: { created: Date.now() }, outcome: 'succeeded' } };
 
 test('a new type:user row in opencode.db proves the send', async () => {
@@ -258,7 +263,9 @@ test('a new type:user row in opencode.db proves the send', async () => {
         OPENCODE_TAB_DB: ocDb(),
       }),
     });
-    await new Promise((r) => setTimeout(r, 2500));
+    // The row lands once the text was typed (the stub's `sent`), as in a live
+    // tab: a fixed sleep raced the send on a loaded machine.
+    await sentBy();
     await ocAppendUser('plain note for the opencode tab', 20);
     const r = await p.then(
       (ok) => ({ code: 0, out: ok.stdout, err: ok.stderr }),
@@ -284,7 +291,7 @@ test('an opencode tab whose store gains no matching row is exit 3, not delivered
         OPENCODE_TAB_DB: ocDb(),
       }),
     });
-    await new Promise((r) => setTimeout(r, 2000));
+    await sentBy();
     await ocAppendUser('a completely different prompt', 20);
     const r = await p.then(
       (ok) => ({ code: 0, out: ok.stdout, err: ok.stderr }),

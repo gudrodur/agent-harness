@@ -2172,7 +2172,10 @@ test('--queue never types onto a draft with several lines under an empty first l
 test('a quiet --queue wait says held: <reason> once per distinct reason', async () => {
   const DRAFT = ['● Done.', '─'.repeat(40), '❯ half a thought', '─'.repeat(40)].join('\n');
   const { killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
-    title: '✳ claude: idle seat', screen: DRAFT, killAfterMs: 7000, envExtra: { AGENT_SEND_VERBOSE: '' },
+    // A short poll curve: the test is about one line per reason, and the default
+    // backoff can put the poll after the screen change past the kill.
+    title: '✳ claude: idle seat', screen: DRAFT, killAfterMs: 7000,
+    envExtra: { AGENT_SEND_VERBOSE: '', AGENT_SEND_QUEUE_POLL_MS: '500', AGENT_SEND_QUEUE_POLL_CAP_MS: '1000' },
     whileRunning: async () => { await sleep(4500); fs.writeFileSync(path.join(binDir, 'queue-screen'), QUESTION_DIALOG); },
   });
   assert.equal(killed, true, stderr);
@@ -3132,4 +3135,25 @@ test('a kitty-send killed by a signal reads as typed, unproven in --status, neve
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+test('--queue --deadline to a busy recipient: the gaps between window reads grow and stop at the cap', async () => {
+  // A wrapper around queueSend's own stub that stamps every `@ ls` call.
+  const stamps = path.join(binDir, 'queue-ls-stamps');
+  fs.rmSync(stamps, { force: true });
+  const counting = kittyStubOf('kitty-queue-stamped', `[ "$2" = ls ] && date +%s%3N >> ${stamps}\nexec ${path.join(binDir, 'kitty-queue-title-stub')} "$@"`);
+  const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue', '--deadline', '6'], {
+    title: '⠇ claude: working',
+    envExtra: { AGENT_MAILBOX_KITTY: counting, KITTY_SEND_STUB_EXIT: '5', AGENT_SEND_QUEUE_POLL_MS: '250', AGENT_SEND_QUEUE_POLL_CAP_MS: '1000' },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 3, stderr);
+  // One read per pass: the idle check and the typing check share it.
+  const t = fs.readFileSync(stamps, 'utf-8').trim().split('\n').map(Number);
+  const gaps = t.slice(1).map((x, i) => x - t[i]);
+  // The first gaps double from the base (250, 500, 1000, +/-20% and the read's
+  // own time); every one after stays near the cap.
+  assert.ok(gaps.length >= 5, `gaps: ${gaps.join(', ')}`);
+  assert.ok(gaps[2] > gaps[0] * 1.8, `the gaps grow: ${gaps.join(', ')}`);
+  for (const g of gaps.slice(3, -1)) assert.ok(g >= 750 && g <= 1600, `a gap past the cap: ${gaps.join(', ')}`);
 });

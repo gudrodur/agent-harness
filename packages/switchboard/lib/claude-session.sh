@@ -12,11 +12,14 @@
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-"$HOME"/.claude}"
 CLAUDE_SESSIONS_DIR="${KITTY_SEND_CLAUDE_SESSIONS_DIR:-${CLAUDE_SESSIONS_DIR:-$CLAUDE_DIR/sessions}}"
 CLAUDE_PROJECTS_DIR="${KITTY_SEND_CLAUDE_PROJECTS_DIR:-${CLAUDE_PROJECTS_DIR:-$CLAUDE_DIR/projects}}"
+# Window reads through the shared cache, lock and breaker.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kitty-ls.sh"
 # The session record of the claude process in this window, or exit 1. $2 is
-# the `kitty @ ls` JSON when the caller already has it (saves a second ls).
+# the `kitty @ ls` JSON when the caller already has it (saves a second ls);
+# without it, one narrow read of the window, a cached answer allowed.
 claude_session_json() { # $1 = window id, $2 = optional kitty @ ls JSON
   local pid f ls="${2:-}"
-  [ -n "$ls" ] || ls=$(kitty @ ls 2>/dev/null)
+  if [ -z "$ls" ]; then win_record "$1" || return 1; ls=$WREC; fi
   pid=$(printf '%s' "$ls" | jq -r --argjson id "$1" '
     .[].tabs[].windows[] | select(.id == $id) | .foreground_processes[]?
     | select((.cmdline[0] // "") | test("(^|/)claude$")) | .pid' 2>/dev/null | head -1)
@@ -25,9 +28,9 @@ claude_session_json() { # $1 = window id, $2 = optional kitty @ ls JSON
   jq -e '.sessionId and .cwd' "$f" >/dev/null 2>&1 || return 1
   cat "$f"
 }
-claude_state_of() { # $1 = window id; busy|idle|unknown
+claude_state_of() { # $1 = window id, $2 = optional kitty @ ls JSON; busy|idle|unknown
   local j
-  j=$(claude_session_json "$1") || { printf 'unknown'; return 0; }
+  j=$(claude_session_json "$1" "${2:-}") || { printf 'unknown'; return 0; }
   case "$(printf '%s' "$j" | jq -r '.status // ""' 2>/dev/null)" in
     # waiting (a permission prompt, a question, a plan approval) and blocked
     # are not at the prompt: a caller must not read them as idle. `shell` is a

@@ -45,8 +45,10 @@ before(async () => {
       '#!/usr/bin/env bash',
       `state=${JSON.stringify(stateDir)}`,
       `tdir=${JSON.stringify(tdir)}`,
+      'printf \'%s\\n\' "$*" >> "$state/kitty-calls"',
       'case "$1/$2" in',
       '  @/ls) [ -f "$state/nokitty" ] && exit 1',
+      '        [ -f "$state/hang" ] && exec /usr/bin/sleep 30',
       '        if [ -f "$state/ls-fail-after" ]; then n=$(cat "$state/ls-count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$state/ls-count"; [ "$n" -gt "$(cat "$state/ls-fail-after")" ] && exit 1; fi',
       '        [ -f "$state/ls.json" ] && { cat "$state/ls.json"; exit 0; }',
       '        if [ -f "$state/gone" ]; then echo "[]"; else printf \'%s\\n\' ' + JSON.stringify(lsJson) + '; fi ;;',
@@ -61,7 +63,9 @@ before(async () => {
     ].join('\n'),
     { mode: 0o755 },
   );
-  await fs.writeFile(path.join(binDir, 'sleep'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+  // `sleep` is a no-op; $state/on-sleep, when present, runs in its place (a
+  // test kills the window's process from it, during the wait loop).
+  await fs.writeFile(path.join(binDir, 'sleep'), `#!/usr/bin/env bash\n[ -x ${JSON.stringify(path.join(stateDir, 'on-sleep'))} ] && ${JSON.stringify(path.join(stateDir, 'on-sleep'))}\nexit 0\n`, { mode: 0o755 });
   await fs.writeFile(path.join(binDir, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
 });
 
@@ -71,7 +75,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  for (const f of ['launch-args', 'closed', 'ls.json', 'ls-fail-after', 'ls-count', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'closed', 'ls.json', 'ls-fail-after', 'ls-count', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'on-sleep', 'hang', 'kitty-calls', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { recursive: true, force: true });
   }
   await fs.rm(projects, { recursive: true, force: true });
@@ -95,10 +99,7 @@ const session = (model, { bridge = false } = {}) => {
   return fs.writeFile(path.join(stateDir, 'session.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
 };
 
-const tab = async (args, extraEnv = {}) => {
-  try {
-    const r = await run('bash', [SCRIPT, ...args], {
-      env: isolatedEnv({
+const tabEnv = (extraEnv = {}) => isolatedEnv({
         PATH: `${binDir}:${process.env.PATH}`,
         XDG_RUNTIME_DIR: stateDir,
         CLAUDE_SESSION_ID: 'test-launcher',
@@ -110,8 +111,10 @@ const tab = async (args, extraEnv = {}) => {
         AGENT_SWITCHBOARD_DB: path.join(stateDir, 'switchboard.db'),
         AGENT_MAILBOX_KITTY: path.join(binDir, 'kitty'),
         ...extraEnv,
-      }),
-    });
+      });
+const tab = async (args, extraEnv = {}) => {
+  try {
+    const r = await run('bash', [SCRIPT, ...args], { env: tabEnv(extraEnv) });
     return { code: 0, out: r.stdout, err: r.stderr };
   } catch (e) {
     return { code: e.code, out: e.stdout, err: e.stderr };
@@ -1012,4 +1015,56 @@ test('plain --close of a launched window is unchanged: closes it and drops its l
   assert.equal(r.code, 0, r.err);
   assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
   assert.doesNotMatch(await fs.readFile(ledgerFile(), 'utf8'), new RegExp(`^${OTHER_WID} `, 'm'));
+});
+
+// Every call the kitty stub took, one argv per line, and the `@ ls` ones.
+const kittyCalls = async () => (await fs.readFile(path.join(stateDir, 'kitty-calls'), 'utf8').catch(() => '')).split('\n').filter(Boolean);
+const lsCalls = async () => (await kittyCalls()).filter((c) => /^@ (--to \S+ )?ls\b/.test(c));
+
+test('an unproven start asks kitty at most 3 times over the whole 90 s wait', async () => {
+  // No transcript ever appears, so the loop runs all 45 passes.
+  const r = await tab(full());
+  assert.equal(r.code, 3, r.err);
+  const n = (await lsCalls()).length;
+  assert.ok(n <= 3, `kitty ls was asked ${n} times`);
+});
+
+test('a window whose process dies during the wait exits 3 "exited before it was proven started"', async () => {
+  // kitty keeps listing the window (its record is stale), but its process is
+  // gone: the wait loop's signal-0 check sees it without asking kitty.
+  const victim = spawn('/usr/bin/sleep', ['600'], { stdio: 'ignore' });
+  try {
+    await fs.writeFile(path.join(stateDir, 'ls.json'), `[{"tabs":[{"windows":[{"id":${WID},"pid":${victim.pid}},{"id":${OTHER_WID},"pid":${other.pid}}]}]}]`);
+    await fs.writeFile(path.join(stateDir, 'on-sleep'), `#!/usr/bin/env bash\nkill ${victim.pid} 2>/dev/null; exit 0\n`, { mode: 0o755 });
+    const r = await tab(full());
+    assert.equal(r.code, 3, r.err);
+    assert.match(r.err, /exited before it was proven started/);
+  } finally {
+    victim.kill();
+  }
+});
+
+test('--retire while the kitty ls breaker is open exits 2 at once and asks kitty nothing', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cltab-kls-'));
+  try {
+    const env = { AGENT_KITTY_LS_DIR: dir, AGENT_KITTY_LS_TIMEOUT_MS: '300', AGENT_KITTY_LS_BREAKER_BASE_MS: '20000' };
+    // Open the breaker the way a hung kitty does: one read that times out.
+    await fs.writeFile(path.join(stateDir, 'hang'), '');
+    const kls = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+    await run(process.execPath, [kls], { env: tabEnv({ ...env, AGENT_MAILBOX_KITTY: 'kitty' }) }).catch(() => {});
+    await fs.rm(path.join(stateDir, 'hang'));
+    await windows();
+    await handover();
+    await fs.rm(path.join(stateDir, 'kitty-calls'), { force: true });
+    const t0 = Date.now();
+    const r = await retire(OTHER_WID, env);
+    const ms = Date.now() - t0;
+    assert.equal(r.code, 2, r.err);
+    assert.ok(ms < 1000, `took ${ms} ms`);
+    assert.deepEqual(await kittyCalls(), [], 'no kitty call while the breaker is open');
+    assert.match(r.err, /backing off until/);
+    assert.equal((await handoverRows())[0].retired_at, null);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

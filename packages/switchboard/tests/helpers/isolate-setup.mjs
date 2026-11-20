@@ -15,3 +15,8 @@ scrubProcessEnv();
 const isolateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-isolate-'));
 process.env.AGENT_SWITCHBOARD_DIR = path.join(isolateDir, 'switchboard');
 process.env.XDG_STATE_HOME = path.join(isolateDir, 'xdg');
+// The kitty ls cache, lock and breaker files go to the same temp dir, and the
+// cache is off: tests rewrite their stub's listing between spawns and expect
+// the next read to see it. A test of the cache sets its own TTL.
+process.env.AGENT_KITTY_LS_DIR = path.join(isolateDir, 'kitty-ls');
+process.env.AGENT_KITTY_LS_TTL_MS = '0';

@@ -155,15 +155,17 @@ is_ancestor() { # $1 = pid
 }
 slot_holders() {
   [ -s "$STATE" ] || return 0
-  local live_ids row_launcher
-  live_ids=$(kitty @ ls 2>/dev/null | jq -r '.[].tabs[].windows[].id' 2>/dev/null | tr '\n' ' ')
+  local row_launcher now
+  # One listing for every row, ids and pids together. A listing kitty did not
+  # give cannot clear the slot, so the launch stops (exit 2) rather than guess.
+  live_pid_map || die "kitty remote control did not answer the window list (${KITTY_LS_MSG:-no answer}); cannot tell who holds the slot — nothing launched." 2
   set -f
   while IFS= read -r row; do
     # shellcheck disable=SC2086: unquoted split is the parse; globbing off via set -f.
     set -- $row
     case "${3:-}" in @*) row_launcher=${3#@} ;; *) row_launcher=unknown ;; esac
-    case " $live_ids " in *" ${1:-} "*) ;; *) continue ;; esac
-    [ "$(win_pid "$1")" = "${2:-}" ] || continue
+    now=$(live_pid_of "${1:-}") || continue
+    [ "$now" = "${2:-}" ] || continue
     [ "$row_launcher" = "$LAUNCHER" ] && continue
     [ -n "${KITTY_WINDOW_ID:-}" ] && [ "$1" = "$KITTY_WINDOW_ID" ] && continue
     is_ancestor "${2:-}" && continue
@@ -217,8 +219,15 @@ START_MS=$(( $(date +%s) * 1000 ))
 WID=$(kitty @ launch --type=tab --tab-title "$TITLE" --cwd "$CWD" \
         "$LAUNCH" mini "${ATTACH[@]}" --model "$MODEL" --prompt "$MSG" 2>/dev/null)
 case "$WID" in *[!0-9]*|"") die "kitty @ launch did not return a plain window id, got: '$WID'" ;; esac
-WPID=$(win_pid "$WID")
-[ -n "$WPID" ] || { printf 'WINDOW_ID=%s\n' "$WID"; die "window $WID exited immediately after launch — run $LAUNCH mini ${ATTACH[*]} --model $MODEL by hand" 3; }
+# One fresh read: the window's pid, then every later liveness check is a
+# signal 0 to it, which asks kitty nothing. A kitty that did not answer here is
+# not a window that exited.
+WRC=0; WPID=$(win_pid "$WID" fresh) || WRC=$?
+if [ "$WRC" = 2 ]; then
+  printf 'WINDOW_ID=%s\n' "$WID"
+  die "kitty remote control did not answer after launching window $WID (${KITTY_LS_MSG:-no answer}); its start is not proven — look at the window" 2
+fi
+[ "$WRC" = 0 ] && [ -n "$WPID" ] || { printf 'WINDOW_ID=%s\n' "$WID"; die "window $WID exited immediately after launch — run $LAUNCH mini ${ATTACH[*]} --model $MODEL by hand" 3; }
 printf '%s %s @%s %s\n' "$WID" "$WPID" "$LAUNCHER" "$TITLE" >> "$STATE"
 note "launched window $WID (pid $WPID) — $TITLE"
 claim_cli --claim "$CWD" "$BRIEF_REF" --owner "kitty:$WID" --note "$TITLE" >/dev/null 2>&1 || true
@@ -258,7 +267,7 @@ JS
 beacon=0; SESSION=""; GOT=""
 for _ in $(seq 1 45); do
   sleep 2
-  if [ -z "$(win_pid "$WID")" ]; then
+  if ! kill -0 "$WPID" 2>/dev/null; then
     printf 'WINDOW_ID=%s\n' "$WID"
     sed -i "/^$WID /d" "$STATE" 2>/dev/null || true
     die "window $WID exited before it was proven started — run $LAUNCH mini ${ATTACH[*]} --model $MODEL by hand to see why" 3
