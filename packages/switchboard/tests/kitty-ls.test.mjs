@@ -334,9 +334,30 @@ test('17. a restarted kitty on the same socket path is another instance: its bre
   const env = fx.env({ KITTY_LISTEN_ON: `unix:${sock}` });
   const before = (await importer('m.cacheKey()', env)).r;
   assert.equal((await importer('m.cacheKey()', env)).r, before, 'the same socket keeps its key');
+  // A new socket bound over the old path while the old file still exists:
+  // both inodes are live at once, so they differ.
+  const next = `${sock}.new`;
+  fs.writeFileSync(next, '');
+  fs.renameSync(next, sock);
+  const renamed = (await importer('m.cacheKey()', env)).r;
+  assert.notEqual(renamed, before, 'a socket renamed over the path is a new key');
+  // Deleted and created again: the filesystem may hand the freed inode number
+  // straight back, so the inode alone cannot tell the two apart. Pin the new
+  // file to the old inode number in the stat the module sees.
+  const ino = fs.statSync(sock, { bigint: true }).ino;
+  // Past the kernel's coarse timestamp tick, so the change time moves.
+  await new Promise((r) => setTimeout(r, 25));
   fs.rmSync(sock);
   fs.writeFileSync(sock, '');
-  assert.notEqual((await importer('m.cacheKey()', env)).r, before, 'a new socket inode is a new key');
+  const reuse = path.join(fx.root, 'same-ino.cjs');
+  fs.writeFileSync(reuse, [
+    "const fs = require('node:fs');",
+    'const real = fs.statSync;',
+    `fs.statSync = (p, o) => { const st = real(p, o); if (p === ${JSON.stringify(sock)}) st.ino = o && o.bigint ? ${ino}n : Number(${ino}n); return st; };`,
+    '',
+  ].join('\n'));
+  const reused = (await importer('m.cacheKey()', { ...env, NODE_OPTIONS: `--require ${reuse}` })).r;
+  assert.notEqual(reused, renamed, 'a re-created socket that reuses the inode number is still a new key');
   const abstract = fx.env({ KITTY_LISTEN_ON: 'unix:@kitty-test', KITTY_PID: '4242' });
   const k1 = (await importer('m.cacheKey()', abstract)).r;
   const k2 = (await importer('m.cacheKey()', { ...abstract, KITTY_PID: '4343' })).r;

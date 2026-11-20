@@ -36,8 +36,8 @@
 // The state lives in AGENT_KITTY_LS_DIR (default
 // $XDG_RUNTIME_DIR/agent-switchboard/kitty-ls), keyed by the resolved kitty
 // binary and the kitty instance (--to, else KITTY_LISTEN_ON with the socket's
-// inode, or with KITTY_PID for a socket that has no path, else the tty's
-// KITTY_PID), so a restarted kitty never sees an older instance's windows or
+// inode and change time, or with KITTY_PID for a socket that has no path,
+// else the tty's KITTY_PID), so a restarted kitty never sees an older instance's windows or
 // its breaker.
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -85,16 +85,21 @@ const resolveBin = (bin) => {
 };
 
 // A restarted kitty listens on the same path, so the path alone would hand it
-// the dead instance's breaker. A socket file gets a new inode when kitty
-// binds it again; an abstract or TCP socket has none, and the kitty pid tells
-// the instances apart instead.
+// the dead instance's breaker. A socket kitty binds again is a new file: its
+// inode and change time together tell it from the old one (the inode alone
+// does not, a filesystem may hand the freed number straight back). An
+// abstract or TCP socket has no file, and the kitty pid tells the instances
+// apart instead.
 const instanceOf = (to) => {
   if (to) return `to:${to}`;
   const listen = process.env.KITTY_LISTEN_ON;
   if (listen) {
     const sock = /^unix:([^@].*)$/.exec(listen)?.[1];
     if (sock) {
-      try { return `listen:${listen}:ino:${fs.statSync(sock).ino}`; } catch { /* unlinked: the path alone */ }
+      try {
+        const st = fs.statSync(sock, { bigint: true });
+        return `listen:${listen}:ino:${st.ino}:ctime:${st.ctimeNs}`;
+      } catch { /* unlinked: the path alone */ }
       return `listen:${listen}`;
     }
     return `listen:${listen}:pid:${process.env.KITTY_PID ?? ''}`;
