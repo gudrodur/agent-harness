@@ -271,7 +271,8 @@ test("splitSegmentsDetailed keeps >| inside its segment; a real pipe still split
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");
-  assert.deepEqual(shell.shellWordsDetailed("echo '> note' >out \\>x \"$f\">y >\"$g\""), [
+  const bare = (s) => shell.shellWordsDetailed(s).map(({ word, bareStart }) => ({ word, bareStart }));
+  assert.deepEqual(bare("echo '> note' >out \\>x \"$f\">y >\"$g\""), [
     { word: "echo", bareStart: true },
     { word: "> note", bareStart: false },
     { word: ">out", bareStart: true },
@@ -280,4 +281,32 @@ test("shellWordsDetailed marks a word whose first character is bare", () => {
     { word: ">$g", bareStart: true },
   ]);
   assert.deepEqual(shellWords("echo '> note' >out"), ["echo", "> note", ">out"]);
+});
+
+// A gate that reads a word's text needs to know when the shell would expand it, and where a bare
+// `<` or `>` inside the word starts a redirection.
+test("shellWordsDetailed marks a word that expands and the bare < and > inside it", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, expands, operatorAt }) => ({ word, expands, operatorAt }));
+  assert.deepEqual(w("echo \"$B\" '$B' \\$B $'x' `d` \"a $\" \"a \\$b\" $"), [
+    { word: "echo", expands: false, operatorAt: [] },
+    { word: "$B", expands: true, operatorAt: [] },
+    { word: "$B", expands: false, operatorAt: [] },
+    { word: "$B", expands: false, operatorAt: [] },
+    { word: "$x", expands: true, operatorAt: [] },
+    { word: "`d`", expands: true, operatorAt: [] },
+    { word: "a $", expands: false, operatorAt: [] },
+    { word: "a $b", expands: false, operatorAt: [] },
+    { word: "$", expands: false, operatorAt: [] },
+  ]);
+  assert.deepEqual(w("echo \"a b\">f x>>g 2>&1 '>q' \"c>d\" \\<e"), [
+    { word: "echo", expands: false, operatorAt: [] },
+    { word: "a b>f", expands: false, operatorAt: [3] },
+    { word: "x>>g", expands: false, operatorAt: [1, 2] },
+    { word: "2>&1", expands: false, operatorAt: [1] },
+    { word: ">q", expands: false, operatorAt: [] },
+    { word: "c>d", expands: false, operatorAt: [] },
+    { word: "<e", expands: false, operatorAt: [] },
+  ]);
+  // shellWords is unchanged by the new fields.
+  assert.deepEqual(shellWords("echo \"a b\">f"), ["echo", "a b>f"]);
 });

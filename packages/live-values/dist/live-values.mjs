@@ -123,18 +123,25 @@ var shellWordsDetailed = (segment) => {
   const words = [];
   let cur = null;
   let bareStart = false;
+  let expands = false;
+  let operatorAt = [];
   let i = 0;
   const add = (s, bare) => {
     if (cur === null)
       bareStart = bare;
     cur = (cur ?? "") + s;
   };
+  const push = () => {
+    if (cur !== null)
+      words.push({ word: cur, bareStart, expands, operatorAt });
+    cur = null;
+    expands = false;
+    operatorAt = [];
+  };
   while (i < text.length) {
     const c = text[i];
     if (/\s/.test(c)) {
-      if (cur !== null)
-        words.push({ word: cur, bareStart });
-      cur = null;
+      push();
       i++;
       continue;
     }
@@ -154,6 +161,8 @@ var shellWordsDetailed = (segment) => {
           j += 2;
           continue;
         }
+        if (text[j] === "`" || text[j] === "$" && /[^\s"]/.test(text[j + 1] ?? " "))
+          expands = true;
         s += text[j];
         j++;
       }
@@ -166,11 +175,14 @@ var shellWordsDetailed = (segment) => {
       i += 2;
       continue;
     }
+    if (c === "`" || c === "$" && /\S/.test(text[i + 1] ?? " "))
+      expands = true;
+    if (c === "<" || c === ">")
+      operatorAt.push(cur === null ? 0 : cur.length);
     add(c, true);
     i++;
   }
-  if (cur !== null)
-    words.push({ word: cur, bareStart });
+  push();
   return words;
 };
 var shellWords = (segment) => shellWordsDetailed(segment).map((w) => w.word);

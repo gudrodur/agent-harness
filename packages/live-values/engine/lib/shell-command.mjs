@@ -390,24 +390,37 @@ export const splitSegmentsDetailed = (command) => {
 // read a word's VALUE (a commit message, a --model name) decide themselves
 // what an unexpanded `$` means. An unbalanced quote runs to the end, which is
 // the allow-biased reading: the word it swallows is never mistaken for a flag.
-// shellWordsDetailed gives each word as `{ word, bareStart }`, where `bareStart`
-// says its first character was neither quoted nor escaped: only such a word can
-// be an operator, so `echo '> quote'` is an argument and `>"$f"` a redirect.
+// shellWordsDetailed gives each word as `{ word, bareStart, expands, operatorAt }`.
+// - `bareStart`: its first character was neither quoted nor escaped. Only such a
+//   word can be an operator, so `echo '> quote'` is an argument and `>"$f"` a redirect.
+// - `expands`: the shell would expand part of it: a `$` outside single quotes with
+//   something after it (`$B`, `$(…)`, `$'…'`; in double quotes not before the
+//   closing quote), or a backtick. A gate reading the word as literal text cannot
+//   trust it then.
+// - `operatorAt`: the offsets in `word` of each bare `<` or `>`. The shell starts a
+//   redirection there even inside a word (`echo "a">f`), so a gate can split it.
 export const shellWordsDetailed = (segment) => {
   const text = String(segment ?? '');
   const words = [];
   let cur = null;
   let bareStart = false;
+  let expands = false;
+  let operatorAt = [];
   let i = 0;
   const add = (s, bare) => {
     if (cur === null) bareStart = bare;
     cur = (cur ?? '') + s;
   };
+  const push = () => {
+    if (cur !== null) words.push({ word: cur, bareStart, expands, operatorAt });
+    cur = null;
+    expands = false;
+    operatorAt = [];
+  };
   while (i < text.length) {
     const c = text[i];
     if (/\s/.test(c)) {
-      if (cur !== null) words.push({ word: cur, bareStart });
-      cur = null;
+      push();
       i++;
       continue;
     }
@@ -427,6 +440,7 @@ export const shellWordsDetailed = (segment) => {
           j += 2;
           continue;
         }
+        if (text[j] === '`' || (text[j] === '$' && /[^\s"]/.test(text[j + 1] ?? ' '))) expands = true;
         s += text[j];
         j++;
       }
@@ -439,10 +453,12 @@ export const shellWordsDetailed = (segment) => {
       i += 2;
       continue;
     }
+    if (c === '`' || (c === '$' && /\S/.test(text[i + 1] ?? ' '))) expands = true;
+    if (c === '<' || c === '>') operatorAt.push(cur === null ? 0 : cur.length);
     add(c, true);
     i++;
   }
-  if (cur !== null) words.push({ word: cur, bareStart });
+  push();
   return words;
 };
 export const shellWords = (segment) => shellWordsDetailed(segment).map((w) => w.word);
