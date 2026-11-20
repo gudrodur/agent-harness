@@ -204,7 +204,9 @@ export const scanFile = (content, file) => {
 // ---- values -------------------------------------------------------------------
 
 const render = (raw, format, current) => {
-  const v = raw.replace(/\s+$/u, "");
+  // Numeric formats also drop leading space: BSD (macOS) `wc -l` pads its count ("       0").
+  // Text keeps its leading characters. Only ^\s*\d+\s*$ passes; "-1" and "abc" still fail.
+  const v = format === "int" || format === "word" ? raw.trim() : raw.replace(/\s+$/u, "");
   if (format === "int") return /^\d+$/.test(v) ? { value: v } : { error: `not an int: ${JSON.stringify(v.slice(0, 60))}` };
   if (format === "word") {
     if (!/^\d+$/.test(v)) return { error: `not a non-negative int: ${JSON.stringify(v.slice(0, 60))}` };
