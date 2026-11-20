@@ -353,6 +353,13 @@ export const splitSegmentsDetailed = (command) => {
       i += 2;
       continue;
     }
+    // `>|` (write even under noclobber) is one redirection operator, not a `>` and a
+    // pipe: split there, `cat >| m.txt <<EOF` lost its target.
+    if (c === '|' && cur.endsWith('>') && !cur.endsWith('\\>')) {
+      cur += c;
+      i++;
+      continue;
+    }
     if ((c === '&' || c === '|') && text[i + 1] === c) {
       push(c + c);
       i += 2;
@@ -383,18 +390,23 @@ export const splitSegmentsDetailed = (command) => {
 // read a word's VALUE (a commit message, a --model name) decide themselves
 // what an unexpanded `$` means. An unbalanced quote runs to the end, which is
 // the allow-biased reading: the word it swallows is never mistaken for a flag.
-export const shellWords = (segment) => {
+// shellWordsDetailed gives each word as `{ word, bareStart }`, where `bareStart`
+// says its first character was neither quoted nor escaped: only such a word can
+// be an operator, so `echo '> quote'` is an argument and `>"$f"` a redirect.
+export const shellWordsDetailed = (segment) => {
   const text = String(segment ?? '');
   const words = [];
   let cur = null;
+  let bareStart = false;
   let i = 0;
-  const add = (s) => {
+  const add = (s, bare) => {
+    if (cur === null) bareStart = bare;
     cur = (cur ?? '') + s;
   };
   while (i < text.length) {
     const c = text[i];
     if (/\s/.test(c)) {
-      if (cur !== null) words.push(cur);
+      if (cur !== null) words.push({ word: cur, bareStart });
       cur = null;
       i++;
       continue;
@@ -402,7 +414,7 @@ export const shellWords = (segment) => {
     if (c === "'") {
       const close = text.indexOf("'", i + 1);
       const end = close < 0 ? text.length : close;
-      add(text.slice(i + 1, end));
+      add(text.slice(i + 1, end), false);
       i = end + 1;
       continue;
     }
@@ -418,21 +430,22 @@ export const shellWords = (segment) => {
         s += text[j];
         j++;
       }
-      add(s);
+      add(s, false);
       i = j + 1;
       continue;
     }
     if (c === '\\' && i + 1 < text.length) {
-      add(text[i + 1]);
+      add(text[i + 1], false);
       i += 2;
       continue;
     }
-    add(c);
+    add(c, true);
     i++;
   }
-  if (cur !== null) words.push(cur);
+  if (cur !== null) words.push({ word: cur, bareStart });
   return words;
 };
+export const shellWords = (segment) => shellWordsDetailed(segment).map((w) => w.word);
 
 // Words that may precede the real command in a segment without being it.
 const PREFIX_WORDS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'then', 'do', 'else', 'if', 'while', 'until', '!', '{', '(']);

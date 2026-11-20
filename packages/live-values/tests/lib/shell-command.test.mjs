@@ -6,7 +6,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { heredocBodies, stripHeredocBodies } from "../../engine/lib/shell-command.mjs";
+import * as shell from "../../engine/lib/shell-command.mjs";
+
+const { heredocBodies, shellWords, splitSegmentsDetailed, stripHeredocBodies } = shell;
 
 test("stripHeredocBodies keeps head lines and drops bodies, several tags on a line in order", () => {
   assert.equal(stripHeredocBodies("cat > f <<EOF\nbody\nEOF\nls"), "cat > f <<EOF\nls");
@@ -247,3 +249,35 @@ for (const [name, fn] of [["stripHeredocBodies", stripHeredocBodies], ["heredocB
     assert.ok(ratio < 48, `16x the openers took ${ratio.toFixed(1)}x the time`);
   });
 }
+
+// `>|` writes a file even under noclobber: one redirection operator, not `>` and a pipe.
+test("splitSegmentsDetailed keeps >| inside its segment; a real pipe still splits", () => {
+  assert.deepEqual(
+    splitSegmentsDetailed("cat >| m.txt <<EOF && git commit -F m.txt").map((s) => s.text.trim()),
+    ["cat >| m.txt <<EOF", "git commit -F m.txt"],
+  );
+  assert.deepEqual(
+    splitSegmentsDetailed("echo x >|m.txt").map((s) => s.text),
+    ["echo x >|m.txt"],
+  );
+  assert.deepEqual(
+    splitSegmentsDetailed("printf x | tee m.txt").map((s) => [s.sep, s.text.trim()]),
+    [["", "printf x"], ["|", "tee m.txt"]],
+  );
+  // An escaped `>` is a character, so the `|` after it is a pipe.
+  assert.deepEqual(splitSegmentsDetailed("echo \\> | cat").length, 2);
+});
+
+// A gate that reads redirections needs to know a quoted `> x` is an argument.
+test("shellWordsDetailed marks a word whose first character is bare", () => {
+  assert.equal(typeof shell.shellWordsDetailed, "function");
+  assert.deepEqual(shell.shellWordsDetailed("echo '> note' >out \\>x \"$f\">y >\"$g\""), [
+    { word: "echo", bareStart: true },
+    { word: "> note", bareStart: false },
+    { word: ">out", bareStart: true },
+    { word: ">x", bareStart: false },
+    { word: "$f>y", bareStart: false },
+    { word: ">$g", bareStart: true },
+  ]);
+  assert.deepEqual(shellWords("echo '> note' >out"), ["echo", "> note", ">out"]);
+});
