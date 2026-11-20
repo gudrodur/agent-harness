@@ -1207,6 +1207,7 @@ const main = (argv) => {
         lastWhy = why;
       }
       const gap = nextDelay(pollAttempt++, { baseMs: QUEUE_POLL_MS, capMs: QUEUE_POLL_CAP_MS });
+      trace(`agent-send: queue poll: next window read in ${gap} ms\n`);
       const left = endMs == null ? gap : endMs - Date.now();
       const untilIdleCap = idleSince == null ? gap : idleSince + capMs - Date.now();
       if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(gap, left, untilIdleCap)) })) return true;

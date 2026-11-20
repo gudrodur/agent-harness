@@ -3138,22 +3138,26 @@ test('a kitty-send killed by a signal reads as typed, unproven in --status, neve
 });
 
 test('--queue --deadline to a busy recipient: the gaps between window reads grow and stop at the cap', async () => {
-  // A wrapper around queueSend's own stub that stamps every `@ ls` call.
+  // Asserted on the delays the poll asks for (its verbose trace) and on the
+  // number of reads, never on wall-clock stamps: a loaded runner skews those.
   const stamps = path.join(binDir, 'queue-ls-stamps');
   fs.rmSync(stamps, { force: true });
-  const counting = kittyStubOf('kitty-queue-stamped', `[ "$2" = ls ] && date +%s%3N >> ${stamps}\nexec ${path.join(binDir, 'kitty-queue-title-stub')} "$@"`);
+  const counting = kittyStubOf('kitty-queue-stamped', `[ "$2" = ls ] && echo ls >> ${stamps}\nexec ${path.join(binDir, 'kitty-queue-title-stub')} "$@"`);
   const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue', '--deadline', '6'], {
     title: '⠇ claude: working',
-    envExtra: { AGENT_MAILBOX_KITTY: counting, KITTY_SEND_STUB_EXIT: '5', AGENT_SEND_QUEUE_POLL_MS: '250', AGENT_SEND_QUEUE_POLL_CAP_MS: '1000' },
+    envExtra: { AGENT_MAILBOX_KITTY: counting, KITTY_SEND_STUB_EXIT: '5', AGENT_SEND_VERBOSE: '1', AGENT_SEND_QUEUE_POLL_MS: '250', AGENT_SEND_QUEUE_POLL_CAP_MS: '1000' },
   });
   assert.equal(killed, false, stderr);
   assert.equal(code, 3, stderr);
-  // One read per pass: the idle check and the typing check share it.
-  const t = fs.readFileSync(stamps, 'utf-8').trim().split('\n').map(Number);
-  const gaps = t.slice(1).map((x, i) => x - t[i]);
-  // The first gaps double from the base (250, 500, 1000, +/-20% and the read's
-  // own time); every one after stays near the cap.
-  assert.ok(gaps.length >= 5, `gaps: ${gaps.join(', ')}`);
-  assert.ok(gaps[2] > gaps[0] * 1.8, `the gaps grow: ${gaps.join(', ')}`);
-  for (const g of gaps.slice(3, -1)) assert.ok(g >= 750 && g <= 1600, `a gap past the cap: ${gaps.join(', ')}`);
+  const gaps = [...stderr.matchAll(/queue poll: next window read in (\d+) ms/g)].map((m) => Number(m[1]));
+  assert.ok(gaps.length >= 4, `gaps: ${gaps.join(', ')}\n${stderr}`);
+  // 250, 500, 1000, then 1000 each, every one +/-20%.
+  gaps.forEach((g, i) => {
+    const want = Math.min(1000, 250 * 2 ** i);
+    assert.ok(g >= want * 0.8 && g <= want * 1.2, `gap ${i} is ${g}, want ${want} +/-20%: ${gaps.join(', ')}`);
+  });
+  // One read per pass (the idle check and the typing check share it), plus
+  // the lookups before the wait starts.
+  const reads = fs.readFileSync(stamps, 'utf-8').trim().split('\n').length;
+  assert.ok(reads <= gaps.length + 3, `${reads} reads for ${gaps.length} passes`);
 });
