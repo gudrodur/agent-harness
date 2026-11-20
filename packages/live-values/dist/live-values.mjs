@@ -91,6 +91,11 @@ var splitSegmentsDetailed = (command) => {
       i += 2;
       continue;
     }
+    if (c === "|" && cur.endsWith(">") && !cur.endsWith("\\>")) {
+      cur += c;
+      i++;
+      continue;
+    }
     if ((c === "&" || c === "|") && text[i + 1] === c) {
       push(c + c);
       i += 2;
@@ -113,19 +118,22 @@ var splitSegmentsDetailed = (command) => {
   push("");
   return segs;
 };
-var shellWords = (segment) => {
+var shellWordsDetailed = (segment) => {
   const text = String(segment ?? "");
   const words = [];
   let cur = null;
+  let bareStart = false;
   let i = 0;
-  const add = (s) => {
+  const add = (s, bare) => {
+    if (cur === null)
+      bareStart = bare;
     cur = (cur ?? "") + s;
   };
   while (i < text.length) {
     const c = text[i];
     if (/\s/.test(c)) {
       if (cur !== null)
-        words.push(cur);
+        words.push({ word: cur, bareStart });
       cur = null;
       i++;
       continue;
@@ -133,7 +141,7 @@ var shellWords = (segment) => {
     if (c === "'") {
       const close = text.indexOf("'", i + 1);
       const end = close < 0 ? text.length : close;
-      add(text.slice(i + 1, end));
+      add(text.slice(i + 1, end), false);
       i = end + 1;
       continue;
     }
@@ -149,22 +157,23 @@ var shellWords = (segment) => {
         s += text[j];
         j++;
       }
-      add(s);
+      add(s, false);
       i = j + 1;
       continue;
     }
     if (c === "\\" && i + 1 < text.length) {
-      add(text[i + 1]);
+      add(text[i + 1], false);
       i += 2;
       continue;
     }
-    add(c);
+    add(c, true);
     i++;
   }
   if (cur !== null)
-    words.push(cur);
+    words.push({ word: cur, bareStart });
   return words;
 };
+var shellWords = (segment) => shellWordsDetailed(segment).map((w) => w.word);
 var PREFIX_WORDS = new Set(["sudo", "command", "exec", "nohup", "time", "then", "do", "else", "if", "while", "until", "!", "{", "("]);
 var OPENERS_RE = /^(?:\$\(|[({`])+/;
 var ASSIGNMENT_RE = /^[A-Za-z_]\w*=/;
