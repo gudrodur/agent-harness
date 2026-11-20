@@ -42,7 +42,7 @@ var repoRootOf = (metaUrl) => path.resolve(path.dirname(fileURLToPath2(metaUrl))
 var resolveRoot = (metaUrl) => envRoot() ?? repoRootOf(metaUrl ?? import.meta.url);
 
 // engine/lib/doc-scope.mjs
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
@@ -375,24 +375,27 @@ var checkQuerySegments = (run, tools = LOCAL_TOOLS) => {
   return { ok: true };
 };
 var clip200 = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-var runCommand = (run, { root, timeoutMs }) => {
-  try {
-    const stdout = execFileSync("bash", ["-c", run], {
-      cwd: root,
-      encoding: "utf8",
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    return { ok: true, stdout };
-  } catch (err) {
-    const out = clip200((err.stdout ?? "") + " " + (err.message ?? ""));
-    const timedOut = /ETIMEDOUT|timed out/i.test(String(err.message ?? ""));
-    return {
-      ok: false,
-      timedOut,
-      output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : out || "exit without output"
-    };
+var runCommand = (run, { root, timeoutMs, failOnStderr = false }) => {
+  const r = spawnSync("bash", ["-c", run], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (!r.error && r.status === 0) {
+    if (failOnStderr && r.stderr.trim())
+      return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`) };
+    return { ok: true, stdout: r.stdout };
   }
+  const message = r.error ? r.error.message : `Command failed: ${run}
+${r.stderr ?? ""}`;
+  const out = clip200((r.stdout ?? "") + " " + message);
+  const timedOut = /ETIMEDOUT|timed out/i.test(String(r.error?.message ?? ""));
+  return {
+    ok: false,
+    timedOut,
+    output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : out || "exit without output"
+  };
 };
 
 // engine/live-values.mjs
@@ -546,10 +549,11 @@ var render = (raw, format, current) => {
     return { error: `text value must be one non-empty line with no comment: ${JSON.stringify(v.slice(0, 60))}` };
   return { value: v };
 };
+var NUMERIC = new Set(["int", "word"]);
 var resolveFileValues = (names, entries, { root, timeoutMs }) => {
   const out = new Map;
   for (const name of names) {
-    const r = runCommand(entries[name].run, { root, timeoutMs });
+    const r = runCommand(entries[name].run, { root, timeoutMs, failOnStderr: NUMERIC.has(entries[name].format) });
     out.set(name, r.ok ? { raw: r.stdout } : { error: `query failed: ${r.output}`, code: 3 });
   }
   return out;
@@ -615,7 +619,7 @@ var runSnapshots = ({ root, timeoutMs = 60000, now = Date.now() }) => {
   const report = { measured: [], kept: [], failed: [], missing: [] };
   for (const name of names) {
     const e = reg.entries[name];
-    const r = runCommand(e.run, { root, timeoutMs });
+    const r = runCommand(e.run, { root, timeoutMs, failOnStderr: NUMERIC.has(e.format) });
     if (!r.ok) {
       if (store[name]?.value) {
         report.kept.push(name);

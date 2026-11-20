@@ -115,6 +115,32 @@ test("BSD wc -l padding: a space-padded count is read as the bare integer; real 
   }
 });
 
+test("a dead first pipeline stage is could-not-check, never a confident 0 (BSD grep has no -P)", () => {
+  // A grep that complains on stderr and prints nothing, as BSD grep does for -P.
+  // `| wc -w` then prints 0, which must not be read as the count.
+  const shim = trackTemp(fs.mkdtempSync(path.join(os.tmpdir(), "lv-shim-")));
+  fs.writeFileSync(path.join(shim, "grep"), "#!/bin/sh\necho 'grep: invalid option -- P' >&2\nexit 2\n", { mode: 0o755 });
+  const reg = (run, format) => ({ n: { run, kind: "file", format } });
+  const check = (run, format, docText, withShim = true) => {
+    const root = sandbox({ doc: docText, registry: reg(run, format) });
+    fs.writeFileSync(path.join(root, "f.txt"), "a b c\n");
+    return spawnSync(process.execPath, [SCRIPT, "--check"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: withShim ? `${shim}${path.delimiter}${process.env.PATH}` : process.env.PATH, CLAUDE_CONFIG_ROOT: root, LIVE_VALUES_STORE: storeOf(root) },
+    });
+  };
+  for (const [format, shown] of [["word", "three"], ["int", "3"]]) {
+    const r = check("grep -oP 'a' f.txt | wc -w", format, `Has ${M("n", shown)} things.\n`);
+    const out = r.stdout + r.stderr;
+    assert.equal(r.status, 3, `${format}: ${out}`);
+    assert.match(out, /QUERY_FAILED|could not check/);
+    assert.doesNotMatch(out, /DRIFT/);
+  }
+  // A grep that finds nothing and says nothing is a real zero.
+  const ok = check("cat f.txt | grep -c zzz | cat", "int", `Has ${M("n", "0")} things.\n`, false);
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+});
+
 test("an unknown NAME is exit 1, and a registered name no doc shows is exit 1", () => {
   const unknown = sandbox({ doc: `We run ${M("nope", "3")} servers.\n` });
   assert.deepEqual(rows(cli(unknown, "--check", "--format=json")).map((r) => r.result), ["UNKNOWN", "UNUSED"]);
