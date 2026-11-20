@@ -26,7 +26,8 @@
 #
 # Usage: tab-state.sh <window-id> [--json] [--watch [--interval=S]]
 # --watch prints the first state, then each transition, until the window is
-# gone (state=gone). An unproven link is never terminal under --watch: at tab
+# gone (state=gone). A kitty that does not answer is not a gone window: it
+# prints state=unknown reason=kitty-unavailable and keeps watching. An unproven link is never terminal under --watch: at tab
 # startup the record appears seconds after launch, so unknown keeps polling
 # instead of exiting.
 # Exit codes:
@@ -67,8 +68,20 @@ JOBS_COUNT="unknown"; JOBS_JSON='"unknown"'; LINK_REASON=""; SOURCE=""; SESSION=
 # Returns 0 with the window, 1 when the window is gone, 2 when kitty remote
 # control itself is unavailable. The --watch loop re-calls it every interval
 # so a closed window ends the watch with state=gone.
+# TAB_STATE_LS_JSON, a `kitty @ ls` answer holding this window that the caller
+# (kitty-send) just read, stands in for the first read; --watch reads anew
+# every pass after it, and an answer without the window is not used.
 window_info() {
-  WIN_JSON=$(kitty @ ls 2>/dev/null) || return 2
+  local rc=0
+  if [ -n "${TAB_STATE_LS_JSON:-}" ] && printf '%s' "$TAB_STATE_LS_JSON" \
+      | jq -e --argjson id "$WID" 'any(.[].tabs[].windows[]; .id == $id)' >/dev/null 2>&1; then
+    WREC=$TAB_STATE_LS_JSON
+  else
+    win_record "$WID" || rc=$?
+  fi
+  TAB_STATE_LS_JSON=""
+  [ "$rc" = 0 ] || return "$rc"
+  WIN_JSON=$WREC
   WINFO=$(printf '%s' "$WIN_JSON" | jq -r --argjson id "$WID" \
     '.[].tabs[].windows[] | select(.id == $id) | "\(.pid)\t\(.cwd // "")\t\(.created_at // 0)"' 2>/dev/null | head -1)
   [ -n "$WINFO" ] || return 1
@@ -84,7 +97,10 @@ window_info || case "$?" in
       exit 0
     fi
     die "no such window: $WID (try opencode-tab.sh --list)" 1 ;;
-  *) die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 1 ;;
+  *)
+    # Under --watch the loop below reads again and reports kitty-unavailable;
+    # a single read has nothing to report.
+    [ "$WATCH" = 1 ] || die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?)" 1 ;;
 esac
 
 # One report, printed by report_state. Globals it reads: STATE TOOL REASON
@@ -250,9 +266,24 @@ fi
 
 PREV=""
 while :; do
-  if ! window_info; then
+  wrc=0
+  window_info || wrc=$?
+  if [ "$wrc" = 1 ]; then
     printf 'window %s state=gone reason=no-such-window\n' "$WID"
     exit 0
+  fi
+  if [ "$wrc" = 2 ]; then
+    # kitty did not answer: the window's fate is unknown, never "gone". Wait at
+    # least as long as the breaker says nothing will ask kitty.
+    SNAP="unknown kitty-unavailable"
+    if [ "$SNAP" != "$PREV" ]; then
+      printf 'window %s state=unknown reason=kitty-unavailable\n' "$WID"
+      PREV="$SNAP"
+    fi
+    wait_s=$(( (WREC_RETRY_MS + 999) / 1000 ))
+    [ "$wait_s" -ge "$INTERVAL" ] || wait_s=$INTERVAL
+    sleep "$wait_s"
+    continue
   fi
   if read_claude_state || read_opencode_state; then :; else no_record; fi
   SNAP="$STATE $TOOL ${REASON:-$LINK_REASON}"

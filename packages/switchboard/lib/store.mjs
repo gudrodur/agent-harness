@@ -27,6 +27,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';
+import { sleepSync } from './backoff.mjs';
 
 const require = createRequire(import.meta.url);
 const isBun = typeof process !== 'undefined' && !!process.versions?.bun;
@@ -267,8 +268,6 @@ export const isStoreBusy = (e) => {
   if (e.code === 'ERR_SQLITE_ERROR' && Number.isInteger(e.errcode) && (e.errcode & 0xff) === 5) return true;
   return /\bdatabase is locked\b/i.test(String(e.message ?? ''));
 };
-
-const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 // Run fn, again on every busy error, until deadlineMs has passed since the
 // first attempt; the last busy error is thrown. Any other error is thrown at

@@ -85,6 +85,7 @@ import {
 } from '../lib/agent-mailbox.mjs';
 import { switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
+import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
@@ -269,8 +270,16 @@ const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN, 17]);
 // 12 (--release-role refused): both leave as 1, "nothing sent".
 const exitOfKittySend = (st) => (st === 11 || st === KITTY_RC_DOWN ? 1 : (st ?? 1));
 // How often a --queue sender re-reads the recipient window's title while it
-// waits for the drain (one `kitty @ ls` per poll).
-const QUEUE_POLL_MS = 2000;
+// waits for the drain (one narrow `kitty @ ls` per poll): from
+// AGENT_SEND_QUEUE_POLL_MS doubling to AGENT_SEND_QUEUE_POLL_CAP_MS while the
+// reason it is held stays the same, back to the start when it changes. The
+// ack itself is still read every 200 ms in between.
+const envMs = (name, dflt) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : dflt;
+};
+const QUEUE_POLL_MS = envMs('AGENT_SEND_QUEUE_POLL_MS', 2000);
+const QUEUE_POLL_CAP_MS = Math.max(QUEUE_POLL_MS, envMs('AGENT_SEND_QUEUE_POLL_CAP_MS', 10000));
 // How long kitty-send may wait for idle after the typing proof passed (no --deadline).
 const TYPE_AFTER_PROOF_WAIT_S = 5;
 const KITTY_NOTHING_REASON = {
@@ -364,7 +373,7 @@ const displacedSeat = (sessionId, liveBeacon) => {
   }
   if (b?.windowId == null) return null;
   const windowId = Number(b.windowId);
-  const win = kittyWindows().find((w) => w.id === windowId);
+  const win = kittyWindows({ fresh: true, match: `id:${windowId}` }).find((w) => w.id === windowId);
   if (win?.pid == null) return null;
   // Kitty reuses window ids after a restart, so a beacon's window id alone
   // proves nothing. Record the window only when it is shown to hold the
@@ -746,18 +755,20 @@ const main = (argv) => {
   // it works, so the title alone would let --now type mid-turn.
   // Idle = the window exists and is not busy. Unreadable kitty or an unknown
   // window is "not idle": callers then keep the cautious (busy) behaviour.
-  const windowIsIdle = (winId) => {
-    const rec = flattenWindows(kittyLs()).find((w) => w.id === Number(winId));
-    return rec != null && !recordIsBusy(rec);
-  };
+  // `rec` is a record the caller already read (one read serves a whole poll pass).
+  // Both reads are fresh: their answer decides whether text is typed, and a
+  // cached record up to the TTL old can show idle a seat that just started a turn.
+  const windowRecord = (winId) => flattenWindows(kittyLs({ match: `id:${winId}`, fresh: true })).find((w) => w.id === Number(winId)) ?? null;
+  const windowIsIdle = (winId, rec = windowRecord(winId)) => rec != null && !recordIsBusy(rec);
   // The opposite is NOT "not idle": busy means the window was read and it is
   // busy. An unreadable window is neither, and a caller that must never type
   // only acts on a positive busy reading. A target that is not a window id is a
   // title substring, as kitty-send resolves it: any matching window that is busy
   // counts.
   const windowIsBusy = (target) => {
-    const wins = flattenWindows(kittyLs());
-    const hit = /^\d+$/.test(String(target))
+    const numeric = /^\d+$/.test(String(target));
+    const wins = flattenWindows(kittyLs(numeric ? { match: `id:${target}`, fresh: true } : { fresh: true }));
+    const hit = numeric
       ? wins.filter((w) => w.id === Number(target))
       : wins.filter((w) => (w.title ?? '').toLowerCase().includes(String(target).toLowerCase()));
     return hit.some(recordIsBusy);
@@ -1161,9 +1172,17 @@ const main = (argv) => {
     const endMs = deadlineMs == null ? null : Date.now() + deadlineMs;
     let idleSince = null;
     let lastWhy = null;
+    let pollAttempt = 0;
+    let pollWhy;
     heldWhy = null;
     for (;;) {
-      const why = rwin != null && windowIsIdle(rwin) ? typingVerdict(rwin, { text }) : 'recipient window not idle';
+      // One window read per pass, a cached answer allowed, for both checks: this
+      // verdict only decides whether to try, and the typing itself goes through
+      // kitty-send's own fresh proof.
+      const rec = rwin != null ? windowRecord(rwin) : null;
+      const why = rec != null && windowIsIdle(rwin, rec) ? typingVerdict(rwin, { text, win: rec }) : 'recipient window not idle';
+      if (why !== pollWhy) pollAttempt = 0;
+      pollWhy = why;
       // A window list that cannot be read never turns idle: do not wait for it.
       if (rcDown()) {
         process.stderr.write(`agent-send: kitty remote control is not answering; row ${row.id} stays queued in ${mbox} for the recipient's own drain (exit 3: not delivered yet, do not resend)\n`);
@@ -1189,9 +1208,11 @@ const main = (argv) => {
         }
         lastWhy = why;
       }
-      const left = endMs == null ? QUEUE_POLL_MS : endMs - Date.now();
-      const untilIdleCap = idleSince == null ? QUEUE_POLL_MS : idleSince + capMs - Date.now();
-      if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(QUEUE_POLL_MS, left, untilIdleCap)) })) return true;
+      const gap = nextDelay(pollAttempt++, { baseMs: QUEUE_POLL_MS, capMs: QUEUE_POLL_CAP_MS });
+      trace(`agent-send: queue poll: next window read in ${gap} ms\n`);
+      const left = endMs == null ? gap : endMs - Date.now();
+      const untilIdleCap = idleSince == null ? gap : idleSince + capMs - Date.now();
+      if (waitForAck({ key: recipient.key, id: row.id, deadlineMs: Math.max(0, Math.min(gap, left, untilIdleCap)) })) return true;
       if (endMs != null && Date.now() >= endMs) {
         // The deadline ran out. A window whose title says idle but whose proof
         // is refused (a draft in the composer, a dialog) would be typed into by

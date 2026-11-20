@@ -32,6 +32,12 @@ const SCRIPT = fileURLToPath(new URL('../bin/kitty-send.sh', import.meta.url));
 // A numeric id: the script resolves numeric --to directly, no title matching.
 const WID = '991001';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Resolves once `file` exists (the mock's send-text marker), or after `ms`.
+const sentBy = async (file, ms = 20_000) => {
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) {
+    if (await fs.access(file).then(() => true, () => false)) return;
+  }
+};
 
 let binDir, queueDir;
 
@@ -49,6 +55,9 @@ if [ "\${1:-}" = "@" ] && [ "\${2:-}" = "ls" ]; then
 fi
 if [ "\${1:-}" = "@" ] && [ "\${2:-}" = "get-text" ]; then
   printf '%s\\n' "\${KITTY_MOCK_SCREEN:-}"
+fi
+if [ "\${1:-}" = "@" ] && [ "\${2:-}" = "send-text" ] && [ -n "\${KITTY_MOCK_SENT:-}" ]; then
+  : > "\$KITTY_MOCK_SENT"
 fi
 exit 0
 `, { mode: 0o755 });
@@ -320,8 +329,11 @@ const wSend = (args, file, extraEnv = {}) => run(SCRIPT, args, {
 test('state=idle sends past a spinner title with no flag', async () => {
   const { dir, file } = await wStore('idle');
   try {
-    const p = wSend(['--to', WID, '--text', 'hi from the state test', '--timeout', '8'], file);
-    await sleep(1500);
+    const sent = path.join(dir, 'sent');
+    const p = wSend(['--to', WID, '--text', 'hi from the state test', '--timeout', '8'], file, { KITTY_MOCK_SENT: sent });
+    // The row lands once the text was typed, as in a live tab: a fixed sleep
+    // raced the send on a loaded machine.
+    await sentBy(sent);
     await wAppend(file, 12, 'user', { time: { created: Date.now() }, text: 'hi from the state test' });
     const { code, err } = await p;
     assert.equal(code, 0, err);
@@ -335,8 +347,9 @@ test('state=idle sends past a spinner title with no flag', async () => {
 test('--idle-when still wins over state=busy', async () => {
   const { dir, file } = await wStore('assistant');
   try {
-    const p = wSend(['--to', WID, '--text', 'hi from the state test', '--idle-when', 'Bíð eftir næsta', '--timeout', '8'], file, { KITTY_MOCK_SCREEN: PARKED });
-    await sleep(1500);
+    const sent = path.join(dir, 'sent');
+    const p = wSend(['--to', WID, '--text', 'hi from the state test', '--idle-when', 'Bíð eftir næsta', '--timeout', '8'], file, { KITTY_MOCK_SCREEN: PARKED, KITTY_MOCK_SENT: sent });
+    await sentBy(sent);
     await wAppend(file, 12, 'user', { time: { created: Date.now() }, text: 'hi from the state test' });
     const { code, err } = await p;
     assert.equal(code, 0, err);
@@ -344,5 +357,132 @@ test('--idle-when still wins over state=busy', async () => {
     assert.doesNotMatch(err, /refusing to send into a mid-turn target/);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- kitty not answering is not a dead window; the wait backs off ----------
+// A second stub with state files: `title` is the window's title, `hang-after`
+// makes every `@ ls` past that many hang (a remote control that stopped
+// answering), `gone` lists no window. Every call is logged to `calls`; a
+// `sleep` stub logs its argument to `sleeps` and, from the sixth call on,
+// marks the window gone so the wait ends.
+const slowStub = async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kitty-slow-'));
+  const bin = path.join(dir, 'bin');
+  await fs.mkdir(bin);
+  await fs.writeFile(path.join(dir, 'title'), 'π ⠹ mock busy (never idle)');
+  await fs.writeFile(path.join(bin, 'kitty'), `#!/usr/bin/env bash
+st=${JSON.stringify(dir)}
+printf '%s\\n' "$*" >> "$st/calls"
+if [ "\${1:-}" = "@" ] && [ "\${2:-}" = "ls" ]; then
+  n=$(( $(cat "$st/ls-n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$st/ls-n"
+  if [ -f "$st/hang-after" ] && [ "$n" -gt "$(cat "$st/hang-after")" ]; then exec /usr/bin/sleep 8; fi
+  [ -f "$st/gone" ] && { echo '[]'; exit 0; }
+  jq -cn --arg t "$(cat "$st/title")" '[{"tabs":[{"title":"mock-tab","windows":[{"id":${WID},"title":$t,"pid":424242,"cwd":"/tmp/kitty-wait-cwd"}]}]}]'
+fi
+exit 0
+`, { mode: 0o755 });
+  const sleepBin = path.join(dir, 'sleep-bin');
+  await fs.mkdir(sleepBin);
+  await fs.writeFile(path.join(sleepBin, 'sleep'), `#!/usr/bin/env bash
+st=${JSON.stringify(dir)}
+printf '%s\\n' "$1" >> "$st/sleeps"
+[ "$(wc -l < "$st/sleeps")" -ge 6 ] && : > "$st/gone"
+exit 0
+`, { mode: 0o755 });
+  const read = (f) => fs.readFile(path.join(dir, f), 'utf8').catch(() => '');
+  return {
+    dir, bin, sleepBin, read,
+    lsCalls: async () => (await read('calls')).split('\n').filter((l) => /^@ (--to \S+ )?ls\b/.test(l)),
+    env: (extra = {}) => ({ PATH: `${bin}:${process.env.PATH}`, XDG_RUNTIME_DIR: dir, AGENT_KITTY_LS_DIR: path.join(dir, 'kls'), ...extra }),
+  };
+};
+const runIn = async (env, args, timeout = 40_000) => {
+  try {
+    const r = await run(SCRIPT, args, { env: isolatedEnv(env), timeout });
+    return { code: 0, out: r.stdout, err: r.stderr };
+  } catch (e) {
+    return { code: e.code ?? e.signal ?? 1, out: e.stdout ?? '', err: e.stderr ?? '' };
+  }
+};
+
+test('a bounded wait while kitty stops answering exits 12, nothing sent, and never says the window died', async () => {
+  const s = await slowStub();
+  try {
+    // The first two reads answer (the up check, the fresh read of the
+    // target); every later one hangs past the read timeout.
+    await fs.writeFile(path.join(s.dir, 'hang-after'), '2');
+    const t0 = Date.now();
+    const { code, err } = await runIn(s.env({ AGENT_KITTY_LS_TIMEOUT_MS: '500' }), ['--to', WID, '--text', 'hi', '--wait-idle', '3']);
+    assert.equal(code, 12, err);
+    assert.doesNotMatch(err, /died/);
+    assert.match(err, /nothing was sent/);
+    assert.ok(Date.now() - t0 < 15_000, `took ${Date.now() - t0} ms`);
+    assert.equal((await s.read('calls')).split('\n').filter((l) => l.startsWith('@ send-text')).length, 0);
+  } finally {
+    await fs.rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+test('the wait for a busy target backs off: 2, 4, 8, 10, 10 s, each within 20%', async () => {
+  const s = await slowStub();
+  try {
+    const env = s.env();
+    env.PATH = `${s.sleepBin}:${env.PATH}`;
+    const { code, err } = await runIn(env, ['--to', WID, '--text', 'hi', '--wait-idle', '600']);
+    assert.equal(code, 1, err);
+    assert.match(err, /died while waiting/);
+    const slept = (await s.read('sleeps')).split('\n').filter(Boolean).map(Number);
+    const want = [2, 4, 8, 10, 10];
+    assert.ok(slept.length >= want.length, `slept ${slept.join(', ')}`);
+    want.forEach((w, i) => assert.ok(slept[i] >= w * 0.8 && slept[i] <= w * 1.2, `sleep ${i + 1} was ${slept[i]} s, want ${w} +/-20%: ${slept.join(', ')}`));
+  } finally {
+    await fs.rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+test('a cached listing never decides the send: a window that is now a Copilot seat with no Copilot is exit 17', async () => {
+  const s = await slowStub();
+  try {
+    const env = s.env({ AGENT_KITTY_LS_TTL_MS: '600000' });
+    // A cached read sees a plain shell; then kitty's own answer changes to a
+    // Copilot title, with no Copilot in the foreground.
+    await fs.writeFile(path.join(s.dir, 'title'), 'bash');
+    const kls = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+    await run(process.execPath, [kls, '--match', `id:${WID}`], { env: isolatedEnv({ ...env, AGENT_MAILBOX_KITTY: 'kitty' }) }).catch(() => {});
+    await run(process.execPath, [kls], { env: isolatedEnv({ ...env, AGENT_MAILBOX_KITTY: 'kitty' }) }).catch(() => {});
+    await fs.writeFile(path.join(s.dir, 'title'), 'GitHub Copilot');
+    await fs.writeFile(path.join(s.dir, 'calls'), '');
+    const { code, err } = await runIn(env, ['--to', WID, '--text', 'hi']);
+    assert.equal(code, 17, err);
+    const calls = (await s.read('calls')).split('\n').filter(Boolean);
+    assert.equal(calls.filter((l) => l.startsWith('@ send-text')).length, 0, 'nothing typed');
+    const ls = calls.filter((l) => /^@ (--to \S+ )?ls\b/.test(l));
+    assert.ok(ls.length > 0, 'kitty itself was asked');
+    assert.match(ls.at(-1), new RegExp(`^@ ls( --match id:${WID})?$`));
+  } finally {
+    await fs.rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+// The idle wait types into the target on the pass that finds it idle, so that
+// read is fresh: a listing cached while the seat was idle, up to the TTL old,
+// would show idle a seat that has just started a turn. The suite runs with the
+// cache off (TTL 0); this test turns it on and primes it with an idle title.
+test('the idle wait reads fresh: a cached idle listing does not let it type into a busy seat', async () => {
+  const s = await slowStub();
+  try {
+    const env = s.env({ AGENT_KITTY_LS_TTL_MS: '600000' });
+    await fs.writeFile(path.join(s.dir, 'title'), 'claude: idle seat');
+    const kls = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+    const primed = await run(process.execPath, [kls, '--fresh'], { env: isolatedEnv({ ...env, AGENT_MAILBOX_KITTY: 'kitty' }) });
+    assert.match(primed.stdout, /claude: idle seat/);
+    await fs.writeFile(path.join(s.dir, 'title'), 'π ⠹ claude: working');
+    const { code, err } = await runIn(env, ['--to', WID, '--text', 'hi', '--wait-idle', '2']);
+    assert.equal(code, 5, err);
+    assert.match(err, /nothing was sent/);
+    assert.equal((await s.read('calls')).split('\n').filter((l) => l.startsWith('@ send-text')).length, 0, 'nothing typed');
+  } finally {
+    await fs.rm(s.dir, { recursive: true, force: true });
   }
 });

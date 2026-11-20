@@ -25,7 +25,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { PRESENCE_FILE, isIdleBeacon, isLiveBeacon, presenceRowToBeacon, switchboardDir } from './presence.mjs';
-import { kittyLs, kittyKnownDown } from './kitty-ls.mjs';
+import { kittyLs, kittyKnownDown, kittyDownMessage } from './kitty-ls.mjs';
 import { defaultStorePath, withRetriedStore, pruneRetention } from './store.mjs';
 import {
   ROLE_PREFIX,
@@ -170,9 +170,10 @@ export const readPresenceBeacons = ({ presenceFile: file, now = Date.now(), incl
   return beacons.filter((b) => isLiveBeacon(b, now));
 };
 // .tabs[].windows[] only — tab ids and window ids share one number space
-// (see lib/tab-ledger.sh win_pid), so a whole-JSON grep would match a tab.
-export const kittyWindows = () => {
-  const parsed = kittyLs();
+// (see lib/kitty-ls.mjs), so a whole-JSON grep would match a tab. `match`
+// (`id:N`) reads that one window; `fresh` refuses a cached listing.
+export const kittyWindows = ({ fresh = false, match } = {}) => {
+  const parsed = kittyLs({ fresh, match });
   if (parsed == null) return [];
   const wins = [];
   for (const osEntry of parsed ?? []) {
@@ -411,15 +412,20 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
     throw new Error(`no live session for mailbox key '${target}' — its presence beacon is stale or gone`);
   }
 
-  const wins = kittyWindows();
+  // A numeric target reads only that window, a cached answer allowed (a gone
+  // window is never served from cache); a title is matched against a fresh
+  // listing of every window.
+  const numeric = /^\d+$/.test(String(target));
+  const wins = numeric ? kittyWindows({ match: `id:${target}` }) : kittyWindows({ fresh: true });
   // An unreadable window list is not "no such window": say which, so the
   // sender can reach for another channel instead of reporting a missing seat.
   if (wins.length === 0 && kittyKnownDown()) {
-    throw resErr('kitty-unreachable', `kitty remote control is not answering, so window '${target}' cannot be looked up (a timeout or an unreachable socket)`);
+    throw resErr('kitty-unreachable', `kitty remote control is not answering, so window '${target}' cannot be looked up: ${kittyDownMessage()}`);
   }
-  if (/^\d+$/.test(String(target))) {
+  if (numeric) {
     const win = wins.find((w) => w.id === Number(target));
-    if (!win) throw new Error(`no kitty window with id ${target}${seatHint(beacons, wins, sender)}`);
+    // The hint names the live seats, so it needs every window, not the one read.
+    if (!win) throw new Error(`no kitty window with id ${target}${seatHint(beacons, kittyWindows(), sender)}`);
     return resolveWindowRecipient(beacons, win, sender, { presenceFile: file });
   }
 

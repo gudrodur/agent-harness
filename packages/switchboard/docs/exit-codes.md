@@ -22,7 +22,7 @@
 |---|---|
 | 0 | Sent and proven (a new user row in the tab's session record). Under `--queue` it means only that the background waiter started; the verdict lands in the queue log. |
 | 1 | Usage or precondition error (no such window, a refused flag pair). |
-| 12 | Kitty remote control unavailable (`kitty @ ls` timed out or the socket is unreachable): nothing sent. agent-send reports it as 1, keeps any queued row, and prints one stderr line telling the calling Claude Code session to deliver with `ListAgents` plus `SendMessage` and to `--cancel --id <id>` the row. |
+| 12 | Kitty remote control unavailable (`kitty @ ls` timed out, the socket is unreachable, or kitty is overloaded and every process is backing off; the message then says until when and not to retry before then): nothing sent. A bounded wait whose window stops answering exits 12 at its end, not 5; kitty not answering is never read as the window being gone. agent-send reports it as 1, keeps any queued row, and prints one stderr line telling the calling Claude Code session to deliver with `ListAgents` plus `SendMessage` and to `--cancel --id <id>` the row. |
 | 3 | Sent, but could not prove it landed: do not resend. Any failure after the keystrokes went out (a screen read, say) also exits 3, never 1 or 11. |
 | 4 | The target shows a selection dialog, or its session record status is `waiting` or `blocked`: nothing sent, in every mode (`--now` included); under `--wait-idle`, `--deadline` or `--queue` the wait loop keeps waiting for it to clear and exits 5 if it does not. |
 | 5 | `--wait-idle` or `--deadline` ran out before the target went idle: nothing sent. |
@@ -37,7 +37,7 @@
 
 The comment block at the top of `bin/kitty-send.sh` is the authority.
 
-Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote control (fall back to headless and say so); exit 3 means the session started on another model and the tab was closed.
+Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote control, or kitty is overloaded and backing off, before any tab opened (the message says until when; fall back to headless and say so); exit 3 means a tab opened but its start is not proven: the session started on another model and the tab was closed, or kitty stopped answering after the launch (the pid read is retried first, `AGENT_LAUNCH_PID_TRIES`, default 6), in which case the tab is left open with a state row whose pid is `?` and its brief claimed. Never fall back to headless or relaunch on 3: the brief would run twice. A launch never exits 2 once `kitty @ launch` has returned a window id.
 
 ## claude-tab.sh --retire and --reseat
 
@@ -46,8 +46,8 @@ Launchers (`opencode-tab.sh`, `claude-tab.sh`): exit 2 means no terminal remote 
 | Code | Meaning |
 |---|---|
 | 0 | Closed and marked retired, or the window was already gone (the row is marked retired and its claims released). |
-| 1 | Usage error (no numeric id, no calling session), the handover store could not be read, or `kitty @ ls` failed or printed something that is not a JSON array (the window is not assumed gone). Nothing closed, retired or released. |
-| 2 | No terminal remote control. |
+| 1 | Usage error (no numeric id, no calling session), the handover store could not be read, or `kitty @ ls` printed something that is not a JSON array (the window is not assumed gone). Nothing closed, retired or released. |
+| 2 | No terminal remote control, or kitty did not answer the window read (timed out, refused, or overloaded and backing off). Nothing closed. |
 | 20 | No usable handover: none names the window, it names another session as taker, or it was already retired. Nothing closed. |
 | 21 | The window's pid is not the recorded one: the id was reused. Nothing closed. |
 | 22 | The id is the caller's own window. Nothing closed. |

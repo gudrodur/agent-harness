@@ -69,8 +69,10 @@ before(async () => {
       'case "$1/$2" in',
       '  @/ls) [ -f "$state/nokitty" ] && exit 1',
       '        if [ -f "$state/ls-fail" ]; then echo "Error: dial unix ${KITTY_LISTEN_ON#unix:}: connect: no such file or directory" >&2; exit 1; fi',
+      // ls-fail-after-launch: every read after the launch gets no answer.
+      '        if [ -f "$state/ls-fail-after-launch" ] && [ -f "$state/launched" ]; then echo "Error: Failed to connect: Connection refused" >&2; exit 1; fi',
       '        if [ -f "$state/gone" ]; then echo "[]"; else printf \'%s\\n\' ' + JSON.stringify(lsJson) + '; fi ;;',
-      '  @/launch) printf \'%s\\n\' "$@" > "$state/launch-args"; echo ' + WID + ' ;;',
+      '  @/launch) printf \'%s\\n\' "$@" > "$state/launch-args"; : > "$state/launched"; echo ' + WID + ' ;;',
       '  @/close-window) printf \'%s\\n\' "$*" > "$state/closed" ;;',
       'esac',
       'exit 0',
@@ -93,7 +95,7 @@ after(async () => {
 // Fresh store and state for each test; `session` rows are what opencode
 // writes when the TUI starts in a directory.
 beforeEach(async () => {
-  for (const f of ['launch-args', 'probe-calls', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'probe-calls', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { force: true });
   }
   await fs.rm(db, { force: true });
@@ -111,20 +113,19 @@ const addSession = (id, model, { dir = cwd, parent = null, at = Date.now() + 60_
 const beacon = (windowId) =>
   fs.writeFile(path.join(stateDir, 'presence.json'), JSON.stringify({ beacons: [{ sessionId: 'x', windowId }] }));
 
+const tabEnv = (extraEnv = {}) => isolatedEnv({
+  PATH: `${binDir}:${process.env.PATH}`,
+  XDG_RUNTIME_DIR: stateDir,
+  CLAUDE_SESSION_ID: 'test-launcher',
+  OPENCODE_TAB_LAUNCH: launcher,
+  OPENCODE_TAB_DB: db,
+  OPENCODE_TAB_PRESENCE: path.join(binDir, 'presence'),
+  SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'no-claim-cli.mjs'),
+  ...extraEnv,
+});
 const tab = async (args, extraEnv = {}) => {
   try {
-    const r = await run('bash', [SCRIPT, ...args], {
-      env: isolatedEnv({
-        PATH: `${binDir}:${process.env.PATH}`,
-        XDG_RUNTIME_DIR: stateDir,
-        CLAUDE_SESSION_ID: 'test-launcher',
-        OPENCODE_TAB_LAUNCH: launcher,
-        OPENCODE_TAB_DB: db,
-        OPENCODE_TAB_PRESENCE: path.join(binDir, 'presence'),
-        SWITCHBOARD_TASK_CLAIM: path.join(stateDir, 'no-claim-cli.mjs'),
-        ...extraEnv,
-      }),
-    });
+    const r = await run('bash', [SCRIPT, ...args], { env: tabEnv(extraEnv) });
     return { code: 0, out: r.stdout, err: r.stderr };
   } catch (e) {
     return { code: e.code, out: e.stdout, err: e.stderr };
@@ -459,6 +460,46 @@ test('the --list prune of a gone row releases that window’s claims', async () 
   const r = await tab(['--list'], { SWITCHBOARD_TASK_CLAIM: await claimStub() });
   assert.equal(r.code, 0, `${r.out}${r.err}`);
   assert.deepEqual(await claimCalls(), [`--release-owner kitty:${GONE}`]);
+});
+
+// --list prunes rows and releases claims, so it reads kitty fresh: a list
+// cached before the window opened would prune a live seat. The suite runs with
+// the cache off (TTL 0); this test turns it on.
+test('--list reads fresh: a cached list from before the window opened prunes nothing and releases nothing', async () => {
+  const ttl = { AGENT_KITTY_LS_TTL_MS: '60000' };
+  await fs.writeFile(path.join(stateDir, 'gone'), '');
+  const KITTY_LS = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+  const primed = await run('node', [KITTY_LS, '--fresh'], { env: tabEnv(ttl) });
+  assert.equal(primed.stdout.trim(), '[]', 'the cache holds a list without the window');
+  await fs.rm(path.join(stateDir, 'gone'));
+  await writeRows(`${WID} ${process.pid} @seatA opencode: just launched`);
+  const r = await tab(['--list'], { ...ttl, SWITCHBOARD_TASK_CLAIM: await claimStub() });
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.match(r.out, new RegExp(`${WID}\\s+live`));
+  assert.deepEqual(await claimCalls(), [], 'no claim released');
+  assert.match(await fs.readFile(ledgerFile(), 'utf8'), new RegExp(`^${WID} `, 'm'));
+});
+
+// A row written while kitty did not answer the pid read has pid `?`; the
+// next --list that sees the window live records its pid.
+test('--list adopts the live pid into a row written with an unknown pid', async () => {
+  await writeRows(`${WID} ? @seatA opencode: unproven`);
+  const r = await tab(['--list'], { SWITCHBOARD_TASK_CLAIM: await claimStub() });
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.match(r.out, new RegExp(`${WID}\\s+live`));
+  assert.match(await fs.readFile(ledgerFile(), 'utf8'), new RegExp(`^${WID} ${process.pid} @seatA opencode: unproven$`, 'm'));
+  assert.deepEqual(await claimCalls(), []);
+});
+
+test('kitty that stops answering after the launch: never exit 2; the row and the claim are written and the exit is 3', async () => {
+  await fs.writeFile(path.join(stateDir, 'ls-fail-after-launch'), '');
+  const r = await tab([...full(), '--no-probe'], { SWITCHBOARD_TASK_CLAIM: await claimStub() });
+  assert.notEqual(r.code, 2, `exit 2 sends the caller to a headless rerun: ${r.err}`);
+  assert.equal(r.code, 3, r.err);
+  assert.match(r.out, new RegExp(`^WINDOW_ID=${WID}$`, 'm'));
+  assert.match(await fs.readFile(ledgerFile(), 'utf8'), new RegExp(`^${WID} \\? @test-launcher opencode: test$`, 'm'));
+  assert.ok((await claimCalls()).some((c) => c.startsWith(`--claim ${cwd} brief:brief.md --owner kitty:${WID}`)), (await claimCalls()).join('\n'));
+  assert.equal(await exists('closed'), false, 'the tab is left open');
 });
 
 test('a missing claim CLI is a loud skip, never a refusal', async () => {
