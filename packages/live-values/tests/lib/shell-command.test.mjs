@@ -18,10 +18,32 @@ test("stripHeredocBodies keeps head lines and drops bodies, several tags on a li
 
 test("heredocBodies pairs each tag with its head line and body, unclosed ones included", () => {
   assert.deepEqual(heredocBodies("cat <<A <<B\na\nA\nb1\nb2\nB\nls <<C\nc"), [
-    { head: "cat <<A <<B", tag: "A", body: "a" },
-    { head: "cat <<A <<B", tag: "B", body: "b1\nb2" },
-    { head: "ls <<C", tag: "C", body: "c" },
+    { head: "cat <<A <<B", tag: "A", body: "a", quoted: false },
+    { head: "cat <<A <<B", tag: "B", body: "b1\nb2", quoted: false },
+    { head: "ls <<C", tag: "C", body: "c", quoted: false },
   ]);
+});
+
+// `<<<word` is a herestring: its word sits on the same line and no body follows.
+test("a herestring opens no heredoc, beside a real one too", () => {
+  assert.equal(stripHeredocBodies("cat <<<word\nnext"), "cat <<<word\nnext");
+  assert.equal(stripHeredocBodies("cat <<< word\nnext"), "cat <<< word\nnext");
+  assert.equal(stripHeredocBodies("cat <<<word <<EOF\nbody\nEOF\nnext"), "cat <<<word <<EOF\nnext");
+  assert.deepEqual(heredocBodies("tr a b <<<word\nnext"), []);
+});
+
+// `<<\EOF` quotes the delimiter as `<<'EOF'` does: the body is data and ends at `EOF`.
+test("a backslash-quoted delimiter opens a quoted heredoc", () => {
+  assert.equal(stripHeredocBodies("cat <<\\EOF\n$(rm x)\nEOF\nnext"), "cat <<\\EOF\nnext");
+  assert.equal(stripHeredocBodies("cat <<-\\EOF\n\tbody\n\tEOF\nnext"), "cat <<-\\EOF\nnext");
+  assert.deepEqual(heredocBodies("cat <<\\EOF\nb\nEOF"), [{ head: "cat <<\\EOF", tag: "EOF", body: "b", quoted: true }]);
+});
+
+test("heredocBodies says whether the delimiter is quoted, so the shell leaves the body unexpanded", () => {
+  assert.deepEqual(
+    heredocBodies("cat <<'A' <<\"B\" <<C <<-  'D'\na\nA\nb\nB\nc\nC\nd\nD").map((h) => [h.tag, h.quoted]),
+    [["A", true], ["B", true], ["C", false], ["D", true]],
+  );
 });
 
 // One line holding many openers, then their terminators. A 1 MB command holds

@@ -9,6 +9,13 @@
 // listing plus quoted "deploy" prose claimed a deploy). The same shape a
 // command gate strips before judging.
 
+// A heredoc opener and its delimiter: `<<TAG`, `<<-TAG`, `<< TAG`, and the
+// quoted forms `<<'TAG'`, `<<"TAG"` and `<<\TAG`, which leave the body
+// unexpanded (group 1 holds the quote). Never a `<<<` herestring: the
+// lookbehind keeps its second `<` from reading as an opener, and its word
+// sits on the same line with no body after it.
+const HEREDOC_OPENER = /(?<!<)<<(?!<)-?~?\s*(\\|['"]?)([A-Za-z_]\w*)['"]?/g;
+
 // Drop heredoc bodies: from a line carrying `<<TAG` (also `<<-TAG`, quoted
 // tags) through the terminating line `TAG`. Head lines are kept verbatim so
 // the redirect target (`cat > <target> <<EOF`) is still judged. `<<<`
@@ -31,9 +38,7 @@ export const stripHeredocBodies = (command) => {
     }
     pending.length = 0;
     next = 0;
-    const re = /<<(?![<])-?~?\s*['"]?([A-Za-z_]\w*)['"]?/g;
-    let m;
-    while ((m = re.exec(line)) !== null) pending.push(m[1]);
+    for (const m of line.matchAll(HEREDOC_OPENER)) pending.push(m[2]);
     kept.push(line);
   }
   return kept.join('\n');
@@ -251,7 +256,9 @@ export const commandWord = (words) => {
 // head line that opened it and the body lines up to the terminator. Mirrors
 // stripHeredocBodies, which drops exactly these lines; a gate that has to
 // READ a body (a message passed as `-F - <<EOF` or `-m "$(cat <<EOF)"`)
-// pairs a segment with the entry whose head line carries it.
+// pairs a segment with the entry whose head line carries it. `quoted` is true
+// for `<<'TAG'`, `<<"TAG"` and `<<\TAG`, whose body the shell leaves
+// unexpanded, so a substitution in it never runs.
 // Linear, as stripHeredocBodies is: an index into the queue, never `shift()`.
 export const heredocBodies = (command) => {
   const lines = String(command ?? '').split('\n');
@@ -262,7 +269,7 @@ export const heredocBodies = (command) => {
     if (next < pending.length) {
       const cur = pending[next];
       if (cur.tag === line.trim()) {
-        out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
+        out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n'), quoted: cur.quoted });
         next++;
       } else {
         cur.body.push(line);
@@ -271,13 +278,11 @@ export const heredocBodies = (command) => {
     }
     pending.length = 0;
     next = 0;
-    const re = /<<(?![<])-?~?\s*['"]?([A-Za-z_]\w*)['"]?/g;
-    let m;
-    while ((m = re.exec(line)) !== null) pending.push({ head: line, tag: m[1], body: [] });
+    for (const m of line.matchAll(HEREDOC_OPENER)) pending.push({ head: line, tag: m[2], quoted: m[1] !== '', body: [] });
   }
   for (let k = next; k < pending.length; k++) {
     const cur = pending[k];
-    out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n') });
+    out.push({ head: cur.head, tag: cur.tag, body: cur.body.join('\n'), quoted: cur.quoted });
   }
   return out;
 };

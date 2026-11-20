@@ -19,6 +19,11 @@ All notable changes to this project are documented here. The format follows
   quadratic (`shift()` on the open-tag queue), and about 120 000 openers threw
   a `RangeError` (the tags were pushed with a spread). Output is unchanged; the
   bundle does not use them, so `dist/` is unchanged.
+- The heredoc readers (`stripHeredocBodies`, `heredocBodies`) share one opener
+  pattern. A `<<<word` herestring no longer reads as a heredoc whose body is
+  the rest of the command, and a `<<\TAG` delimiter now opens one.
+  `heredocBodies` entries carry `quoted`: true for `<<'TAG'`, `<<"TAG"` and
+  `<<\TAG`, whose body the shell leaves unexpanded.
 
 ## [1.0.0] - Unreleased
 
