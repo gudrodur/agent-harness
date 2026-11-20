@@ -12,6 +12,14 @@ All notable changes to this project are documented here. The format follows
   upstream copies they were extracted from (see 1.0.0 "Changed" for the two
   behaviour changes). The bundle header now names `live-values@<version>`.
 
+### Fixed
+
+- `stripHeredocBodies` and `heredocBodies` (`engine/lib/shell-command.mjs`) are
+  linear in the command. A line holding many heredoc openers made them
+  quadratic (`shift()` on the open-tag queue), and about 120 000 openers threw
+  a `RangeError` (the tags were pushed with a spread). Output is unchanged; the
+  bundle does not use them, so `dist/` is unchanged.
+
 ## [1.0.0] - Unreleased
 
 First tagged release. The date is filled in when the tag is cut.
