@@ -44,7 +44,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { isMainModule } from './cli-entry.mjs';
 import { nextDelay, sleepSync } from './backoff.mjs';
 
 const KITTY_LS_TIMEOUT_MS = 5000;
@@ -428,7 +428,7 @@ export const kittyDownMessage = (r = last) => {
 // `reason=`, `retry_in_ms=` and `detail=` lines, on stderr and on stdout:
 // lib/kitty-ls.sh reads stdout alone, so a node warning on stderr never
 // lands in what it parses.
-if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] ?? null : null);
   const known = new Set(['--match', '--fresh', '--probe', '--to']);
