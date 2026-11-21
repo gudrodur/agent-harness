@@ -355,22 +355,28 @@ test("shellWordsDetailed: bare < and the forms the review listed", () => {
   ]);
 });
 
-test("shellWordsDetailed: a process substitution expands and is no redirection", () => {
-  const w = (s) => shell.shellWordsDetailed(s).map(({ word, expands, operatorAt }) => ({ word, expands, operatorAt }));
+test("shellWordsDetailed: a process substitution expands, is no redirection, and procSubAt marks it", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, expands, operatorAt, procSubAt }) => ({ word, expands, operatorAt, procSubAt }));
   // Bash passes `/dev/fd/63` and tee writes the file: a gate reading `>(tee` as a redirect misses it.
   assert.deepEqual(w("echo x >(tee f) <(cat g) a>(b)"), [
-    { word: "echo", expands: false, operatorAt: [] },
-    { word: "x", expands: false, operatorAt: [] },
-    { word: ">(tee", expands: true, operatorAt: [] },
-    { word: "f)", expands: false, operatorAt: [] },
-    { word: "<(cat", expands: true, operatorAt: [] },
-    { word: "g)", expands: false, operatorAt: [] },
-    { word: "a>(b)", expands: true, operatorAt: [] },
+    { word: "echo", expands: false, operatorAt: [], procSubAt: [] },
+    { word: "x", expands: false, operatorAt: [], procSubAt: [] },
+    { word: ">(tee", expands: true, operatorAt: [], procSubAt: [0] },
+    { word: "f)", expands: false, operatorAt: [], procSubAt: [] },
+    { word: "<(cat", expands: true, operatorAt: [], procSubAt: [0] },
+    { word: "g)", expands: false, operatorAt: [], procSubAt: [] },
+    { word: "a>(b)", expands: true, operatorAt: [], procSubAt: [1] },
   ]);
   // A redirect into a process substitution keeps its own operator.
-  assert.deepEqual(w("> >(cat)"), [{ word: ">", expands: false, operatorAt: [0] }, { word: ">(cat)", expands: true, operatorAt: [] }]);
+  assert.deepEqual(w("> >(cat) --f=<(x)"), [
+    { word: ">", expands: false, operatorAt: [0], procSubAt: [] },
+    { word: ">(cat)", expands: true, operatorAt: [], procSubAt: [0] },
+    { word: "--f=<(x)", expands: true, operatorAt: [], procSubAt: [4] },
+  ]);
   // Quoted or escaped, it is text.
-  assert.deepEqual(w("'>(x)' \">(x)\" \\>(x)").map((x) => x.expands), [false, false, false]);
+  assert.deepEqual(w("'>(x)' \">(x)\" \\>(x) \"$a>(\"").map((x) => [x.expands, x.procSubAt]), [
+    [false, []], [false, []], [false, []], [true, []],
+  ]);
 });
 
 test("shellWordsDetailed: an extglob is a pattern, and so is a glob after $$ or another special parameter", () => {

@@ -128,6 +128,7 @@ var shellWordsDetailed = (segment) => {
   let expands = false;
   let pattern = false;
   let operatorAt = [];
+  let procSubAt = [];
   let braces = 0;
   let braceSep = false;
   let bracket = false;
@@ -145,10 +146,11 @@ var shellWordsDetailed = (segment) => {
   };
   const push = () => {
     if (cur !== null)
-      words.push({ word: cur, bareStart, expands: expands || pattern, pattern, operatorAt });
+      words.push({ word: cur, bareStart, expands: expands || pattern, pattern, operatorAt, procSubAt });
     cur = null;
     expands = pattern = braceSep = bracket = paramNext = lastName = false;
     operatorAt = [];
+    procSubAt = [];
     braces = 0;
     lastBare = null;
   };
@@ -215,8 +217,10 @@ var shellWordsDetailed = (segment) => {
       pattern = true;
     lastName = param;
     const procSub = (c === "<" || c === ">") && text[i + 1] === "(";
-    if (procSub)
+    if (procSub) {
       expands = true;
+      procSubAt.push(cur === null ? 0 : cur.length);
+    }
     if (!param && c === "[")
       bracket = true;
     if (c === "]" && bracket)

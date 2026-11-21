@@ -390,7 +390,8 @@ export const splitSegmentsDetailed = (command) => {
 // read a word's VALUE (a commit message, a --model name) decide themselves
 // what an unexpanded `$` means. An unbalanced quote runs to the end, which is
 // the allow-biased reading: the word it swallows is never mistaken for a flag.
-// shellWordsDetailed gives each word as `{ word, bareStart, expands, pattern, operatorAt }`.
+// shellWordsDetailed gives each word as `{ word, bareStart, expands, pattern, operatorAt,
+// procSubAt }`.
 // - `bareStart`: its first character was neither quoted nor escaped. Only such a
 //   word can be an operator, so `echo '> quote'` is an argument and `>"$f"` a redirect.
 // - `expands`: the shell would expand part of it: a `$` outside single quotes that
@@ -407,6 +408,9 @@ export const splitSegmentsDetailed = (command) => {
 //   redirection, which it does even inside a word (`echo "a">f`), so a gate can split
 //   it. One followed by `(` is a process substitution, not a redirection. A `$'…'`
 //   string is read with its escapes, so a `>` inside it is no operator.
+// - `procSubAt`: the offsets in `word` of each bare `<(` or `>(`, a process
+//   substitution. Bash passes a `/dev/fd` path to a command it runs alongside, so a
+//   gate can neither read the word as a file nor know what that command writes.
 // Out of scope: history `!` expansion, word splitting of an unquoted expansion, a
 // backslash-newline joining two lines (agent-harness#57), and the words inside a
 // process substitution: they come back as plain words, and splitSegments splits at a
@@ -422,6 +426,7 @@ export const shellWordsDetailed = (segment) => {
   let expands = false;
   let pattern = false;
   let operatorAt = [];
+  let procSubAt = [];
   let braces = 0; // bare `{` not yet closed in this word
   let braceSep = false; // a bare `,` or `..` since the first open one
   let bracket = false; // a bare `[` in this word
@@ -436,10 +441,11 @@ export const shellWordsDetailed = (segment) => {
     if (!bare) paramNext = lastName = false;
   };
   const push = () => {
-    if (cur !== null) words.push({ word: cur, bareStart, expands: expands || pattern, pattern, operatorAt });
+    if (cur !== null) words.push({ word: cur, bareStart, expands: expands || pattern, pattern, operatorAt, procSubAt });
     cur = null;
     expands = pattern = braceSep = bracket = paramNext = lastName = false;
     operatorAt = [];
+    procSubAt = [];
     braces = 0;
     lastBare = null;
   };
@@ -506,7 +512,10 @@ export const shellWordsDetailed = (segment) => {
     lastName = param;
     // A process substitution `<(…)` or `>(…)`: bash passes a `/dev/fd` path, so no redirection starts.
     const procSub = (c === '<' || c === '>') && text[i + 1] === '(';
-    if (procSub) expands = true;
+    if (procSub) {
+      expands = true;
+      procSubAt.push(cur === null ? 0 : cur.length);
+    }
     if (!param && c === '[') bracket = true;
     if (c === ']' && bracket) pattern = true;
     if (lastBare !== '$' && c === '{') braces++; // bash never brace-expands `${`, even after `$$`
