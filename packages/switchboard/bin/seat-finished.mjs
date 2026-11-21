@@ -29,6 +29,7 @@
 // and the launcher's pid, session and idle guards. A missing store answers
 // {finished: false}; it is never created here.
 import fs from 'node:fs';
+import { isMainModule } from '../lib/cli-entry.mjs';
 import { sanitizeSessionId } from '../lib/agent-mailbox.mjs';
 import { readRolesDb, rolesForSession } from '../lib/seat-roles.mjs';
 import { heldBy, waitingFor } from '../lib/resource-leases.mjs';
@@ -84,7 +85,7 @@ export const finishedVerdict = (db, { sessionId, sinceMs = 0, transcript = null 
   return { finished: true, id: marker.id, ts: marker.ts };
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   const [cmd, ...a] = process.argv.slice(2);
   if (cmd === 'check' && a.length === 3) {
     try {
