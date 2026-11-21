@@ -354,3 +354,37 @@ test("shellWordsDetailed: bare < and the forms the review listed", () => {
     { word: "x`y`", expands: false, operatorAt: [] },
   ]);
 });
+
+test("shellWordsDetailed: a process substitution expands and is no redirection", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, expands, operatorAt }) => ({ word, expands, operatorAt }));
+  // Bash passes `/dev/fd/63` and tee writes the file: a gate reading `>(tee` as a redirect misses it.
+  assert.deepEqual(w("echo x >(tee f) <(cat g) a>(b)"), [
+    { word: "echo", expands: false, operatorAt: [] },
+    { word: "x", expands: false, operatorAt: [] },
+    { word: ">(tee", expands: true, operatorAt: [] },
+    { word: "f)", expands: false, operatorAt: [] },
+    { word: "<(cat", expands: true, operatorAt: [] },
+    { word: "g)", expands: false, operatorAt: [] },
+    { word: "a>(b)", expands: true, operatorAt: [] },
+  ]);
+  // A redirect into a process substitution keeps its own operator.
+  assert.deepEqual(w("> >(cat)"), [{ word: ">", expands: false, operatorAt: [0] }, { word: ">(cat)", expands: true, operatorAt: [] }]);
+  // Quoted or escaped, it is text.
+  assert.deepEqual(w("'>(x)' \">(x)\" \\>(x)").map((x) => x.expands), [false, false, false]);
+});
+
+test("shellWordsDetailed: an extglob is a pattern, and so is a glob after $$ or another special parameter", () => {
+  const flags = (s) => shell.shellWordsDetailed(s).map(({ expands, pattern }) => [expands, pattern]);
+  assert.deepEqual(flags("@(a|b) !(a) +(a) ?(a) *(a)"), [[true, true], [true, true], [true, true], [true, true], [true, true]]);
+  assert.deepEqual(flags("a@b a+b !x '@(a)' \\@(a) $@ $!"), [
+    [false, false], [false, false], [false, false], [false, false], [false, false], [true, false], [true, false],
+  ]);
+  // `$$*` is the pid and a glob, bash matches `<pid>a`; `$?*`, `$-?`, `$1?` and `$$@(a|b)` the same.
+  assert.deepEqual(flags("$$* $$? $$[ab] $?* $-? $1? $$$$* $$@(a|b)"), [
+    [true, true], [true, true], [true, true], [true, true], [true, true], [true, true], [true, true], [true, true],
+  ]);
+  // `$$$*` is the pid and `$*`; bash never brace-expands a `${`, so `$${x,y}` passes `<pid>{x,y}`.
+  assert.deepEqual(flags("$$ $? $* ${A} $@( $$$* $?( $${x,y}"), [
+    [true, false], [true, false], [true, false], [true, false], [true, false], [true, false], [true, false], [true, false],
+  ]);
+});

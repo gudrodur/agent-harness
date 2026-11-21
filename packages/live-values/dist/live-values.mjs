@@ -132,18 +132,22 @@ var shellWordsDetailed = (segment) => {
   let braceSep = false;
   let bracket = false;
   let lastBare = null;
+  let paramNext = false;
+  let lastName = false;
   let i = 0;
   const add = (s, bare) => {
     if (cur === null)
       bareStart = bare;
     cur = (cur ?? "") + s;
     lastBare = bare ? s : null;
+    if (!bare)
+      paramNext = lastName = false;
   };
   const push = () => {
     if (cur !== null)
       words.push({ word: cur, bareStart, expands: expands || pattern, pattern, operatorAt });
     cur = null;
-    expands = pattern = braceSep = bracket = false;
+    expands = pattern = braceSep = bracket = paramNext = lastName = false;
     operatorAt = [];
     braces = 0;
     lastBare = null;
@@ -199,18 +203,25 @@ var shellWordsDetailed = (segment) => {
       i = j + 1;
       continue;
     }
-    if (c === "`" || c === "$" && EXPANSION_START_BARE.test(text[i + 1] ?? ""))
+    const param = paramNext;
+    paramNext = c === "$" && !param && EXPANSION_START_BARE.test(text[i + 1] ?? "");
+    if (c === "`" || paramNext)
       expands = true;
     if (c === "~" && (cur === null || lastBare === "=" || lastBare === ":"))
       expands = true;
-    const param = lastBare === "$";
     if (!param && (c === "*" || c === "?"))
       pattern = true;
+    if (c === "(" && !lastName && (lastBare === "@" || lastBare === "!" || lastBare === "+"))
+      pattern = true;
+    lastName = param;
+    const procSub = (c === "<" || c === ">") && text[i + 1] === "(";
+    if (procSub)
+      expands = true;
     if (!param && c === "[")
       bracket = true;
     if (c === "]" && bracket)
       pattern = true;
-    if (!param && c === "{")
+    if (lastBare !== "$" && c === "{")
       braces++;
     if (braces > 0 && (c === "," || c === "." && lastBare === "."))
       braceSep = true;
@@ -219,7 +230,7 @@ var shellWordsDetailed = (segment) => {
         pattern = true;
       braces--;
     }
-    if (c === "<" || c === ">")
+    if ((c === "<" || c === ">") && !procSub)
       operatorAt.push(cur === null ? 0 : cur.length);
     add(c, true);
     i++;
