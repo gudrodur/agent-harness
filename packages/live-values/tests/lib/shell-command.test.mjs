@@ -310,3 +310,47 @@ test("shellWordsDetailed marks a word that expands and the bare < and > inside i
   // shellWords is unchanged by the new fields.
   assert.deepEqual(shellWords("echo \"a b\">f"), ["echo", "a b>f"]);
 });
+
+test("shellWordsDetailed flags brace, glob and tilde expansion; pattern marks the ones that make several words or read the disk", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, expands, pattern }) => ({ word, expands, pattern }));
+  const flags = (s) => w(s).map(({ expands, pattern }) => [expands, pattern]);
+  // Brace expansion: bash passes `-m 'Co-Authored-By: Claude' -m 'Co-Authored-By: Cl'`.
+  assert.deepEqual(w("\"Co-Authored-By: Cl\"{aude,}"), [{ word: "Co-Authored-By: Cl{aude,}", expands: true, pattern: true }]);
+  assert.deepEqual(flags("x{a,b} {a..c} {} {a} '{a,b}' \\{a,b} {a\",\"b} \"{a,b}\""), [
+    [true, true], [true, true], [false, false], [false, false], [false, false], [false, false], [false, false], [false, false],
+  ]);
+  // Globs read the disk: the word the shell passes is not the literal.
+  assert.deepEqual(flags("*.md b.m? [ab].md '*.md' \"*\" \\* [ x] a]"), [
+    [true, true], [true, true], [true, true], [false, false], [false, false], [false, false], [false, false], [false, false], [false, false],
+  ]);
+  // A parameter is an expansion, not a pattern: `$?` and `$*` are no globs, `${A}` and `$[1]` no braces.
+  assert.deepEqual(flags("$? $* ${A} ${a,b} $[1]"), [[true, false], [true, false], [true, false], [true, false], [true, false]]);
+  // A leading tilde, or one after a bare = or :, is the home directory.
+  assert.deepEqual(flags("~/f ~ a=~/x p:~/y '~' \"~/f\" x~ \\~"), [
+    [true, false], [true, false], [true, false], [true, false], [false, false], [false, false], [false, false], [false, false],
+  ]);
+});
+
+test("shellWordsDetailed: only a $ that starts an expansion flags the word, and a $'…' string holds no operator", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ expands, operatorAt }) => [expands, operatorAt]);
+  // `$.`, `$%`, `$,` and `$/` stay literal in bash; `$-` (the option flags), `$?`, `$$`, `$1` and `${A}` expand.
+  assert.deepEqual(w("$. $% $, $/ \"a $.\" $- $? $$ $1 ${A} \"$-\""), [
+    [false, []], [false, []], [false, []], [false, []], [false, []],
+    [true, []], [true, []], [true, []], [true, []], [true, []], [true, []],
+  ]);
+  // The `>` is inside the ANSI-C string, after an escaped quote: no redirection starts there.
+  assert.deepEqual(w("$'\\'>f' $'a'>g"), [[true, []], [true, [2]]]);
+});
+
+test("shellWordsDetailed: bare < and the forms the review listed", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, expands, operatorAt }) => ({ word, expands, operatorAt }));
+  assert.deepEqual(w("<in <<EOF >|f \"`d`\" \"${A}\" \"$(x)\" x\\`y\\`"), [
+    { word: "<in", expands: false, operatorAt: [0] },
+    { word: "<<EOF", expands: false, operatorAt: [0, 1] },
+    { word: ">|f", expands: false, operatorAt: [0] },
+    { word: "`d`", expands: true, operatorAt: [] },
+    { word: "${A}", expands: true, operatorAt: [] },
+    { word: "$(x)", expands: true, operatorAt: [] },
+    { word: "x`y`", expands: false, operatorAt: [] },
+  ]);
+});

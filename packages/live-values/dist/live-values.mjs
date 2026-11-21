@@ -118,25 +118,35 @@ var splitSegmentsDetailed = (command) => {
   push("");
   return segs;
 };
+var EXPANSION_START_QUOTED = /[A-Za-z0-9_{(\[@*#?$!-]/;
+var EXPANSION_START_BARE = /[A-Za-z0-9_{(\[@*#?$!'"-]/;
 var shellWordsDetailed = (segment) => {
   const text = String(segment ?? "");
   const words = [];
   let cur = null;
   let bareStart = false;
   let expands = false;
+  let pattern = false;
   let operatorAt = [];
+  let braces = 0;
+  let braceSep = false;
+  let bracket = false;
+  let lastBare = null;
   let i = 0;
   const add = (s, bare) => {
     if (cur === null)
       bareStart = bare;
     cur = (cur ?? "") + s;
+    lastBare = bare ? s : null;
   };
   const push = () => {
     if (cur !== null)
-      words.push({ word: cur, bareStart, expands, operatorAt });
+      words.push({ word: cur, bareStart, expands: expands || pattern, pattern, operatorAt });
     cur = null;
-    expands = false;
+    expands = pattern = braceSep = bracket = false;
     operatorAt = [];
+    braces = 0;
+    lastBare = null;
   };
   while (i < text.length) {
     const c = text[i];
@@ -161,7 +171,7 @@ var shellWordsDetailed = (segment) => {
           j += 2;
           continue;
         }
-        if (text[j] === "`" || text[j] === "$" && /[^\s"]/.test(text[j + 1] ?? " "))
+        if (text[j] === "`" || text[j] === "$" && EXPANSION_START_QUOTED.test(text[j + 1] ?? ""))
           expands = true;
         s += text[j];
         j++;
@@ -175,8 +185,40 @@ var shellWordsDetailed = (segment) => {
       i += 2;
       continue;
     }
-    if (c === "`" || c === "$" && /\S/.test(text[i + 1] ?? " "))
+    if (c === "$" && text[i + 1] === "'") {
       expands = true;
+      add("$", true);
+      let j = i + 2;
+      let s = "";
+      while (j < text.length && text[j] !== "'") {
+        const n = text[j] === "\\" && j + 1 < text.length ? 2 : 1;
+        s += text.slice(j, j + n);
+        j += n;
+      }
+      add(s, false);
+      i = j + 1;
+      continue;
+    }
+    if (c === "`" || c === "$" && EXPANSION_START_BARE.test(text[i + 1] ?? ""))
+      expands = true;
+    if (c === "~" && (cur === null || lastBare === "=" || lastBare === ":"))
+      expands = true;
+    const param = lastBare === "$";
+    if (!param && (c === "*" || c === "?"))
+      pattern = true;
+    if (!param && c === "[")
+      bracket = true;
+    if (c === "]" && bracket)
+      pattern = true;
+    if (!param && c === "{")
+      braces++;
+    if (braces > 0 && (c === "," || c === "." && lastBare === "."))
+      braceSep = true;
+    if (c === "}" && braces > 0) {
+      if (braceSep)
+        pattern = true;
+      braces--;
+    }
     if (c === "<" || c === ">")
       operatorAt.push(cur === null ? 0 : cur.length);
     add(c, true);
