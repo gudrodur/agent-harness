@@ -5,10 +5,10 @@
 // does not claim mailbox consumption. A sender can therefore use the existing
 // kitty typing fallback to wake the seat and deliver the next prompt.
 
+import { isMainModule } from '../../lib/cli-entry.mjs';
 import { recordPresence } from '../../lib/presence.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 const readStdin = () =>
   new Promise((resolve) => {
@@ -100,7 +100,7 @@ export const bindCopilotWindow = (env = process.env, pid = process.pid, parent =
   return file;
 };
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   try {
     bindCopilotWindow();
   } catch {
