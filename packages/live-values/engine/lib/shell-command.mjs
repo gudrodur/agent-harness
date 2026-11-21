@@ -412,7 +412,7 @@ export const splitSegmentsDetailed = (command) => {
 //   substitution. Bash passes a `/dev/fd` path to a command it runs alongside, so a
 //   gate can neither read the word as a file nor know what that command writes.
 // Out of scope: history `!` expansion, word splitting of an unquoted expansion, a
-// backslash-newline joining two lines (agent-harness#57), and the words inside a
+// backslash-newline joining two lines (an issue of its own), and the words inside a
 // process substitution: they come back as plain words, and splitSegments splits at a
 // `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it were outside.
 // What may follow a `$` for the shell to expand it, in double quotes and bare.
