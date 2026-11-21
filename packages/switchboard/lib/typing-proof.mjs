@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { isMainModule } from './cli-entry.mjs';
 import { kittyList, kittyDownMessage, flattenWindows } from './kitty-ls.mjs';
 
 // Verdict kinds. `dialog` is its own kind, never folded into "busy": a seat
@@ -313,7 +313,7 @@ export const typingVerdict = (winId, opts = {}) => {
 // [--stdin] [--other-tabs] [--no-composer]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
 // 3 a dialog is open, 64 usage. The reason goes to stderr.
 const EXIT = { [PROVEN]: 0, [REFUSED]: 2, [DIALOG]: 3 };
-if (process.argv[1] != null && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
   const winId = opt('--window');
