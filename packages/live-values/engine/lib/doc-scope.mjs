@@ -359,11 +359,11 @@ export const runCommand = (run, { root, timeoutMs, failOnStderr = false, deadSta
     stdio: ["ignore", "pipe", "pipe", ...(deadStages ? ["pipe"] : [])],
   });
   if (!r.error && r.status === 0) {
-    if (failOnStderr && r.stderr.trim()) return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`) };
+    if (failOnStderr && r.stderr.trim()) return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`), raw: `${r.stdout ?? ""}\n${r.stderr ?? ""}` };
     if (deadStages) {
       const statuses = String(r.output?.[3] ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
       const dead = statuses.length ? deadStage(run, statuses) : "";
-      if (dead) return { ok: false, timedOut: false, output: clip200(dead) };
+      if (dead) return { ok: false, timedOut: false, output: clip200(dead), raw: `${r.stdout ?? ""}\n${r.stderr ?? ""}` };
     }
     return { ok: true, stdout: r.stdout };
   }
@@ -374,5 +374,8 @@ export const runCommand = (run, { root, timeoutMs, failOnStderr = false, deadSta
     ok: false,
     timedOut,
     output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : (out || "exit without output"),
+    // The command's whole output, for a caller that shows more than `output`'s 200 characters. Unredacted: the
+    // caller decides what may be shown.
+    raw: `${r.stdout ?? ""}\n${r.stderr ?? ""}`,
   };
 };
