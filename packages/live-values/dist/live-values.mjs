@@ -527,12 +527,14 @@ exit "\${__lv_ps[$((\${#__lv_ps[@]} - 1))]}"` : run;
   });
   if (!r.error && r.status === 0) {
     if (failOnStderr && r.stderr.trim())
-      return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`) };
+      return { ok: false, timedOut: false, output: clip200(`stderr: ${r.stderr}`), raw: `${r.stdout ?? ""}
+${r.stderr ?? ""}` };
     if (deadStages) {
       const statuses = String(r.output?.[3] ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
       const dead = statuses.length ? deadStage(run, statuses) : "";
       if (dead)
-        return { ok: false, timedOut: false, output: clip200(dead) };
+        return { ok: false, timedOut: false, output: clip200(dead), raw: `${r.stdout ?? ""}
+${r.stderr ?? ""}` };
     }
     return { ok: true, stdout: r.stdout };
   }
@@ -543,7 +545,9 @@ ${r.stderr ?? ""}`;
   return {
     ok: false,
     timedOut,
-    output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : out || "exit without output"
+    output: timedOut ? `timed out after ${timeoutMs} ms ${out}`.trim() : out || "exit without output",
+    raw: `${r.stdout ?? ""}
+${r.stderr ?? ""}`
   };
 };
 

@@ -82,6 +82,20 @@ test("checkQuerySegments takes a caller's allowlist", () => {
   assert.equal(checkQuerySegments(`awk 1 a.md`).word, "awk");
 });
 
+test("runCommand's failure carries the whole stdout and stderr as raw, beyond the 200-character output", () => {
+  const bad = runCommand("i=0; while [ $i -lt 100 ]; do echo line-$i; i=$((i+1)); done; echo oops >&2; exit 2", { root: "/", timeoutMs: 5000 });
+  assert.equal(bad.ok, false);
+  assert.ok(bad.output.length <= 210);
+  assert.match(bad.raw, /line-0\n/);
+  assert.match(bad.raw, /line-99\n[\s\S]*oops/);
+  const noisy = runCommand("echo out; echo warn >&2", { root: "/", timeoutMs: 5000, failOnStderr: true });
+  assert.equal(noisy.ok, false);
+  assert.match(noisy.raw, /out\n[\s\S]*warn/);
+  const dead = runCommand("echo seen; (exit 3) | true", { root: "/", timeoutMs: 5000, deadStages: true });
+  assert.equal(dead.ok, false);
+  assert.match(dead.raw, /seen/);
+});
+
 test("runCommand returns stdout, and a failure as text that is never empty", () => {
   assert.deepEqual(runCommand("printf 7", { root: "/", timeoutMs: 5000 }), { ok: true, stdout: "7" });
   const bad = runCommand("exit 3", { root: "/", timeoutMs: 5000 });
