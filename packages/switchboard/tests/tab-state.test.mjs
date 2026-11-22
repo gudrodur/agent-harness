@@ -17,6 +17,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { fileURLToPath } from 'node:url';
+import * as BG from './fixtures/claude-background-screens.mjs';
 const run = promisify(execFile);
 const SCRIPT = fileURLToPath(new URL('../bin/tab-state.sh', import.meta.url));
 const WID = '991001';
@@ -53,6 +54,8 @@ before(async () => {
     `  printf '[{"tabs":[{"title":"mock","windows":[{"id":${WID},"title":"mock","pid":%s,"cwd":${JSON.stringify(WCWD)},"created_at":%s,"foreground_processes":%s}]}]}]\\n' "$pid" "$created" "$fg"`,
     '  exit 0',
     'fi',
+    '# the screen a test wrote, else an empty one',
+    'if [ "$2" = get-text ]; then [ -f "$state/screen" ] && cat "$state/screen"; exit 0; fi',
     'exit 0',
     '',
   ].join('\n');
@@ -67,7 +70,7 @@ after(async () => {
 
 const clearLinks = async () => {
   for (const f of await fs.readdir(sessDir)) {
-    if (f === 'no-window' || f === 'claude-pid' || f === 'down' || f === 'ls-calls') await fs.rm(path.join(sessDir, f), { force: true });
+    if (f === 'no-window' || f === 'claude-pid' || f === 'down' || f === 'ls-calls' || f === 'screen') await fs.rm(path.join(sessDir, f), { force: true });
   }
 };
 
@@ -295,6 +298,26 @@ test('a claude window with status busy reports busy from the sessions file', asy
   assert.match(r.out, /age=[5-9]s/);
   assert.match(r.out, /lines=3/);
   assert.ok(r.out.includes(`session=${claudeTranscript()}`), r.out);
+});
+
+// A busy record also covers a finished turn with only background agents at
+// work, the seat waiting at its prompt; the screen tells the two apart.
+test('a claude window with status busy at its prompt with only background agents reports idle', async () => {
+  await setupClaude({ status: 'busy' });
+  await fs.writeFile(path.join(sessDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  const r = await runScript([WID]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /state=idle .*reason=claude-background/);
+});
+
+test('a claude window with status busy in its own turn, background agents or not, reports busy', async () => {
+  for (const screen of [BG.OWN_TURN_WITH_BACKGROUND, BG.QUESTION_WITH_BACKGROUND]) {
+    await setupClaude({ status: 'busy' });
+    await fs.writeFile(path.join(sessDir, 'screen'), screen);
+    const r = await runScript([WID]);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /state=busy/, screen);
+  }
 });
 
 test('a claude window with status idle reports idle', async () => {

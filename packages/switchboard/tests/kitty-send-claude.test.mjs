@@ -21,6 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { fileURLToPath } from 'node:url';
+import * as BG from './fixtures/claude-background-screens.mjs';
 
 const run = promisify(execFile);
 const SCRIPT = fileURLToPath(new URL('../bin/kitty-send.sh', import.meta.url));
@@ -212,6 +213,39 @@ test('a Claude tab whose session status is shell is sendable even with a spinner
   assert.equal(r.code, 0, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), ['text']);
 });
+
+// `busy` also covers a finished turn while background agents still work: the
+// seat waits at an empty prompt (fixtures/claude-background-screens.mjs). Its
+// screen says so, and that seat is sendable; its own turn is not, and a dialog
+// raised meanwhile is refused in every mode.
+for (const flags of [[], ['--wait-idle', '4']]) {
+  const how = flags[0] ?? 'no mode flag';
+  test(`(a) a busy-record Claude tab at its prompt with only background agents is sent to with ${how}`, async () => {
+    await reset('burst', 'busy');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '8', ...flags]);
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), ['text']);
+  });
+  test(`(b) a busy-record Claude tab in its own turn with background agents is not sent to with ${how}`, async () => {
+    await reset('burst', 'busy');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.OWN_TURN_WITH_BACKGROUND);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...flags.map((f) => (f === '4' ? '2' : f))]);
+    assert.notEqual(r.code, 0, `${r.out}${r.err}`);
+    if (flags.length === 0) assert.equal(r.code, 7, `${r.out}${r.err}`);
+    else assert.match(r.err, /still busy/);
+    assert.deepEqual(await calls(), []);
+  });
+}
+for (const flags of [[], ['--now'], ['--wait-idle', '2']]) {
+  test(`(c) a Claude tab showing a question while background agents run is refused with ${flags.join(' ') || 'no mode flag'}, nothing sent`, async () => {
+    await reset('burst', 'waiting');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.QUESTION_WITH_BACKGROUND);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...flags]);
+    assert.notEqual(r.code, 0, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), []);
+  });
+}
 
 test('a busy Claude tab parked by --idle-when remains pending, not falsely delivered', async () => {
   await reset('never', 'busy');

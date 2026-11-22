@@ -141,7 +141,9 @@ report_state() {
 # (lib/claude-session.sh finds <pid>.json from the ls table window_info
 # already fetched). Returns 1 having touched nothing when the window is not a
 # Claude Code tab. Otherwise
-# returns 0 with STATE/REASON set: busy|idle from the record's status, unknown
+# returns 0 with STATE/REASON set: busy|idle from the record's status (a busy
+# record over a finished turn with only background work is idle,
+# reason=claude-background), unknown
 # reason=claude-status-<value> for any other status, and unknown
 # reason=session-older-than-window when the record's startedAt predates the
 # window (a pid reused by an older claude). SESSION is the transcript path, LINES its line count (0
@@ -168,7 +170,10 @@ read_claude_state() {
   if [ "$updated" -gt 0 ]; then AGE_S=$(( now - updated / 1000 )); [ "$AGE_S" -lt 0 ] && AGE_S=0; fi
   st=$(printf '%s' "$cj" | jq -r '.status // ""' 2>/dev/null)
   case "$st" in
-    busy|idle) STATE="$st" ;;
+    # busy also covers a finished turn with only background agents at work, the
+    # seat waiting at its prompt: read from its screen (lib/claude-session.sh).
+    busy) if [ "$(claude_busy_seat_state "$WID")" = idle ]; then STATE=idle; REASON="claude-background"; else STATE=busy; fi ;;
+    idle) STATE="$st" ;;
     *) STATE=unknown; REASON="claude-status-${st:-none}" ;;
   esac
   return 0

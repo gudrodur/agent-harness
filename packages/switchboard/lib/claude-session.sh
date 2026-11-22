@@ -2,7 +2,7 @@
 # Sourced by bin/kitty-send.sh and bin/tab-state.sh; defines functions only.
 #
 # The `claude` process writes <config>/sessions/<pid>.json (sessionId, cwd,
-# startedAt and statusUpdatedAt in epoch ms, status busy|idle|waiting|blocked) and every turn
+# startedAt and statusUpdatedAt in epoch ms, status busy|idle|shell|waiting|blocked) and every turn
 # to <config>/projects/<cwd with every character outside [A-Za-z0-9-] as
 # '-'>/<sessionId>.jsonl.
 #
@@ -28,6 +28,21 @@ claude_session_json() { # $1 = window id, $2 = optional kitty @ ls JSON
   jq -e '.sessionId and .cwd' "$f" >/dev/null 2>&1 || return 1
   cat "$f"
 }
+_CLAUDE_SESSION_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A `busy` record covers two states: the seat's own turn, and a finished turn
+# while background agents still work, in which the seat waits at its prompt.
+# The one reading that tells them apart is lib/typing-proof.mjs's
+# claudeSeatState (it reads the screen); this asks it and prints idle, busy or
+# dialog. It fails closed: no node, a failed run or any other answer is busy.
+# kitty is the `kitty` on PATH, as for every window read here (lib/kitty-ls.sh).
+claude_busy_seat_state() { # $1 = window id
+  local out=""
+  if command -v node >/dev/null 2>&1 && [ -f "$_CLAUDE_SESSION_LIB/typing-proof.mjs" ]; then
+    out=$(AGENT_MAILBOX_KITTY=kitty KITTY_SEND_CLAUDE_SESSIONS_DIR="$CLAUDE_SESSIONS_DIR" \
+      node "$_CLAUDE_SESSION_LIB/typing-proof.mjs" --window "$1" --mode seat 2>/dev/null </dev/null) || out=""
+  fi
+  case "$out" in idle|dialog) printf '%s' "$out" ;; *) printf 'busy' ;; esac
+}
 claude_state_of() { # $1 = window id, $2 = optional kitty @ ls JSON; busy|idle|unknown
   local j
   j=$(claude_session_json "$1" "${2:-}") || { printf 'unknown'; return 0; }
@@ -35,7 +50,10 @@ claude_state_of() { # $1 = window id, $2 = optional kitty @ ls JSON; busy|idle|u
     # waiting (a permission prompt, a question, a plan approval) and blocked
     # are not at the prompt: a caller must not read them as idle. `shell` is a
     # finished turn with a background shell still running: at the prompt.
-    busy|waiting|blocked) printf 'busy' ;; idle|shell) printf 'idle' ;; *) printf 'unknown' ;;
+    # busy is idle only when the screen shows a finished turn with background
+    # work alone (claude_busy_seat_state); a dialog stays busy here.
+    busy) if [ "$(claude_busy_seat_state "$1")" = idle ]; then printf 'idle'; else printf 'busy'; fi ;;
+    waiting|blocked) printf 'busy' ;; idle|shell) printf 'idle' ;; *) printf 'unknown' ;;
   esac
 }
 claude_transcript_of() { # $1 = session json

@@ -22,6 +22,7 @@ import path from 'node:path';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import * as BG from './fixtures/claude-background-screens.mjs';
 import {
   ack,
   appendMessage,
@@ -1960,6 +1961,79 @@ for (const args of [['--now'], ['--stop'], []]) {
     assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one queued row');
     assert.match(stderr, /next tool call/);
     assert.doesNotMatch(stderr, /next prompt/);
+  });
+}
+
+// Claude Code records `busy` also after its turn has ended while background
+// agents still work; the seat then waits at an empty prompt and answers a typed
+// message at once. Queued rows to such a seat sat undelivered for up to two
+// hours. The screen tells that state from its own turn
+// (fixtures/claude-background-screens.mjs); a dialog stays held.
+for (const args of [['--now'], []]) {
+  test(`(a) ${args[0] ?? 'a bare send'} to a seat at its prompt with only background agents (record busy) is typed`, async () => {
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', ...args], {
+      title: 'my renamed seat', status: 'busy', screen: BG.BACKGROUND_AT_PROMPT,
+      envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+    });
+    assert.equal(killed, false, stderr);
+    assert.ok(argv, `kitty-send ran: ${stderr}`);
+    assert.equal(code, 0, stderr);
+  });
+}
+
+test('(a) --queue to a seat at its prompt with only background agents (record busy) is typed in and exits 0', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: 'my renamed seat', status: 'busy', screen: BG.BACKGROUND_AT_PROMPT_TITLED,
+  });
+  assert.equal(killed, false, `the row was never delivered to a seat waiting at its prompt: ${stderr}`);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  assert.equal(typedRows().length, 1);
+});
+
+test('(a) a row queued during its own turn is typed once the turn ends and only background agents run', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: 'my renamed seat', status: 'busy', screen: BG.OWN_TURN_WITH_BACKGROUND,
+    envExtra: { AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' },
+    whileRunning: async () => {
+      await sleep(2500);
+      assert.equal(fs.existsSync(fallbackArgv), false, 'nothing typed while its own turn ran');
+      fs.writeFileSync(path.join(binDir, 'queue-screen'), BG.BACKGROUND_AT_PROMPT);
+    },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
+  assert.equal(typedRows().length, 1);
+});
+
+const heldOn = async (args, opts) => {
+  const { killed, stderr, argv } = await queueSend(['--to', '991001', ...args], {
+    title: 'my renamed seat', killAfterMs: 5000,
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' },
+    ...opts,
+  });
+  assert.equal(argv, null, `kitty-send ran, so text was typed: ${argv}`);
+  assert.equal(typedRows().length, 0);
+  return { killed, stderr };
+};
+
+for (const args of [['--queue'], ['--now'], []]) {
+  test(`(b) ${args[0] ?? 'a bare send'} to a seat in its own turn with background agents (record busy) types nothing`, async () => {
+    await heldOn(args, { status: 'busy', screen: BG.OWN_TURN_WITH_BACKGROUND });
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
+  });
+}
+// --now and a bare send leave the dialog question to kitty-send's typing proof,
+// the last read before a keystroke (tests/kitty-send-claude.test.mjs covers it
+// for this screen); the queue wait answers it here.
+for (const status of ['waiting', 'busy']) {
+  test(`(c) --queue to a seat showing a question while background agents run (record ${status}) types nothing`, async () => {
+    const { stderr } = await heldOn(['--queue'], { status, screen: BG.QUESTION_WITH_BACKGROUND, envExtra: { AGENT_SEND_VERBOSE: '1', AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' } });
+    // A busy record with a dialog drawn is not idle, so the wait never gets as far as the proof.
+    if (status === 'waiting') assert.match(stderr, /status waiting/);
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
   });
 }
 

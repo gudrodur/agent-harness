@@ -28,9 +28,11 @@ export const DIALOG = 'dialog';
 // seat's own drain.
 //   - a Claude Code tab only: the composer of any other kind of tab cannot be
 //     read reliably from its screen, so those are never typed into;
-//   - the session record status must be on the idle whitelist (`idle`, `shell`;
-//     `waiting` is a permission prompt or question and `blocked` a stuck turn,
-//     both the DIALOG kind; an unknown or missing status proves nothing);
+//   - the session record must read idle through claudeSeatState: status `idle`
+//     or `shell`, or `busy` over a screen showing the turn has ended and only
+//     background work runs (`waiting` is a permission prompt or question and
+//     `blocked` a stuck turn, both the DIALOG kind; an unknown or missing status
+//     proves nothing);
 //   - the screen must be readable and carry no dialog footer;
 //   - the composer box, found by its top and bottom rule, must be empty of
 //     everything but faint text (a prompt suggestion or a hint drawn faint is
@@ -79,19 +81,21 @@ const sessionRecordOf = (proc) => {
 // The busy decision for a window (`kitty @ ls` record), following the order of
 // kitty-send.sh's target_busy for the two signals it shares with it (it also
 // reads the tab-state script and the --idle-when screen proof, which this does
-// not): Claude Code's session record first (busy is
-// busy, idle and shell are idle), the title spinner only when there is no
+// not): Claude Code's session record first, read through claudeSeatState (idle
+// and shell are idle; busy is busy unless the screen shows the turn has ended
+// and only background work runs), the title spinner only when there is no
 // usable record. The title alone is not enough: a renamed Claude Code seat
 // never shows a spinner while it works. A seat waiting on a dialog (record
 // status waiting or blocked) is not "working" here: that is the DIALOG verdict,
 // which refuses typing in every mode and carries its own reason.
 // No staleness bound: a record that says busy is busy however old its
 // statusUpdatedAt is, so a crashed seat's stale record keeps its window busy
-// (the row then waits for its drain) until the record changes.
+// (the row then waits for its drain) until the record changes. The screen is
+// read only for a busy record, so idle windows cost no extra read.
 export const windowIsBusy = (win) => {
   const proc = claudeProcOf(win);
   const status = proc != null ? sessionRecordOf(proc)?.status : null;
-  if (status === 'busy') return true;
+  if (status === 'busy') return claudeSeatState({ status, title: win.title, lines: () => readScreen(win.id) }).state !== 'idle';
   if (QUEUE_IDLE_STATUSES.has(status) || DIALOG_STATUSES.has(status)) return false;
   return titleShowsBusy(win.title);
 };
@@ -203,12 +207,17 @@ const solidText = (line, from = 0) => {
 // `{ chip }` whether a paste or image chip sits in it, `{ error }` says why the
 // box could not be found or read. Shared by the typing proof and by `--mode
 // composer`, so the two never read a composer differently.
-const composerBox = (lines) => {
-  const text = lines.map((l) => l.text);
+const composerBounds = (text) => {
   const bottom = text.findLastIndex((l) => RULE_RE.test(l));
   if (bottom < 0) return { error: 'no composer box on the screen (no closing rule)' };
   const at = text.slice(0, bottom).findLastIndex((l) => PROMPT_RE.test(l));
   if (at < 1 || !TOP_RULE_RE.test(text[at - 1])) return { error: 'no composer box on the screen (no prompt line under a top rule)' };
+  return { top: at - 1, at, bottom };
+};
+const composerBox = (lines) => {
+  const bounds = composerBounds(lines.map((l) => l.text));
+  if (bounds.error != null) return bounds;
+  const { at, bottom } = bounds;
   if (lines.slice(at - 1, bottom + 1).some((l) => l.faint == null)) return { error: 'composer could not be read (an escape sequence the proof does not parse)' };
   const box = lines.slice(at, bottom);
   // The prompt mark (`❯` or `>`, one UTF-16 unit) is skipped by position.
@@ -235,6 +244,75 @@ const readScreen = (winId) => {
   } catch { return null; }
 };
 const dialogOnScreen = (lines) => lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l.text));
+
+// ---- a busy record: its own turn, or only background work ---------------------
+//
+// Claude Code records `busy` in two states: while its own turn runs, and after
+// its turn has ended while background agents still work. In the second the seat
+// waits at an empty prompt, and a message typed there is answered at once while
+// the agents run on (checked on a live seat). Read as a turn in progress, it
+// kept queued mail from a waiting seat for hours. The screen tells them apart,
+// and the reading fails closed: anything it does not recognise is busy.
+//   - own turn: the footer under the composer carries "esc to interrupt", or a
+//     spinner line ("✻ Gitifying… (8s · ↓ 98 tokens)") stands just above the
+//     composer, or the title spins;
+//   - only background work: none of those, and the footer lists
+//     "N background tasks" or the screen says "Waiting for N background agents";
+//   - a footer cut off at the window edge before the place "esc to interrupt"
+//     takes cannot be told apart: busy.
+const INTERRUPT_RE = /esc to interrupt/;
+// A spinner glyph, a space, one word ending in "…": the progress line of a turn.
+const SPINNER_LINE_RE = /^\S \S[^\s…]*…(\s|$)/u;
+const SPINNER_SCAN = 3;
+const BACKGROUND_FOOTER_RE = /\b\d+ background tasks?\b/;
+const BACKGROUND_WAIT_RE = /\bWaiting for \d+ background agents? to finish\b/;
+
+// Why a busy record over this screen is (or is not) only background work: null
+// when the screen shows the turn has ended and only background work runs, else
+// the reason it stays busy.
+const busyScreenReason = (lines, title) => {
+  if (titleShowsBusy(title)) return 'the title shows a turn in progress';
+  const text = lines.map((l) => l.text);
+  const bounds = composerBounds(text);
+  if (bounds.error != null) return bounds.error;
+  const footer = text.slice(bounds.bottom + 1);
+  if (footer.some((l) => INTERRUPT_RE.test(l))) return 'the footer says esc to interrupt: its own turn runs';
+  const above = text.slice(0, bounds.top).filter((l) => l.trim() !== '').slice(-SPINNER_SCAN);
+  if (above.some((l) => SPINNER_LINE_RE.test(l.trim()))) return 'a spinner line stands above the composer: its own turn runs';
+  const first = footer[0] ?? '';
+  if (first.trimEnd().endsWith('…') && !first.includes('←')) return 'the footer is cut off before it could say esc to interrupt';
+  if (BACKGROUND_FOOTER_RE.test(first) || above.some((l) => BACKGROUND_WAIT_RE.test(l))) return null;
+  return 'no background work is listed, so the turn may still run';
+};
+
+// The ONE reading of a Claude Code seat from its record status and screen:
+// `{ state, reason }`, state `idle` (at its prompt), `busy` (a turn runs, or it
+// could not tell), `dialog` (a permission prompt, question or stuck turn) or
+// null for a status this does not know. `lines` is the parsed screen, or a
+// function returning it, so the screen is read only for a busy record.
+export const claudeSeatState = ({ status, title = '', lines }) => {
+  if (QUEUE_IDLE_STATUSES.has(status)) return { state: 'idle', reason: null };
+  if (DIALOG_STATUSES.has(status)) return { state: 'dialog', reason: `session record status ${status}: a permission prompt, question or stuck turn is waiting on the human` };
+  if (status !== 'busy') return { state: null, reason: `session record status ${status ?? 'missing'}` };
+  const screen = typeof lines === 'function' ? lines() : lines;
+  if (screen == null) return { state: 'busy', reason: 'screen could not be read' };
+  if (dialogOnScreen(screen)) return { state: 'dialog', reason: 'a dialog is open on the screen' };
+  const why = busyScreenReason(screen, title);
+  return why == null ? { state: 'idle', reason: 'its turn has ended; only background work runs' } : { state: 'busy', reason: why };
+};
+
+// The seat reading of a window for the shell callers: idle, busy, dialog or
+// unknown (not a Claude Code tab, no record, a status this does not know, or
+// the window list could not be read).
+export const seatStateOf = (winId) => {
+  const ls = kittyList({ match: `id:${winId}`, fresh: true });
+  if (!ls.ok) return 'unknown';
+  const win = flattenWindows(ls.data).find((w) => w.id === Number(winId));
+  const proc = win != null ? claudeProcOf(win) : null;
+  const record = proc != null ? sessionRecordOf(proc) : null;
+  if (record == null) return 'unknown';
+  return claudeSeatState({ status: record.status, title: win.title, lines: () => readScreen(winId) }).state ?? 'unknown';
+};
 
 // Does the composer still hold `text` (whitespace ignored)? true / false, or
 // null when the box cannot be found, a dialog is open or the screen cannot be read: "could not
@@ -286,7 +364,9 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   if (titleShowsBusy(win.title)) return verdict(REFUSED, 'title shows a turn in progress');
   if (proc == null) return verdict(REFUSED, 'not a Claude Code tab, whose composer cannot be read reliably');
   if (record == null) return verdict(REFUSED, 'no session record');
-  if (!QUEUE_IDLE_STATUSES.has(record.status)) return verdict(REFUSED, `session record status ${record.status ?? 'missing'}, not idle`);
+  const seatNow = claudeSeatState({ status: record.status, title: win.title, lines });
+  if (seatNow.state === 'dialog') return verdict(DIALOG, seatNow.reason);
+  if (seatNow.state !== 'idle') return verdict(REFUSED, `session record status ${record.status ?? 'missing'}, not idle${seatNow.state === 'busy' ? `: ${seatNow.reason}` : ''}`);
 
   // The composer box is found by BOTH rules, not by the first rule after the
   // prompt: a draft line of box-drawing characters is itself rule-shaped, and
@@ -312,6 +392,8 @@ export const typingVerdict = (winId, opts = {}) => {
 // CLI, run by bin/kitty-send.sh: `typing-proof.mjs --window N --mode idle|dialog
 // [--stdin] [--other-tabs] [--no-composer]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
 // 3 a dialog is open, 64 usage. The reason goes to stderr.
+// `--mode seat` (lib/claude-session.sh, bin/tab-state.sh) prints the seat
+// reading, idle|busy|dialog|unknown, and exits 0.
 const EXIT = { [PROVEN]: 0, [REFUSED]: 2, [DIALOG]: 3 };
 if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
@@ -323,8 +405,12 @@ if (isMainModule(import.meta.url)) {
     const held = composerHolds(winId, fs.readFileSync(0, 'utf-8'));
     process.exit(held === null ? 3 : held ? 2 : 0);
   }
+  if (mode === 'seat' && /^\d+$/.test(winId ?? '')) {
+    process.stdout.write(`${seatStateOf(winId)}\n`);
+    process.exit(0);
+  }
   if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog'].includes(mode)) {
-    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|composer [--stdin] [--other-tabs] [--no-composer]\n');
+    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|composer|seat [--stdin] [--other-tabs] [--no-composer]\n');
     process.exit(64);
   }
   const text = argv.includes('--stdin') ? fs.readFileSync(0, 'utf-8') : null;

@@ -16,7 +16,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { proofVerdict, typingVerdict, PROVEN, REFUSED, DIALOG } from '../lib/typing-proof.mjs';
+import { proofVerdict, typingVerdict, windowIsBusy, claudeSeatState, PROVEN, REFUSED, DIALOG } from '../lib/typing-proof.mjs';
+import * as BG from './fixtures/claude-background-screens.mjs';
 
 const CLI = fileURLToPath(new URL('../lib/typing-proof.mjs', import.meta.url));
 const WIN = 991007;
@@ -386,4 +387,94 @@ test('--mode composer reads the box with the same parser: a faint suggestion is 
 test('--mode composer: 3 (could not tell) with no box on the screen, and with a dialog open', () => {
   assert.equal(composerCli('just text'), 3);
   assert.equal(composerCli([boxWith('❯ /rename x'), 'Enter to select · Esc to cancel'].join('\n')), 3);
+});
+
+// ---- a busy record: its own turn, or only background work -----------------------
+//
+// Claude Code records `busy` while its own turn runs AND while its turn has
+// ended and only background agents still work. The second is a seat waiting at
+// its prompt: queued mail to it sat undelivered for up to two hours, because
+// every reader took the record's `busy` as a turn in progress. The screen tells
+// the two apart (fixtures/claude-background-screens.mjs).
+
+const winRecord = (title = 'example renamed seat') => ({ id: WIN, title, foreground_processes: [{ pid: PID, cmdline: ['claude'] }] });
+const busyOn = (screen, title = 'example renamed seat') => { seat({ title, status: 'busy', screen }); return windowIsBusy(winRecord(title)); };
+
+test('(a) a busy record over an idle prompt with background agents is idle and proven', () => {
+  for (const screen of [BG.BACKGROUND_AT_PROMPT, BG.BACKGROUND_AT_PROMPT_TITLED]) {
+    assert.equal(busyOn(screen), false, screen);
+    const v = proofVerdict(WIN);
+    assert.equal(v.kind, PROVEN, JSON.stringify(v));
+  }
+});
+
+test('(b) a spinner in the title keeps a background-looking screen busy', () => {
+  // A seat that was never renamed shows Claude Code's own title, which spins
+  // only while its turn runs (a live seat at its prompt with background agents
+  // showed none): the spinner wins over the screen.
+  assert.equal(busyOn(BG.BACKGROUND_AT_PROMPT, '◐ claude: seat'), true);
+  assert.equal(proofVerdict(WIN).kind, REFUSED);
+});
+
+test('(b) a busy record with its own turn running stays busy and refused', () => {
+  for (const screen of [BG.OWN_TURN_WITH_BACKGROUND, BG.OWN_TURN_FOOTER_CUT]) {
+    assert.equal(busyOn(screen), true, screen);
+    const v = proofVerdict(WIN);
+    assert.equal(v.kind, REFUSED, JSON.stringify(v));
+    assert.match(v.reason, /^session record status busy/);
+  }
+});
+
+test('(b) a busy record the screen cannot settle stays busy: cut footer, no background listed, no composer, unreadable', () => {
+  for (const [name, screen] of [
+    ['footer cut before the esc slot', BG.FOOTER_CUT_NO_SPINNER],
+    ['no background work listed', BG.BUSY_NO_BACKGROUND],
+    ['no composer box', '● Working\n  ⏵⏵ bypass permissions on · 2 background tasks'],
+    ['unreadable screen', null],
+  ]) {
+    assert.equal(busyOn(screen), true, name);
+    assert.notEqual(proofVerdict(WIN).kind, PROVEN, name);
+  }
+});
+
+test('(b) an empty composer with a draft refuses even when only background work runs', () => {
+  const screen = BG.BACKGROUND_AT_PROMPT.replace('❯ \n', '❯ half a thought\n');
+  assert.equal(busyOn(screen), false, 'the seat is at its prompt');
+  assert.match(proofVerdict(WIN).reason, /composer holds text/);
+});
+
+test('(c) a question raised while background agents run is a DIALOG in every mode', () => {
+  for (const status of ['waiting', 'busy']) {
+    seat({ title: 'example renamed seat', status, screen: BG.QUESTION_WITH_BACKGROUND });
+    assert.equal(proofVerdict(WIN).kind, DIALOG, status);
+    assert.equal(proofVerdict(WIN, { mode: 'dialog' }).kind, DIALOG, status);
+  }
+  // A busy record with a dialog drawn is never idle for the busy readers either.
+  assert.equal(busyOn(BG.QUESTION_WITH_BACKGROUND), true);
+});
+
+test('(c) a dialog drawn under a screen that otherwise reads idle-with-background is a dialog, not idle', () => {
+  const screen = `${BG.BACKGROUND_AT_PROMPT}\n  Enter to select · ↑/↓ to navigate · Esc to cancel`;
+  assert.equal(busyOn(screen), true);
+  assert.equal(claudeSeatState({ status: 'busy', title: 'example renamed seat', lines: screen.split('\n').map((text) => ({ text, faint: [] })) }).state, 'dialog');
+  assert.equal(proofVerdict(WIN).kind, DIALOG);
+  assert.equal(proofVerdict(WIN, { mode: 'dialog' }).kind, DIALOG);
+});
+
+// --mode seat: the one reading for the shell callers (tab-state.sh, claude-session.sh).
+const seatCli = (opts) => {
+  seat({ title: 'example renamed seat', ...opts });
+  const r = spawnSync(process.execPath, [CLI, '--window', String(WIN), '--mode', 'seat'], { encoding: 'utf-8', env: process.env });
+  return { code: r.status, out: r.stdout.trim() };
+};
+
+test('--mode seat prints idle, busy, dialog or unknown for the record and screen', () => {
+  assert.deepEqual(seatCli({ status: 'busy', screen: BG.BACKGROUND_AT_PROMPT }), { code: 0, out: 'idle' });
+  assert.deepEqual(seatCli({ status: 'busy', screen: BG.OWN_TURN_WITH_BACKGROUND }), { code: 0, out: 'busy' });
+  assert.deepEqual(seatCli({ status: 'busy', screen: null }), { code: 0, out: 'busy' });
+  assert.deepEqual(seatCli({ status: 'waiting', screen: BG.QUESTION_WITH_BACKGROUND }), { code: 0, out: 'dialog' });
+  assert.deepEqual(seatCli({ status: 'busy', screen: BG.QUESTION_WITH_BACKGROUND }), { code: 0, out: 'dialog' });
+  assert.deepEqual(seatCli({ status: 'idle' }), { code: 0, out: 'idle' });
+  assert.deepEqual(seatCli({ status: 'shell' }), { code: 0, out: 'idle' });
+  assert.deepEqual(seatCli({ status: null }), { code: 0, out: 'unknown' });
 });
