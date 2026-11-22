@@ -253,6 +253,130 @@ for (const flags of [[], ['--now'], ['--wait-idle', '2']]) {
   });
 }
 
+// ---- a command that ends the conversation never reaches a seat with background work ----
+// /exit and /quit would end that work, /clear and /new (and their alias /reset)
+// wipe the conversation waiting on it. Exit 23, as --retire and --close give.
+const QUEUE_LOG = () => path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
+const queueLog = () => fs.readFile(QUEUE_LOG(), 'utf8').catch(() => '');
+const waiterEnded = async () => {
+  for (let i = 0; i < 100; i += 1) {
+    if (/queued waiter exit rc=/.test(await queueLog())) return;
+    await new Promise((res) => setTimeout(res, 100));
+  }
+};
+const FAST_POLL = { KITTY_SEND_POLL_MS: '100', KITTY_SEND_POLL_CAP_MS: '100' };
+const sendText = async (text, flags, env = {}) => {
+  await fs.rm(QUEUE_LOG(), { force: true });
+  const r = await runScript(['--to', WID, '--text', text, '--timeout', '2', ...flags], { ...FAST_POLL, ...env });
+  if (flags.includes('--queue') && r.code === 0) await waiterEnded();
+  return r;
+};
+const onBackground = async (status = 'busy', screen = BG.BACKGROUND_AT_PROMPT) => {
+  await reset('burst', status);
+  await fs.writeFile(path.join(stateDir, 'screen'), screen);
+  await fs.writeFile(path.join(stateDir, 'after_text'), BG.BACKGROUND_AT_PROMPT_TITLED); // a screen change proves a slash send
+};
+const refused23 = async (r) => {
+  assert.deepEqual(await calls(), [], `${r.out}${r.err}`);
+  assert.equal(r.code, 23, `${r.out}${r.err}`);
+  assert.match(r.err, /background/);
+};
+const SEND_PATHS = [['bare', []], ['--queue', ['--queue', '--deadline', '4']], ['--queue with no bound', ['--queue']], ['--now', ['--now']], ['--wait-idle', ['--wait-idle', '4']], ['--idle-when', ['--idle-when', 'bypass permissions']]];
+
+for (const command of ['/exit', '/quit', '/clear', '/new']) {
+  for (const [how, flags] of SEND_PATHS) {
+    test(`(d) ${command} (${how}) to a seat idle only by background work exits 23, nothing typed`, async () => {
+      await onBackground();
+      await refused23(await sendText(command, flags));
+    });
+  }
+}
+for (const text of [
+  '/exit now', '/quit please', '/clear my notes', '/new topic', '  /exit  ', '\t/clear\t', ' /quit ', '/Exit', '/reset',
+  'exit', 'quit', ':q', ':q!', ':wq', ':wq!', ' exit ', // Claude Code runs these bare words as /exit
+]) {
+  test(`(d) ${JSON.stringify(text)} to a seat idle only by background work exits 23, nothing typed`, async () => {
+    await onBackground();
+    await refused23(await sendText(text, []));
+  });
+}
+for (const [how, flags] of SEND_PATHS) {
+  test(`(d) /exit (${how}) to a seat whose background shell runs (status shell) exits 23, nothing typed`, async () => {
+    await reset('burst', 'shell');
+    await refused23(await sendText('/exit', flags));
+  });
+}
+test('(d) --expect does not get /exit past the refusal', async () => {
+  await onBackground();
+  await refused23(await sendText('/exit', ['--expect', 'Bye']));
+});
+test('(d) --now /exit into its own turn with background work exits 23: the steering queue would run it later', async () => {
+  await onBackground('busy', BG.OWN_TURN_WITH_BACKGROUND);
+  await refused23(await sendText('/exit', ['--now']));
+});
+test('(d) a bounded --queue waiter does not fire /exit into a seat that became idle by background work', async () => {
+  await onBackground('busy', BG.OWN_TURN_WITH_BACKGROUND);
+  await fs.rm(QUEUE_LOG(), { force: true });
+  const r = await runScript(['--to', WID, '--text', '/exit', '--timeout', '2', '--queue', '--deadline', '8'], FAST_POLL);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await waiterEnded();
+  assert.deepEqual(await calls(), [], await queueLog());
+  assert.match(await queueLog(), /queued waiter exit rc=23/);
+});
+test('(d) an unbounded --queue waiter holds /exit through background work and sends it once truly idle', async () => {
+  await onBackground('busy', BG.OWN_TURN_WITH_BACKGROUND);
+  await fs.rm(QUEUE_LOG(), { force: true });
+  const r = await runScript(['--to', WID, '--text', '/exit', '--timeout', '2', '--queue'], FAST_POLL);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await new Promise((res) => setTimeout(res, 3000));
+  const early = await calls();
+  const running = !/queued waiter exit rc=/.test(await queueLog());
+  await fs.writeFile(path.join(claudeDir, 'sessions', `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: SID, cwd: CWD, status: 'idle' }));
+  await fs.rm(path.join(stateDir, 'screen'));
+  await waiterEnded();
+  assert.deepEqual(early, [], 'nothing typed while only background work ran');
+  assert.ok(running, 'the waiter held the command rather than dropping it');
+  assert.deepEqual(await calls(), ['burst'], await queueLog());
+});
+// Controls: everything else keeps the delivery.
+for (const text of [MSG, '/rename x']) {
+  for (const [how, flags] of SEND_PATHS) {
+    test(`(d) control: ${JSON.stringify(text.slice(0, 20))} (${how}) still reaches a seat idle only by background work`, async () => {
+      await onBackground();
+      const r = await sendText(text, flags);
+      assert.equal(r.code, 0, `${r.out}${r.err}`);
+      assert.ok((await calls()).length > 0, `${r.err}${await queueLog()}`);
+    });
+  }
+}
+for (const text of ['/newer', '/clear-cache', '/exit-plan', 'exit the loop when the tests pass', 'please run /exit later']) {
+  test(`(d) control: ${JSON.stringify(text)} is no ending command and is delivered`, async () => {
+    await onBackground();
+    const r = await sendText(text, []);
+    assert.notEqual(r.code, 23, `${r.out}${r.err}`);
+    assert.ok((await calls()).length > 0, r.err);
+  });
+}
+for (const [how, flags] of SEND_PATHS) {
+  test(`(d) control: /exit (${how}) still works on a truly idle seat`, async () => {
+    await reset('burst');
+    await fs.writeFile(path.join(stateDir, 'screen_dyn'), '');
+    await fs.writeFile(path.join(stateDir, 'rule'), '─'.repeat(60));
+    const r = await sendText('/exit', flags);
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), ['burst'], await queueLog());
+  });
+}
+test('(d) control: --now /exit into its own turn with no background work is sent, as before', async () => {
+  const rule = '─'.repeat(60);
+  await onBackground('busy', ['✢ Working… (8s)', '', rule, BG.EMPTY_PROMPT, rule, '  esc to interrupt'].join('\n'));
+  const r = await sendText('/exit', ['--now']);
+  assert.notEqual(r.code, 23, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst'], r.err);
+});
+
 // ---- a compacting, mid-turn or drafted seat is never read as at its prompt ----
 for (const flags of [[], ['--wait-idle', '2']]) {
   const how = flags[0] ?? 'no mode flag';

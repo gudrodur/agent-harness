@@ -2008,6 +2008,89 @@ test('(a) a row queued during its own turn is typed once the turn ends and only 
   assert.equal(typedRows().length, 1);
 });
 
+// A command that ends or wipes the conversation is refused (exit 23, as --retire
+// and --close give) where the seat is idle only because background work runs.
+const withoutConsumer = async (fn) => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]);
+    return await fn();
+  } finally { fs.writeFileSync(presFile, saved); }
+};
+const SEAT_KINDS = [['with a mailbox', (fn) => fn()], ['with no mailbox consumer', withoutConsumer]];
+const endingSend = (args, text, opts = {}) => queueSend(['--to', '991001', ...args], {
+  title: 'my renamed seat', status: 'busy', screen: BG.BACKGROUND_AT_PROMPT, killAfterMs: 6000, text,
+  envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' },
+  ...opts,
+});
+for (const [kind, within] of SEAT_KINDS) {
+  for (const command of ['/exit', '/quit', '/clear', '/new']) {
+    for (const args of [[], ['--now'], ['--stop'], ['--queue']]) {
+      test(`(d) ${command} (${args[0] ?? 'bare'}) to a seat ${kind}, idle only by background work, exits 23`, () => within(async () => {
+        const { code, stderr, argv } = await endingSend(args, command);
+        assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+        assert.equal(code, 23, stderr);
+        assert.match(stderr, /background/);
+        assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'nothing is queued');
+        assert.equal(typedRows().length, 0);
+      }));
+    }
+  }
+  for (const text of ['  /clear my notes ', 'exit']) {
+    test(`(d) ${JSON.stringify(text)} to a seat ${kind}, idle only by background work, exits 23`, () => within(async () => {
+      const { code, stderr, argv } = await endingSend([], text);
+      assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+      assert.equal(code, 23, stderr);
+    }));
+  }
+  test(`(d) /exit to a seat ${kind} with a background shell (status shell) exits 23`, () => within(async () => {
+    const { code, stderr, argv } = await endingSend([], '/exit', { status: 'shell', screen: EMPTY_COMPOSER });
+    assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+    assert.equal(code, 23, stderr);
+  }));
+  test(`(d) --no-wait /exit to a seat ${kind}, idle only by background work, exits 23 and queues nothing`, () => within(async () => {
+    const { code, stderr } = await endingSend(['--no-wait'], '/exit');
+    assert.equal(code, 23, stderr);
+    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  }));
+  // The seat can change after agent-send looked: kitty-send's own refusal passes through.
+  for (const [args, text] of [[[], '/exit'], [['--now'], '/exit'], [['--queue'], 'exit']]) {
+    test(`(d) kitty-send exit 23 (${args[0] ?? 'bare'}) to a seat ${kind} passes through, never re-queued`, () => within(async () => {
+      const { code, stderr, argv } = await endingSend(args, text, {
+        status: 'idle', screen: EMPTY_COMPOSER,
+        envExtra: { AGENT_SEND_VERBOSE: '', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', KITTY_SEND_STUB_EXIT: '23' },
+      });
+      assert.ok(argv, `kitty-send did not run: ${stderr}`);
+      assert.equal(code, 23, stderr);
+      assert.match(stderr, /kitty-send exit 23 .*nothing was sent/);
+      assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a refused command is not put back');
+    }));
+  }
+  for (const text of ['an ordinary message', '/rename x']) {
+    test(`(d) control: ${JSON.stringify(text)} still reaches a seat ${kind}, idle only by background work`, () => within(async () => {
+      const { code, stderr, argv } = await endingSend([], text);
+      assert.ok(argv, `kitty-send did not run: ${stderr}`);
+      assert.equal(code, 0, stderr);
+    }));
+  }
+  test(`(d) control: /exit still reaches a truly idle seat ${kind}`, () => within(async () => {
+    const { code, stderr, argv } = await endingSend([], '/exit', { status: 'idle', screen: EMPTY_COMPOSER });
+    assert.ok(argv, `kitty-send did not run: ${stderr}`);
+    assert.equal(code, 0, stderr);
+  }));
+}
+test('(d) /exit queued during its own turn is never typed once only background work runs', async () => {
+  const { stderr, argv } = await endingSend(['--queue'], '/exit', {
+    screen: BG.OWN_TURN_WITH_BACKGROUND,
+    whileRunning: async () => {
+      await sleep(2000);
+      fs.writeFileSync(path.join(binDir, 'queue-screen'), BG.BACKGROUND_AT_PROMPT);
+    },
+  });
+  assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+  assert.equal(typedRows().length, 0);
+});
+
 const heldOn = async (args, opts) => {
   const { killed, stderr, argv } = await queueSend(['--to', '991001', ...args], {
     title: 'my renamed seat', killAfterMs: 5000,

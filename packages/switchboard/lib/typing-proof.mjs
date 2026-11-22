@@ -288,6 +288,8 @@ const WAIT_SCAN = 3;
 const BACKGROUND_FOOTER_RE = /\b\d+ background tasks?\b/;
 const BACKGROUND_WAIT_RE = /\bWaiting for \d+ background agents? to finish\b/;
 
+const waitLineAbove = (above) => above.filter((l) => l.trim() !== '').slice(-WAIT_SCAN).some((l) => BACKGROUND_WAIT_RE.test(l));
+
 // Why a busy record over this screen is (or is not) only background work: null
 // when the screen proves the turn has ended and only background work runs, else
 // the reason it stays busy.
@@ -303,7 +305,7 @@ const busyScreenReason = (lines, title) => {
   if (above.some((l) => SPINNER_LINE_RE.test(l))) return 'a spinner line stands above the composer: its own turn runs';
   const first = footer[0] ?? '';
   if (!MANAGE_RE.test(first)) return 'the footer does not show ↓ to manage whole, so it cannot prove the turn ended';
-  if (BACKGROUND_FOOTER_RE.test(first) || above.filter((l) => l.trim() !== '').slice(-WAIT_SCAN).some((l) => BACKGROUND_WAIT_RE.test(l))) return null;
+  if (BACKGROUND_FOOTER_RE.test(first) || waitLineAbove(above)) return null;
   return 'no background work is listed, so the turn may still run';
 };
 
@@ -334,6 +336,53 @@ export const seatStateOf = (winId) => {
   const record = proc != null ? sessionRecordOf(proc) : null;
   if (record == null) return 'unknown';
   return claudeSeatState({ status: record.status, title: win.title, lines: () => readScreen(winId) }).state ?? 'unknown';
+};
+
+// ---- a command that ends or wipes the conversation -----------------------------
+//
+// Where background work runs, `/exit` (alias `/quit`) ends it and `/clear`
+// (aliases `/new`, `/reset`) wipes the conversation waiting on its result. Such
+// a command is not typed into a seat that is idle only because that work runs
+// (what --retire and --close refuse), nor into a turn with that work listed,
+// whose steering queue would run it later into just such a seat.
+// Claude Code trims the input, reads the name up to the first whitespace and
+// runs the bare words below as /exit.
+const ENDING_COMMAND_RE = /^\/(?:exit|quit|clear|reset|new)(?:\s|$)/i;
+const EXIT_WORDS = new Set(['exit', 'quit', ':q', ':q!', ':wq', ':wq!']);
+const endsConversation = (text) => {
+  const t = String(text ?? '').trim();
+  return ENDING_COMMAND_RE.test(t) || EXIT_WORDS.has(t);
+};
+// Every label the footer gives background work. Wider than BACKGROUND_FOOTER_RE
+// on purpose: a match here only refuses, there it lets text be typed.
+const BACKGROUND_LISTED_RE = /\b\d+ (?:background (?:tasks?|agents?|dynamic workflows?)|shells?|(?:Artifact comment )?monitors?|teams?|MCP tasks?|cloud (?:sessions?|dynamic workflows?))\b/;
+
+export const ENDING_CLEAR = 'clear';
+export const ENDING_BACKGROUND = 'background';
+export const ENDING_TURN = 'turn';
+export const ENDING_UNKNOWN = 'unknown';
+// May `text` be typed into this window, as far as background work goes? Only a
+// Claude Code seat with a record is judged; any other text is clear before
+// anything is read. "Could not tell" is never clear.
+export const endingVerdict = (winId, text) => {
+  if (!endsConversation(text)) return verdict(ENDING_CLEAR);
+  const unknown = (why) => verdict(ENDING_UNKNOWN, `could not tell whether background work runs: ${why}`);
+  const ls = kittyList({ match: `id:${winId}`, fresh: true });
+  if (!ls.ok) return unknown(kittyDownMessage(ls));
+  const win = flattenWindows(ls.data).find((w) => w.id === Number(winId));
+  if (win == null) return unknown('window not found');
+  const proc = claudeProcOf(win);
+  const status = proc != null ? sessionRecordOf(proc)?.status : null;
+  if (status === 'shell') return verdict(ENDING_BACKGROUND, 'the seat is idle only because background shells or monitors run');
+  if (status !== 'busy') return verdict(ENDING_CLEAR);
+  const lines = readScreen(winId);
+  if (lines == null) return unknown('screen could not be read');
+  if (claudeSeatState({ status, title: win.title, lines }).state === 'idle') return verdict(ENDING_BACKGROUND, 'the seat is idle only because background agents or tasks run');
+  const screen = lines.map((l) => l.text);
+  const { top, bottom, error } = composerBounds(screen);
+  if (error != null) return unknown(error);
+  const listed = screen.slice(bottom + 1).some((l) => BACKGROUND_LISTED_RE.test(l)) || waitLineAbove(screen.slice(0, top));
+  return listed ? verdict(ENDING_TURN, 'its turn runs with background work listed, and would run the command into that work') : verdict(ENDING_CLEAR);
 };
 
 // Does the composer still hold `text` (whitespace ignored)? true / false, or
@@ -422,7 +471,11 @@ export const typingVerdict = (winId, opts = {}) => {
 // 3 a dialog is open, 64 usage. The reason goes to stderr.
 // `--mode seat` (lib/claude-session.sh, bin/tab-state.sh) prints the seat
 // reading, idle|busy|dialog|unknown, and exits 0.
+// `--mode ending --stdin` (bin/kitty-send.sh) answers endingVerdict by exit
+// code: 0 clear, 2 only background work runs, 3 a turn with background work
+// listed, 1 could not tell.
 const EXIT = { [PROVEN]: 0, [REFUSED]: 2, [DIALOG]: 3 };
+const ENDING_EXIT = { [ENDING_CLEAR]: 0, [ENDING_BACKGROUND]: 2, [ENDING_TURN]: 3, [ENDING_UNKNOWN]: 1 };
 if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
@@ -437,8 +490,13 @@ if (isMainModule(import.meta.url)) {
     process.stdout.write(`${seatStateOf(winId)}\n`);
     process.exit(0);
   }
+  if (mode === 'ending' && /^\d+$/.test(winId ?? '') && argv.includes('--stdin')) {
+    const v = endingVerdict(winId, fs.readFileSync(0, 'utf-8'));
+    if (v.reason != null) process.stderr.write(`${v.reason}\n`);
+    process.exit(ENDING_EXIT[v.kind]);
+  }
   if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog', 'enter'].includes(mode)) {
-    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|enter|composer|seat [--stdin] [--other-tabs] [--no-composer] [--refuse-draft]\n');
+    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|enter|composer|seat|ending [--stdin] [--other-tabs] [--no-composer] [--refuse-draft]\n');
     process.exit(64);
   }
   const text = argv.includes('--stdin') ? fs.readFileSync(0, 'utf-8') : null;

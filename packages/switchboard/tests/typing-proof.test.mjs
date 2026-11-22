@@ -513,6 +513,41 @@ test('--mode seat prints idle, busy, dialog or unknown for the record and screen
   assert.deepEqual(seatCli({ status: null }), { code: 0, out: 'unknown' });
 });
 
+// --mode ending: may a command that ends or wipes the conversation be typed?
+// 0 yes, 2 only background work runs, 3 its own turn runs with background work
+// listed, 1 could not tell.
+const endingCli = (text, opts, window = WIN) => {
+  seat({ title: 'example renamed seat', ...opts });
+  return spawnSync(process.execPath, [CLI, '--window', String(window), '--mode', 'ending', '--stdin'], { input: text, encoding: 'utf-8', env: process.env }).status;
+};
+// Without the agents panel, whose "waiting on 1 shell" would match by itself.
+const ownTurnListing = (label) => BG.OWN_TURN_WITH_BACKGROUND.split('\n  ● main')[0].replace('2 background tasks', label);
+for (const [name, status, screen, code] of [
+  ['idle only by background work', 'busy', BG.BACKGROUND_AT_PROMPT, 2],
+  ['idle with only the waiting line', 'busy', BG.BACKGROUND_WAIT_LINE_ONLY, 2],
+  ['idle with a background shell', 'shell', EMPTY, 2],
+  ['its own turn with background tasks', 'busy', BG.OWN_TURN_WITH_BACKGROUND, 3],
+  // The other labels Claude Code gives background work in that footer.
+  ...['1 shell', '2 shells', '1 monitor', '2 background agents', '1 team', '1 MCP task', '2 background dynamic workflows', '1 cloud session']
+    .map((label) => [`its own turn with ${label}`, 'busy', ownTurnListing(label), 3]),
+  ['its own turn with only the waiting line', 'busy', BG.BACKGROUND_WAIT_LINE_ONLY.replace('↓ to manage', 'esc to interrupt'), 3],
+  ['its own turn with no background work', 'busy', BG.BUSY_NO_BACKGROUND, 0],
+  ['its own turn with no count in the footer', 'busy', ownTurnListing('accept edits'), 0],
+  ['truly idle', 'idle', EMPTY, 0],
+  ['busy with no screen to read', 'busy', null, 1],
+  ['busy with no composer to read', 'busy', BG.PERMISSION_PROMPT_NO_FOOTER, 1],
+]) {
+  test(`--mode ending on a seat ${name} exits ${code}`, () => assert.equal(endingCli('/exit', { status, screen }), code));
+}
+test('--mode ending cannot tell for a window that is not there', () => {
+  assert.equal(endingCli('/exit', { status: 'idle', screen: EMPTY }, WIN + 1), 1);
+});
+test('--mode ending passes any other text without reading the seat', () => {
+  for (const text of ['an ordinary message', '/rename x', '/compact', '/newer', '/clear-cache', 'exit now']) {
+    assert.equal(endingCli(text, { status: 'busy', screen: null }, WIN + 1), 0, text);
+  }
+});
+
 // --mode enter: the proof before an Enter that follows typed text.
 test('--mode enter passes a composer holding the typed text, whatever the record', () => {
   for (const status of ['idle', 'shell', 'busy']) {

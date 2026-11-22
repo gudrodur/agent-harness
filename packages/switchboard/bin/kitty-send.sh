@@ -71,6 +71,14 @@
 #      proven submitted. Same meaning as 10 for the caller (look at the window,
 #      never resend blind); a distinct code because here the text is known to
 #      sit unsubmitted in the composer.
+#   23 a command that ends or wipes the conversation (/exit, /quit, /clear,
+#      /new, /reset, or a bare exit, quit, :q, :q!, :wq, :wq!) for a Claude Code
+#      seat that is idle only because background work runs, or, where it would
+#      be typed mid-turn (--now, --idle-when), for a turn with such work listed.
+#      NOTHING WAS SENT, in every mode; --queue refuses before it starts a
+#      waiter. A waiter queued earlier refuses too (23 in its log), except an
+#      unbounded one, which holds it until no background work runs. The same
+#      code, for the same loss, as claude-tab.sh --retire and --close.
 #   12 kitty remote control did not answer (a timeout or an unreachable
 #      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
 #      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
@@ -282,6 +290,10 @@ Options:
               a pattern: `pkill -f` with the target's own argv also matches
               the shell running the pkill (seen twice, exit 144).
   --quiet     only errors on stderr
+
+No option, --now included, types a command that ends or wipes the
+conversation (/exit, /quit, /clear, /new, /reset, bare exit or quit) into a
+Claude Code seat over its background work: exit 23, nothing sent.
 KITTY_SEND_USAGE
 }
 
@@ -434,9 +446,10 @@ title_busy() {
 # module proves a queued send's target idle with an empty composer, so the two
 # questions cannot drift apart.
 TYPING_PROOF="${KITTY_SEND_TYPING_PROOF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/typing-proof.mjs}"
-# run_proof <window id> <idle|dialog|enter> [proof flag]: sets PROOF_RC (0 proven/clear, 2 refused,
+# run_proof <window id> <idle|dialog|enter|ending> [proof flag]: sets PROOF_RC (0 proven/clear, 2 refused,
 # 3 a dialog is open, anything else = the proof could not run) and PROOF_REASON.
-# No mode here reads stdin (the slash-text refusal is agent-send's). Node or the module missing is
+# Only `ending` reads stdin, the text about to be typed (the general slash-text refusal is agent-send's);
+# its own codes are 0 clear, 2 only background work runs, 3 a turn with such work, else it could not tell. Node or the module missing is
 # PROOF_RC=127: callers refuse, they never fall back to typing unproven.
 # KITTY_SEND_TYPING_PROOF is a test seam (a path to a stand-in or a missing
 # file); production never sets it.
@@ -447,7 +460,10 @@ run_proof() {
     PROOF_RC=127; PROOF_REASON="the typing proof ($TYPING_PROOF, run by node) is not available"
     return 0
   fi
-  if [ "$2" = idle ]; then
+  if [ "$2" = ending ]; then
+    # A here-string, so a proof that never reads stdin breaks no pipe.
+    PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode ending --stdin 2>&1 >/dev/null <<<"$TEXT") || PROOF_RC=$?
+  elif [ "$2" = idle ]; then
     PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode idle --other-tabs ${3:-} 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
   else
     PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode "$2" ${3:-} 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
@@ -472,6 +488,11 @@ proof_gate() {
     3) die "refusing to type into a dialog (nothing was sent): ${PROOF_REASON} — answer it in the window" 4 ;;
     *) die "the typing proof did not pass (nothing was sent): ${PROOF_REASON:-exit $PROOF_RC}" 11 ;;
   esac
+}
+# The one refusal of a command that ends or wipes the conversation where
+# background work runs (exit 23, as claude-tab.sh --retire and --close give).
+refuse_ending() {
+  die "refusing to type a command that ends or wipes the conversation (nothing was sent): ${PROOF_REASON}; send it once no background work runs" 23
 }
 # enter_allowed: asked immediately before EVERY Enter that is not typed in
 # one call with its text, because a prompt can open in between and that Enter
@@ -766,6 +787,10 @@ fi
 # group, which is what lets --cancel kill the waiter and its sleep together
 # by pid and touch nothing else.
 if [ "$QUEUE" = 1 ]; then
+  # Refused here, not only in the waiter, whose exit the caller never sees. A
+  # turn that still runs is held instead; the waiter asks again before it types.
+  run_proof "$WID" ending
+  [ "$PROOF_RC" != 2 ] || refuse_ending
   # No bound -> UNBOUNDED. The old fixed 600 s default died
   # on any tab inside a pre-push suite ("target still busy after 600s", x4 on
   # 2026-09-05); an unbounded waiter delivers whenever the tab finally goes
@@ -823,11 +848,15 @@ WAIT_UNBOUNDED=0
 # "give up": a refusal at the chokepoint would exit 11 and drop a send whose
 # caller already got exit 0. Only a refusal (PROOF_RC 2) keeps it polling; a
 # proof that cannot run (127, a dialog) falls through to proof_gate, which
-# fails loudly.
+# fails loudly. A proven seat still holds a command that ends the conversation
+# while background work runs, or while that cannot be told.
 unbounded_proof_refuses() {
   [ "$WAIT_UNBOUNDED" = 1 ] || return 1
   if [ -z "$IDLE_WHEN" ]; then run_proof "$WID" idle; else run_proof "$WID" dialog --refuse-draft; fi
-  [ "$PROOF_RC" = 2 ]
+  [ "$PROOF_RC" != 2 ] || return 0
+  [ "$PROOF_RC" = 0 ] || return 1
+  run_proof "$WID" ending
+  [ "$PROOF_RC" != 0 ]
 }
 if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   idle_deadline=$(( $(date +%s) + WAIT_IDLE ))
@@ -1196,6 +1225,14 @@ proof_gate
 if [ "$CLAUDE_TAB" = 1 ] && [ "$SLASH_SEND" = 1 ]; then
   enter_allowed || die "Enter withheld from window $WID's slash command (nothing was sent): $ENTER_BLOCKED. Look at the window first." 11
 fi
+# The last check, keyed on the text and not on SLASH_SEND (--expect clears
+# that, and a bare "exit" is no slash).
+run_proof "$WID" ending
+case "$PROOF_RC" in
+  0) ;;
+  2|3) refuse_ending ;;
+  *) die "cannot type a command that ends the conversation (nothing was sent): ${PROOF_REASON:-the proof exited $PROOF_RC}" 11 ;;
+esac
 # From here the keystrokes are out. SENT=1 plus the EXIT trap is the one
 # mechanism that keeps the promise of the exit codes: any exit that is not one
 # this section chooses (0, 3, 8, 10, 16) becomes 3, "sent, delivery not proven". A
