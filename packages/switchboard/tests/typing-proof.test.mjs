@@ -7,7 +7,8 @@
 // Code windows (top rule, a `❯` line, bottom rule, a footer line); the dialog
 // footers are ASSUMED from strings in the Claude Code 2.1.323 binary, because
 // no live dialog was available to capture. A permission prompt is refused
-// through the record status `waiting`, so it carries no footer string here.
+// through the record status `waiting` or its footer, and before an Enter also
+// through the composer it replaces (--mode enter).
 import './helpers/isolate-setup.mjs';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -401,7 +402,7 @@ const winRecord = (title = 'example renamed seat') => ({ id: WIN, title, foregro
 const busyOn = (screen, title = 'example renamed seat') => { seat({ title, status: 'busy', screen }); return windowIsBusy(winRecord(title)); };
 
 test('(a) a busy record over an idle prompt with background agents is idle and proven', () => {
-  for (const screen of [BG.BACKGROUND_AT_PROMPT, BG.BACKGROUND_AT_PROMPT_TITLED]) {
+  for (const screen of [BG.BACKGROUND_AT_PROMPT, BG.BACKGROUND_AT_PROMPT_TITLED, BG.BACKGROUND_FOOTER_LINES, BG.BACKGROUND_FOOTER_RC, BG.BACKGROUND_WAIT_LINE_ONLY]) {
     assert.equal(busyOn(screen), false, screen);
     const v = proofVerdict(WIN);
     assert.equal(v.kind, PROVEN, JSON.stringify(v));
@@ -437,10 +438,43 @@ test('(b) a busy record the screen cannot settle stays busy: cut footer, no back
   }
 });
 
-test('(b) an empty composer with a draft refuses even when only background work runs', () => {
-  const screen = BG.BACKGROUND_AT_PROMPT.replace('❯ \n', '❯ half a thought\n');
-  assert.equal(busyOn(screen), false, 'the seat is at its prompt');
-  assert.match(proofVerdict(WIN).reason, /composer holds text/);
+// Each group trips exactly one guard: every other sign on those screens says
+// the seat is at its prompt, so deleting that guard fails its test.
+for (const [guard, screens, reason] of [
+  ['the esc hint', BG.ONLY_ESC_HINT, /esc to interrupt: its own turn runs/],
+  ['the spinner line', BG.ONLY_SPINNER, /a spinner line stands above the composer/],
+  ['the manage hint', BG.ONLY_FOOTER_UNPROVEN, /↓ to manage/],
+  ['the empty composer', BG.ONLY_DRAFT, /composer (holds text|could not be read)/],
+]) {
+  for (const [name, screen] of Object.entries(screens)) {
+    test(`(b) ${guard} alone keeps a busy record busy: ${name}`, () => {
+      assert.equal(busyOn(screen), true);
+      const v = proofVerdict(WIN);
+      assert.equal(v.kind, REFUSED, JSON.stringify(v));
+      assert.match(v.reason, /^session record status busy, not idle/);
+      assert.match(v.reason, reason);
+      assert.equal(seatCli({ status: 'busy', screen }).out, 'busy');
+    });
+  }
+}
+
+for (const [name, screen] of [
+  ['A, compacting with a draft', BG.COMPACTING_WITH_DRAFT],
+  ['B, compacting with a clipped footer', BG.COMPACTING_CLIPPED],
+  ['C, a spinner above a task list with a draft', BG.SPINNER_ABOVE_TASKS_WITH_DRAFT],
+  ['a draft under the waiting line', BG.WAITING_WITH_DRAFT],
+]) {
+  test(`(b) screen ${name} is busy and never proven`, () => {
+    assert.equal(busyOn(screen), true);
+    assert.equal(proofVerdict(WIN).kind, REFUSED);
+    assert.equal(seatCli({ status: 'busy', screen }).out, 'busy');
+  });
+}
+
+test('(a) a faint prompt suggestion is an empty composer for a background-idle seat', () => {
+  const screen = BG.BACKGROUND_AT_PROMPT.replace(BG.EMPTY_PROMPT, `${BG.EMPTY_PROMPT}\x1b[22;2mcheck on the agents\x1b[22m`);
+  assert.equal(busyOn(screen), false);
+  assert.equal(proofVerdict(WIN).kind, PROVEN);
 });
 
 test('(c) a question raised while background agents run is a DIALOG in every mode', () => {
@@ -478,3 +512,25 @@ test('--mode seat prints idle, busy, dialog or unknown for the record and screen
   assert.deepEqual(seatCli({ status: 'shell' }), { code: 0, out: 'idle' });
   assert.deepEqual(seatCli({ status: null }), { code: 0, out: 'unknown' });
 });
+
+// --mode enter: the proof before an Enter that follows typed text.
+test('--mode enter passes a composer holding the typed text, whatever the record', () => {
+  for (const status of ['idle', 'shell', 'busy']) {
+    seat({ status, screen: BG.typedInto('the message') });
+    assert.equal(proofVerdict(WIN, { mode: 'enter' }).kind, PROVEN, status);
+  }
+});
+
+for (const [name, status, screen, kind] of [
+  ['a permission prompt', 'busy', BG.PERMISSION_PROMPT, DIALOG],
+  ['a permission prompt without its footer', 'busy', BG.PERMISSION_PROMPT_NO_FOOTER, REFUSED],
+  ['a waiting record over a composer not yet redrawn', 'waiting', BG.typedInto('the message'), DIALOG],
+  ['an unreadable screen', 'busy', null, REFUSED],
+]) {
+  test(`--mode enter refuses ${name}`, () => {
+    seat({ status, screen });
+    assert.equal(proofVerdict(WIN, { mode: 'enter' }).kind, kind);
+    const r = spawnSync(process.execPath, [CLI, '--window', String(WIN), '--mode', 'enter'], { encoding: 'utf-8', env: process.env });
+    assert.equal(r.status, kind === DIALOG ? 3 : 2, r.stderr);
+  });
+}

@@ -311,7 +311,7 @@ test('a claude window with status busy at its prompt with only background agents
 });
 
 test('a claude window with status busy in its own turn, background agents or not, reports busy', async () => {
-  for (const screen of [BG.OWN_TURN_WITH_BACKGROUND, BG.QUESTION_WITH_BACKGROUND]) {
+  for (const screen of [BG.OWN_TURN_WITH_BACKGROUND, BG.QUESTION_WITH_BACKGROUND, BG.COMPACTING_WITH_DRAFT, BG.COMPACTING_CLIPPED, BG.SPINNER_ABOVE_TASKS_WITH_DRAFT, BG.WAITING_WITH_DRAFT]) {
     await setupClaude({ status: 'busy' });
     await fs.writeFile(path.join(sessDir, 'screen'), screen);
     const r = await runScript([WID]);

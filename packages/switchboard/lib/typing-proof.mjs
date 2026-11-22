@@ -39,8 +39,12 @@ export const DIALOG = 'dialog';
 //     not typed input; see "screen attributes" below). A hint at normal
 //     intensity, or a paste or image chip however drawn, reads as text: not typed.
 // Mode `dialog` (--now, --stop and every send that does not claim idleness)
-// asks only the dialog question; a busy mid-turn seat stays allowed there, and
-// the composer is not read (--now needs no empty-composer proof).
+// asks the dialog question; a busy mid-turn seat stays allowed there. With
+// `refuseDraft` (kitty-send's chokepoint) it also refuses a busy seat whose
+// composer box is on the screen and holds text: the Enter would submit that
+// draft. With no box the text may go out and mode `enter` withholds the Enter.
+// Mode `enter` runs before an Enter: no dialog, and in a Claude Code tab a
+// composer on the screen, which a prompt that takes the keys replaces.
 // `shell`: the turn ended and background shells or monitors still run (seen on
 // live screens with an empty composer and the title idle).
 const QUEUE_IDLE_STATUSES = new Set(['idle', 'shell']);
@@ -224,6 +228,14 @@ const composerBox = (lines) => {
   return { rows: box.map((l, k) => solidText(l, k === 0 ? 1 : 0)), chip: box.some((l) => CHIP_RE.test(l.text)) };
 };
 
+// Why this screen's composer is not proven empty, or null when it is. Shared
+// by the idle proof, the reading of a busy record and the draft refusal.
+const composerRefusal = (lines) => {
+  const box = composerBox(lines);
+  if (box.error != null) return box.error;
+  return box.chip || box.rows.some((l) => l.trim() !== '') ? 'composer holds text' : null;
+};
+
 // The visible screen as parsed lines (see parseScreenLine), or null when it
 // cannot be read. `get-text --ansi` first. Only a refusal of `--ansi` itself
 // (its error names the option: a kitty without it) falls back to the plain read
@@ -252,36 +264,46 @@ const dialogOnScreen = (lines) => lines.slice(-DIALOG_ROWS).some((l) => DIALOG_R
 // waits at an empty prompt, and a message typed there is answered at once while
 // the agents run on (checked on a live seat). Read as a turn in progress, it
 // kept queued mail from a waiting seat for hours. The screen tells them apart,
-// and the reading fails closed: anything it does not recognise is busy.
-//   - own turn: the footer under the composer carries "esc to interrupt", or a
-//     spinner line ("✻ Gitifying… (8s · ↓ 98 tokens)") stands just above the
-//     composer, or the title spins;
-//   - only background work: none of those, and the footer lists
-//     "N background tasks" or the screen says "Waiting for N background agents";
-//   - a footer cut off at the window edge before the place "esc to interrupt"
-//     takes cannot be told apart: busy.
+// and the second state needs positive proof, all of it; anything else is busy:
+//   - no spinner in the title;
+//   - the composer is on the screen and empty (with text in it Claude Code
+//     drops "esc to interrupt", and an Enter would submit that text);
+//   - no "esc to interrupt" under the composer;
+//   - no progress line of a turn above the composer, whatever its label;
+//   - the footer's first line shows "↓ to manage" with nothing cut before it,
+//     so there was room for "esc to interrupt";
+//   - background work is listed: "N background tasks" on that line, or
+//     "Waiting for N background agents to finish" just above the composer.
 const INTERRUPT_RE = /esc to interrupt/;
-// A spinner glyph, a space, one word ending in "…": the progress line of a turn.
-const SPINNER_LINE_RE = /^\S \S[^\s…]*…(\s|$)/u;
-const SPINNER_SCAN = 3;
+// The progress line of a turn, in three shapes:
+//   - a glyph, a space and a label of any words ending in "…"
+//     ("✢ Compacting conversation… (8s)");
+//   - "●", the reduced-motion glyph, which also starts replies and tool calls:
+//     a label with no "(" before its "…", ending the line or followed by one;
+//   - any label with an elapsed time, whose glyph may be blinked out
+//     ("  Compacting conversation… (8s)").
+const SPINNER_LINE_RE = /^(?:[^\s●❯>※] \S.*…(?:\s|$)|● [^(…]+…(?:\s+\(|$)|\s{0,2}\S.*…\s+\(\d+[hms])/u;
+const MANAGE_RE = /^[^…]*↓ to manage(?:\s|$)/u;
+const WAIT_SCAN = 3;
 const BACKGROUND_FOOTER_RE = /\b\d+ background tasks?\b/;
 const BACKGROUND_WAIT_RE = /\bWaiting for \d+ background agents? to finish\b/;
 
 // Why a busy record over this screen is (or is not) only background work: null
-// when the screen shows the turn has ended and only background work runs, else
+// when the screen proves the turn has ended and only background work runs, else
 // the reason it stays busy.
 const busyScreenReason = (lines, title) => {
   if (titleShowsBusy(title)) return 'the title shows a turn in progress';
+  const draft = composerRefusal(lines);
+  if (draft != null) return draft;
   const text = lines.map((l) => l.text);
-  const bounds = composerBounds(text);
-  if (bounds.error != null) return bounds.error;
-  const footer = text.slice(bounds.bottom + 1);
+  const { top, bottom } = composerBounds(text);
+  const footer = text.slice(bottom + 1);
   if (footer.some((l) => INTERRUPT_RE.test(l))) return 'the footer says esc to interrupt: its own turn runs';
-  const above = text.slice(0, bounds.top).filter((l) => l.trim() !== '').slice(-SPINNER_SCAN);
-  if (above.some((l) => SPINNER_LINE_RE.test(l.trim()))) return 'a spinner line stands above the composer: its own turn runs';
+  const above = text.slice(0, top);
+  if (above.some((l) => SPINNER_LINE_RE.test(l))) return 'a spinner line stands above the composer: its own turn runs';
   const first = footer[0] ?? '';
-  if (first.trimEnd().endsWith('…') && !first.includes('←')) return 'the footer is cut off before it could say esc to interrupt';
-  if (BACKGROUND_FOOTER_RE.test(first) || above.some((l) => BACKGROUND_WAIT_RE.test(l))) return null;
+  if (!MANAGE_RE.test(first)) return 'the footer does not show ↓ to manage whole, so it cannot prove the turn ended';
+  if (BACKGROUND_FOOTER_RE.test(first) || above.filter((l) => l.trim() !== '').slice(-WAIT_SCAN).some((l) => BACKGROUND_WAIT_RE.test(l))) return null;
   return 'no background work is listed, so the turn may still run';
 };
 
@@ -329,7 +351,7 @@ export const composerHolds = (winId, text) => {
   return want !== '' && box.rows.join('').replace(/\s+/g, '').includes(want);
 };
 
-export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true, win: given = null } = {}) => {
+export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = false, composer = true, refuseDraft = false, win: given = null } = {}) => {
   const idleMode = mode === 'idle';
   // `text`, when given, is the message about to be typed: one that starts with
   // `/` would run as a slash command in the seat (`/compact` compacts it)
@@ -359,7 +381,15 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   const lines = readScreen(winId);
   if (lines == null) return verdict(REFUSED, 'screen could not be read');
   if (dialogOnScreen(lines)) return verdict(DIALOG, 'a dialog is open on the screen');
-  if (dialogOnly) return verdict(PROVEN);
+  if (dialogOnly) {
+    if (proc != null && (mode === 'enter' || (refuseDraft && record?.status === 'busy'))) {
+      const noBox = composerBounds(lines.map((l) => l.text)).error;
+      if (mode === 'enter' && noBox != null) return verdict(REFUSED, `${noBox}, so a prompt may have taken its place`);
+      const draft = mode !== 'enter' && noBox == null ? composerRefusal(lines) : null;
+      if (draft != null) return verdict(REFUSED, draft);
+    }
+    return verdict(PROVEN);
+  }
 
   if (titleShowsBusy(win.title)) return verdict(REFUSED, 'title shows a turn in progress');
   if (proc == null) return verdict(REFUSED, 'not a Claude Code tab, whose composer cannot be read reliably');
@@ -376,10 +406,8 @@ export const proofVerdict = (winId, { mode = 'idle', text = null, otherTabs = fa
   // must be the top rule. Anything else (bash `!` mode, a panel in the way, a
   // screen scrolled mid-box) is a shape this does not know: refused.
   if (!composer) return verdict(PROVEN);
-  const box = composerBox(lines);
-  if (box.error != null) return verdict(REFUSED, box.error);
-  if (box.chip || box.rows.some((l) => l.trim() !== '')) return verdict(REFUSED, 'composer holds text');
-  return verdict(PROVEN);
+  const notEmpty = composerRefusal(lines);
+  return notEmpty == null ? verdict(PROVEN) : verdict(REFUSED, notEmpty);
 };
 
 // The reason string or null, for a caller that wants only "may I type": any
@@ -389,8 +417,8 @@ export const typingVerdict = (winId, opts = {}) => {
   return v.kind === PROVEN ? null : v.reason;
 };
 
-// CLI, run by bin/kitty-send.sh: `typing-proof.mjs --window N --mode idle|dialog
-// [--stdin] [--other-tabs] [--no-composer]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
+// CLI, run by bin/kitty-send.sh: `typing-proof.mjs --window N --mode idle|dialog|enter
+// [--stdin] [--other-tabs] [--no-composer] [--refuse-draft]` (the message text on stdin with --stdin). Exit 0 proven, 2 refused,
 // 3 a dialog is open, 64 usage. The reason goes to stderr.
 // `--mode seat` (lib/claude-session.sh, bin/tab-state.sh) prints the seat
 // reading, idle|busy|dialog|unknown, and exits 0.
@@ -409,12 +437,12 @@ if (isMainModule(import.meta.url)) {
     process.stdout.write(`${seatStateOf(winId)}\n`);
     process.exit(0);
   }
-  if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog'].includes(mode)) {
-    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|composer|seat [--stdin] [--other-tabs] [--no-composer]\n');
+  if (!/^\d+$/.test(winId ?? '') || !['idle', 'dialog', 'enter'].includes(mode)) {
+    process.stderr.write('usage: typing-proof.mjs --window <id> --mode idle|dialog|enter|composer|seat [--stdin] [--other-tabs] [--no-composer] [--refuse-draft]\n');
     process.exit(64);
   }
   const text = argv.includes('--stdin') ? fs.readFileSync(0, 'utf-8') : null;
-  const v = proofVerdict(winId, { mode, text, otherTabs: argv.includes('--other-tabs'), composer: !argv.includes('--no-composer') });
+  const v = proofVerdict(winId, { mode, text, otherTabs: argv.includes('--other-tabs'), composer: !argv.includes('--no-composer'), refuseDraft: argv.includes('--refuse-draft') });
   if (v.reason != null) process.stderr.write(`${v.reason}\n`);
   process.exit(EXIT[v.kind]);
 }

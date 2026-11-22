@@ -76,7 +76,7 @@ before(async () => {
     '    text="${@: -1}";',
     '    if [ "$text" = $' + "'\\r'" + ' ]; then echo enter >> "$state/calls"; if [ -f "$state/composer" ] && [ "$(wc -c < "$state/composer")" -gt 500 ] && [ ! -f "$state/long-first-enter" ]; then touch "$state/long-first-enter"; else jq -cn --arg text "$(cat "$state/composer")" \'{type:"user.message",data:{content:$text}}\' >> "$events"; rm -f "$state/composer"; fi;',
     '    elif [[ "$text" == *$' + "'\\r'" + ' ]]; then echo burst >> "$state/calls"; printf "%s" "${text%' + "'\\r'" + '}" > "$state/composer";',
-    '    else echo text >> "$state/calls"; printf "%s" "$text" > "$state/composer"; fi ;;',
+    '    else echo text >> "$state/calls"; printf "%s" "$text" > "$state/composer"; if [ -f "$state/dialog_after_text" ]; then jq -cn \'{type:"permission.requested"}\' >> "$events"; fi; fi ;;',
     '  @/get-text) if [ -f "$state/composer" ]; then cat "$state/composer"; else printf "%s\\n" "copilot prompt"; fi ;;',
     'esac',
     'exit 0',
@@ -201,6 +201,34 @@ test('a Copilot permission dialog refuses the send', async () => {
   }
   assert.equal(result.code, 4);
   assert.match(result.stderr, /permission dialog/);
+});
+
+test('a Copilot permission dialog that opens after the text gets no Enter', async () => {
+  await fs.writeFile(events, `${JSON.stringify({ type: 'user.message', data: { content: 'an earlier prompt' } })}\n`);
+  for (const f of ['calls', 'composer']) await fs.rm(path.join(stateDir, f), { force: true });
+  await fs.writeFile(path.join(stateDir, 'dialog_after_text'), '');
+  try {
+    let result;
+    try {
+      result = await run(SCRIPT, ['--to', WID, '--text', MSG, '--timeout', '3'], {
+        env: isolatedEnv({
+          PATH: `${binDir}:${process.env.PATH}`,
+          HOME: copilotDir,
+          XDG_RUNTIME_DIR: stateDir,
+          COPILOT_STATE_DIR: copilotDir,
+          KITTY_SEND_TYPING_PROOF: proof,
+        }),
+        timeout: 15_000,
+      });
+    } catch (error) {
+      result = error;
+    }
+    assert.deepEqual((await fs.readFile(path.join(stateDir, 'calls'), 'utf8')).trim().split('\n'), ['text']);
+    assert.equal(result.code, 3, `${result.stdout ?? ''}${result.stderr ?? ''}`);
+    assert.match(result.stderr, /Enter withheld/);
+  } finally {
+    for (const f of ['dialog_after_text', 'composer', 'calls']) await fs.rm(path.join(stateDir, f), { force: true });
+  }
 });
 
 test('a window still titled Copilot with a bare shell in front is refused', async () => {

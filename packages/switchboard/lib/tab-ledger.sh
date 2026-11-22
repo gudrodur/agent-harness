@@ -128,7 +128,9 @@ tab_ledger_list() {
       if [ -n "$st" ]; then
         tl=$(printf '%s' "$stline" | grep -o 'tool=[^ ]*' | head -1)
         ag=$(printf '%s' "$stline" | grep -o 'age=[^ ]*' | head -1)
-        stab="$st ${tl:-tool=-} ${ag:-age=-}"
+        # The one reason shown: that idle is not safe to close (exit 23).
+        rs=$(printf '%s' "$stline" | grep -o 'reason=claude-background' | head -1)
+        stab="$st ${tl:-tool=-} ${ag:-age=-}${rs:+ $rs}"
       fi
     fi
     printf '%-6s %-8s %-12s %-28s %s\n' "$id" "$s" "$launcher" "$stab" "$title"

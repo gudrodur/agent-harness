@@ -2,12 +2,14 @@
 # Proof by STATE for a delegated agent tab: is the window busy, idle or
 # unknown, and which session is it.
 #
-# Nothing on the screen is read and nothing is sent. Two kinds of tab are
-# recognised, asked in this order:
+# Nothing is sent. The screen is read for one case only, a Claude Code record
+# that says busy. Two kinds of tab are recognised, asked in this order:
 #
 # A Claude Code tab: when the window's foreground process is `claude`,
-# <config>/sessions/<pid>.json decides: its status busy|idle is the state
-# (anything else is unknown with reason=claude-status-<value>), session= is
+# <config>/sessions/<pid>.json decides: status idle is idle; busy is idle with
+# reason=claude-background when the screen proves that only background work
+# runs (lib/typing-proof.mjs), else busy; any other status is unknown with
+# reason=claude-status-<value>; session= is
 # the transcript path, lines= its line count, age= the seconds since
 # statusUpdatedAt, source=claude. A record whose startedAt predates the window
 # is unknown reason=session-older-than-window. tool= is "-" and jobs are

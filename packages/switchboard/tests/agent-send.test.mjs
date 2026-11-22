@@ -2025,6 +2025,20 @@ for (const args of [['--queue'], ['--now'], []]) {
     assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
   });
 }
+for (const args of [['--queue'], ['--now'], ['--stop'], []]) {
+  for (const [name, screen] of [
+    ['screen A', BG.COMPACTING_WITH_DRAFT],
+    ['screen B', BG.COMPACTING_CLIPPED],
+    ['screen C', BG.SPINNER_ABOVE_TASKS_WITH_DRAFT],
+    ['a draft under the waiting line', BG.WAITING_WITH_DRAFT],
+    ['only a draft', BG.ONLY_DRAFT['a draft']],
+  ]) {
+    test(`(b) ${args[0] ?? 'a bare send'} to ${name} (record busy) types nothing`, async () => {
+      await heldOn(args, { status: 'busy', screen });
+      assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
+    });
+  }
+}
 // --now and a bare send leave the dialog question to kitty-send's typing proof,
 // the last read before a keystroke (tests/kitty-send-claude.test.mjs covers it
 // for this screen); the queue wait answers it here.

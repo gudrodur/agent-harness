@@ -630,6 +630,39 @@ test('--retire refuses a seat at its prompt while its background agents still ru
   assert.equal((await handoverRows())[0].retired_at, null);
 });
 
+test('--list names why a seat with live background work reads idle', async () => {
+  await handover();
+  await windows({ status: 'busy' });
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await fs.writeFile(path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid), `${OTHER_WID} ${other.pid} @other-seat claude: background seat\n`);
+  const r = await tab(['--list']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /state=idle [^\n]*reason=claude-background/);
+});
+
+for (const [name, screen] of [
+  ['compacting', BG.COMPACTING_CLIPPED],
+  ['holding a draft', BG.ONLY_DRAFT['a draft']],
+]) {
+  test(`--retire refuses a seat ${name} over background agents, with exit 23`, async () => {
+    await handover();
+    await windows({ status: 'busy' });
+    await fs.writeFile(path.join(stateDir, 'screen'), screen);
+    const r = await retire();
+    assert.equal(r.code, 23, r.err);
+    assert.equal(await exists('closed'), false);
+  });
+  test(`--close --after-loka refuses a seat ${name} over background agents, with exit 23`, async () => {
+    await windows({ status: 'busy' });
+    await fs.writeFile(path.join(stateDir, 'screen'), screen);
+    await seatTranscript();
+    await lokaDone();
+    const r = await closeFinished();
+    assert.equal(r.code, 23, r.err);
+    assert.equal(await exists('closed'), false);
+  });
+}
+
 test('--retire refuses a busy seat with exit 23, and a seat whose state is unknown', async () => {
   await handover();
   await windows({ status: 'busy' });
