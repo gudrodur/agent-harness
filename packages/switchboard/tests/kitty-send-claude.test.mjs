@@ -21,6 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { fileURLToPath } from 'node:url';
+import * as BG from './fixtures/claude-background-screens.mjs';
 
 const run = promisify(execFile);
 const SCRIPT = fileURLToPath(new URL('../bin/kitty-send.sh', import.meta.url));
@@ -67,7 +68,11 @@ before(async () => {
     `  @/ls) if [ -f "$state/nonclaude" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed 's/"cmdline":\\["claude"\\]/"cmdline":["pi"]/'; elif [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
     '  @/send-text)',
     '    text="${@: -1}"',
+    '    [ -f "$state/sent" ] || cat "$state/reads" > "$state/sent_at" 2>/dev/null',
     '    : > "$state/sent"',
+    '    if [ -f "$state/waiting_at" ]; then',
+    '      if [ "$(cat "$state/waiting_at")" = text ] || [ "$text" = $\'\\r\' ]; then cp "$state/waiting_record" "$(cat "$state/record_path")"; fi',
+    '    fi',
     '    if [ "$text" = $\'\\r\' ]; then',
     '      echo enter >> "$state/calls"',
     '      if [ -f "$state/eat" ]; then rm -f "$state/eat"',
@@ -86,7 +91,9 @@ before(async () => {
     '  @/get-text)',
     '    # screen: what the window shows; screen_late replaces it from the late_at-th read on',
     '    n=$(( $(cat "$state/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$state/reads"',
-    '    if [ -f "$state/screen_late" ] && [ "$n" -ge "$(cat "$state/late_at")" ]; then cat "$state/screen_late"',
+    '    if [ -f "$state/after_enter" ] && grep -q enter "$state/calls" 2>/dev/null; then cat "$state/after_enter"',
+    '    elif [ -f "$state/after_text" ] && [ -f "$state/sent" ]; then cat "$state/after_text"',
+    '    elif [ -f "$state/screen_late" ] && [ "$n" -ge "$(cat "$state/late_at")" ]; then cat "$state/screen_late"',
     '    elif [ -f "$state/screen_dyn" ]; then',
     '      # a live composer: typed text sits in the box until a lone \\r submits it, then the command shows its effect',
     '      rule=$(cat "$state/rule")',
@@ -94,7 +101,7 @@ before(async () => {
     '      elif [ -f "$state/sent" ]; then printf \'%s\\n\' "● Done." "● Renamed." "" "$rule" "❯ " "$rule" "  ⏵⏵ bypass permissions on · 1 shell"',
     '      else printf \'%s\\n\' "● Done." "" "$rule" "❯ " "$rule" "  ⏵⏵ bypass permissions on · 1 shell"; fi',
     '    elif [ -f "$state/screen" ]; then cat "$state/screen"',
-    "    else printf '%s\\n' 'claude composer'; fi ;;",
+    "    else printf '%s\\n' '● Done.' '' '────────────' '❯\u00a0' '────────────' '  ? for shortcuts'; fi ;;",
     'esac',
     'exit 0',
     '',
@@ -110,7 +117,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_dyn', 'dialog_after_send', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_dyn', 'dialog_after_send', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude', 'after_text', 'after_enter', 'waiting_at']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -211,6 +218,325 @@ test('a Claude tab whose session status is shell is sendable even with a spinner
   const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '8']);
   assert.equal(r.code, 0, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), ['text']);
+});
+
+// `busy` also covers a finished turn while background agents still work: the
+// seat waits at an empty prompt (fixtures/claude-background-screens.mjs). Its
+// screen says so, and that seat is sendable; its own turn is not, and a dialog
+// raised meanwhile is refused in every mode.
+for (const flags of [[], ['--wait-idle', '4']]) {
+  const how = flags[0] ?? 'no mode flag';
+  test(`(a) a busy-record Claude tab at its prompt with only background agents is sent to with ${how}`, async () => {
+    await reset('burst', 'busy');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '8', ...flags]);
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), ['text']);
+  });
+  test(`(b) a busy-record Claude tab in its own turn with background agents is not sent to with ${how}`, async () => {
+    await reset('burst', 'busy');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.OWN_TURN_WITH_BACKGROUND);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...flags.map((f) => (f === '4' ? '2' : f))]);
+    assert.notEqual(r.code, 0, `${r.out}${r.err}`);
+    if (flags.length === 0) assert.equal(r.code, 7, `${r.out}${r.err}`);
+    else assert.match(r.err, /still busy/);
+    assert.deepEqual(await calls(), []);
+  });
+}
+for (const flags of [[], ['--now'], ['--wait-idle', '2']]) {
+  test(`(c) a Claude tab showing a question while background agents run is refused with ${flags.join(' ') || 'no mode flag'}, nothing sent`, async () => {
+    await reset('burst', 'waiting');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.QUESTION_WITH_BACKGROUND);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...flags]);
+    assert.notEqual(r.code, 0, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), []);
+  });
+}
+
+// ---- a command that ends the conversation never reaches a seat with background work ----
+// /exit and /quit would end that work, /clear and /new (and their alias /reset)
+// wipe the conversation waiting on it. Exit 23, as --retire and --close give.
+const QUEUE_LOG = () => path.join(stateDir, 'kitty-send', `queue-${WID}.log`);
+const queueLog = () => fs.readFile(QUEUE_LOG(), 'utf8').catch(() => '');
+const waiterEnded = async () => {
+  for (let i = 0; i < 100; i += 1) {
+    if (/queued waiter exit rc=/.test(await queueLog())) return;
+    await new Promise((res) => setTimeout(res, 100));
+  }
+};
+const FAST_POLL = { KITTY_SEND_POLL_MS: '100', KITTY_SEND_POLL_CAP_MS: '100' };
+const sendText = async (text, flags, env = {}) => {
+  await fs.rm(QUEUE_LOG(), { force: true });
+  const r = await runScript(['--to', WID, '--text', text, '--timeout', '2', ...flags], { ...FAST_POLL, ...env });
+  if (flags.includes('--queue') && r.code === 0) await waiterEnded();
+  return r;
+};
+const onBackground = async (status = 'busy', screen = BG.BACKGROUND_AT_PROMPT) => {
+  await reset('burst', status);
+  await fs.writeFile(path.join(stateDir, 'screen'), screen);
+  await fs.writeFile(path.join(stateDir, 'after_text'), BG.BACKGROUND_AT_PROMPT_TITLED); // a screen change proves a slash send
+};
+const refused23 = async (r) => {
+  assert.deepEqual(await calls(), [], `${r.out}${r.err}`);
+  assert.equal(r.code, 23, `${r.out}${r.err}`);
+  assert.match(r.err, /background/);
+};
+const SEND_PATHS = [['bare', []], ['--queue', ['--queue', '--deadline', '4']], ['--queue with no bound', ['--queue']], ['--now', ['--now']], ['--wait-idle', ['--wait-idle', '4']], ['--idle-when', ['--idle-when', 'bypass permissions']]];
+
+for (const command of ['/exit', '/quit', '/clear', '/new']) {
+  for (const [how, flags] of SEND_PATHS) {
+    test(`(d) ${command} (${how}) to a seat idle only by background work exits 23, nothing typed`, async () => {
+      await onBackground();
+      await refused23(await sendText(command, flags));
+    });
+  }
+}
+for (const text of [
+  '/exit now', '/quit please', '/clear my notes', '/new topic', '  /exit  ', '\t/clear\t', ' /quit ', '/Exit', '/reset',
+  'exit', 'quit', ':q', ':q!', ':wq', ':wq!', ' exit ', // Claude Code runs these bare words as /exit
+]) {
+  test(`(d) ${JSON.stringify(text)} to a seat idle only by background work exits 23, nothing typed`, async () => {
+    await onBackground();
+    await refused23(await sendText(text, []));
+  });
+}
+for (const [how, flags] of SEND_PATHS) {
+  test(`(d) /exit (${how}) to a seat whose background shell runs (status shell) exits 23, nothing typed`, async () => {
+    await reset('burst', 'shell');
+    await refused23(await sendText('/exit', flags));
+  });
+}
+test('(d) --expect does not get /exit past the refusal', async () => {
+  await onBackground();
+  await refused23(await sendText('/exit', ['--expect', 'Bye']));
+});
+test('(d) --now /exit into its own turn with background work exits 23: the steering queue would run it later', async () => {
+  await onBackground('busy', BG.OWN_TURN_WITH_BACKGROUND);
+  await refused23(await sendText('/exit', ['--now']));
+});
+test('(d) a bounded --queue waiter does not fire /exit into a seat that became idle by background work', async () => {
+  await onBackground('busy', BG.OWN_TURN_WITH_BACKGROUND);
+  await fs.rm(QUEUE_LOG(), { force: true });
+  const r = await runScript(['--to', WID, '--text', '/exit', '--timeout', '2', '--queue', '--deadline', '8'], FAST_POLL);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await waiterEnded();
+  assert.deepEqual(await calls(), [], await queueLog());
+  assert.match(await queueLog(), /queued waiter exit rc=23/);
+});
+test('(d) an unbounded --queue waiter holds /exit through background work and sends it once truly idle', async () => {
+  await onBackground('busy', BG.OWN_TURN_WITH_BACKGROUND);
+  await fs.rm(QUEUE_LOG(), { force: true });
+  const r = await runScript(['--to', WID, '--text', '/exit', '--timeout', '2', '--queue'], FAST_POLL);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await new Promise((res) => setTimeout(res, 3000));
+  const early = await calls();
+  const running = !/queued waiter exit rc=/.test(await queueLog());
+  await fs.writeFile(path.join(claudeDir, 'sessions', `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: SID, cwd: CWD, status: 'idle' }));
+  await fs.rm(path.join(stateDir, 'screen'));
+  await waiterEnded();
+  assert.deepEqual(early, [], 'nothing typed while only background work ran');
+  assert.ok(running, 'the waiter held the command rather than dropping it');
+  assert.deepEqual(await calls(), ['burst'], await queueLog());
+});
+// Controls: everything else keeps the delivery.
+for (const text of [MSG, '/rename x']) {
+  for (const [how, flags] of SEND_PATHS) {
+    test(`(d) control: ${JSON.stringify(text.slice(0, 20))} (${how}) still reaches a seat idle only by background work`, async () => {
+      await onBackground();
+      const r = await sendText(text, flags);
+      assert.equal(r.code, 0, `${r.out}${r.err}`);
+      assert.ok((await calls()).length > 0, `${r.err}${await queueLog()}`);
+    });
+  }
+}
+for (const text of ['/newer', '/clear-cache', '/exit-plan', 'exit the loop when the tests pass', 'please run /exit later']) {
+  test(`(d) control: ${JSON.stringify(text)} is no ending command and is delivered`, async () => {
+    await onBackground();
+    const r = await sendText(text, []);
+    assert.notEqual(r.code, 23, `${r.out}${r.err}`);
+    assert.ok((await calls()).length > 0, r.err);
+  });
+}
+for (const [how, flags] of SEND_PATHS) {
+  test(`(d) control: /exit (${how}) still works on a truly idle seat`, async () => {
+    await reset('burst');
+    await fs.writeFile(path.join(stateDir, 'screen_dyn'), '');
+    await fs.writeFile(path.join(stateDir, 'rule'), '─'.repeat(60));
+    const r = await sendText('/exit', flags);
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.deepEqual(await calls(), ['burst'], await queueLog());
+  });
+}
+test('(d) control: --now /exit into its own turn with no background work is sent, as before', async () => {
+  const rule = '─'.repeat(60);
+  await onBackground('busy', ['✢ Working… (8s)', '', rule, BG.EMPTY_PROMPT, rule, '  esc to interrupt'].join('\n'));
+  const r = await sendText('/exit', ['--now']);
+  assert.notEqual(r.code, 23, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst'], r.err);
+});
+
+// ---- a compacting, mid-turn or drafted seat is never read as at its prompt ----
+for (const flags of [[], ['--wait-idle', '2']]) {
+  const how = flags[0] ?? 'no mode flag';
+  for (const [name, screen] of [
+    ['screen A, compacting with a draft', BG.COMPACTING_WITH_DRAFT],
+    ['screen B, compacting with a clipped footer', BG.COMPACTING_CLIPPED],
+    ['screen C, a spinner above a task list with a draft', BG.SPINNER_ABOVE_TASKS_WITH_DRAFT],
+    ['a draft under the waiting line', BG.WAITING_WITH_DRAFT],
+    ['only the esc hint', BG.ONLY_ESC_HINT['esc on the first line']],
+    ['only a spinner line', BG.ONLY_SPINNER['a multi-word label']],
+    ['only a clipped footer', BG.ONLY_FOOTER_UNPROVEN['clipped after the task count']],
+    ['only a draft', BG.ONLY_DRAFT['a draft']],
+  ]) {
+    test(`(b) ${name}: ${how} types nothing`, async () => {
+      await reset('burst', 'busy');
+      await fs.writeFile(path.join(stateDir, 'screen'), screen);
+      const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '3', ...flags]);
+      assert.equal(r.code, flags.length === 0 ? 7 : 5, `${r.out}${r.err}`);
+      assert.deepEqual(await calls(), []);
+    });
+  }
+}
+
+for (const [name, flags] of [['--now', ['--now']], ['--idle-when', ['--idle-when', 'bypass permissions']]]) {
+  for (const [what, screen] of [
+    ['a draft under the waiting line', BG.WAITING_WITH_DRAFT],
+    ['a draft in a compacting seat', BG.COMPACTING_WITH_DRAFT],
+    ['a composer that cannot be parsed', BG.ONLY_DRAFT['a composer row that cannot be parsed']],
+  ]) {
+    test(`(b) ${name} never submits ${what}: exit 11, nothing sent`, async () => {
+      await reset('burst', 'busy');
+      await fs.writeFile(path.join(stateDir, 'screen'), screen);
+      const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '3', ...flags]);
+      assert.equal(r.code, 11, `${r.out}${r.err}`);
+      assert.deepEqual(await calls(), []);
+    });
+  }
+}
+
+test('(b) a draft typed after the busy check is not submitted by a bare send', async () => {
+  // The draft appears at the n-th screen read; one n is the chokepoint's own read.
+  let refused = false;
+  for (let at = 2; at <= 8 && !refused; at += 1) {
+    await reset('burst', 'busy');
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+    await fs.writeFile(path.join(stateDir, 'screen_late'), BG.ONLY_DRAFT['a draft']);
+    await fs.writeFile(path.join(stateDir, 'late_at'), String(at));
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '2']);
+    if (r.code !== 11) continue;
+    assert.match(r.err, /composer holds text/);
+    assert.deepEqual(await calls(), []);
+    refused = true;
+  }
+  assert.ok(refused, 'no read refused the late draft');
+});
+
+test('(b) an unbounded waiter with --idle-when waits a draft out instead of dropping the send', async () => {
+  await reset('burst', 'busy');
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.ONLY_DRAFT['a draft']);
+  await fs.writeFile(path.join(stateDir, 'screen_late'), BG.BACKGROUND_AT_PROMPT);
+  await fs.writeFile(path.join(stateDir, 'late_at'), '14');
+  const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '3', '--idle-when', 'bypass permissions'], { KITTY_SEND_WAIT_UNBOUNDED: '1', KITTY_SEND_POLL_MS: '100', KITTY_SEND_POLL_CAP_MS: '100' });
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['text']);
+  const typedAt = Number(await fs.readFile(path.join(stateDir, 'sent_at'), 'utf8'));
+  assert.ok(typedAt >= 14, `typed at screen read ${typedAt}, while the draft was there`);
+});
+
+// ---- a message never approves a prompt that opened after it was typed --------
+const promptAfter = async (when, { screen, waiting = false } = {}) => {
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  if (screen != null) await fs.writeFile(path.join(stateDir, `after_${when}`), screen);
+  if (waiting) {
+    await fs.writeFile(path.join(stateDir, 'record_path'), path.join(claudeDir, 'sessions', `${process.pid}.json`));
+    await fs.writeFile(path.join(stateDir, 'waiting_record'), JSON.stringify({ pid: process.pid, sessionId: SID, cwd: CWD, status: 'waiting' }));
+    await fs.writeFile(path.join(stateDir, 'waiting_at'), when);
+  }
+};
+const PROMPTS = [
+  ['a permission prompt with the record still busy', { screen: BG.PERMISSION_PROMPT }],
+  ['a permission prompt without its footer', { screen: BG.PERMISSION_PROMPT_NO_FOOTER }],
+  ['a waiting record over a screen not yet redrawn', { waiting: true }],
+];
+for (const [name, opts] of PROMPTS) {
+  for (const flags of [[], ['--now'], ['--wait-idle', '4']]) {
+    test(`(c) ${name}, opened after the text, gets no Enter (${flags[0] ?? 'no mode flag'})`, async () => {
+      await reset('enter', 'busy');
+      await promptAfter('text', opts);
+      const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '4', ...flags]);
+      assert.deepEqual(await calls(), ['text'], 'an Enter would have selected Yes');
+      assert.equal(r.code, 3, `${r.out}${r.err}`);
+      assert.match(r.err, /Enter withheld/);
+    });
+  }
+  test(`(c) ${name}, opened after the first Enter, gets no second one`, async () => {
+    await reset('eat1', 'busy');
+    await promptAfter('enter', opts);
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '5']);
+    assert.deepEqual(await calls(), ['text', 'enter'], 'the retry would have selected Yes');
+    assert.equal(r.code, 3, `${r.out}${r.err}`);
+    assert.match(r.err, /Enter withheld/);
+  });
+}
+
+test('(c) a chip gets no Enter under a prompt, in a window with no session record', async () => {
+  await reset('never');
+  await fs.writeFile(path.join(stateDir, 'nonclaude'), '');
+  await fs.writeFile(path.join(stateDir, 'after_text'), `[Pasted text #1 +2 lines]\n${BG.PERMISSION_PROMPT}`);
+  const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '3']);
+  assert.deepEqual(await calls(), ['burst'], 'the chip Enter would have selected Yes');
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
+  assert.match(r.err, /Enter withheld/);
+});
+
+test('(c) the stranded-chip recovery presses no Enter without a composer on the screen', async () => {
+  await reset('never');
+  await fs.rm(path.join(claudeDir, 'sessions', `${process.pid}.json`));
+  await fs.writeFile(path.join(stateDir, 'screen'), `[Pasted text #1 +2 lines]\n${BG.PERMISSION_PROMPT_NO_FOOTER}`);
+  const record = path.join(stateDir, 'kitty-send-stranded', `stranded-${WID}`);
+  await fs.mkdir(path.dirname(record), { recursive: true });
+  await fs.writeFile(record, `pid=${process.pid}\ncreated=\ntime=1\nchips=1 \n`);
+  try {
+    const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '2']);
+    assert.deepEqual(await calls(), []);
+    assert.equal(r.code, 11, `${r.out}${r.err}`);
+    assert.match(r.err, /Enter withheld/);
+  } finally {
+    await fs.rm(record, { force: true });
+  }
+});
+
+test('(a) the Enter still follows text typed to a background-idle seat', async () => {
+  await reset('enter', 'busy');
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await fs.writeFile(path.join(stateDir, 'after_text'), BG.typedInto(MSG));
+  const r = await runScript(['--to', WID, '--text', MSG, '--timeout', '8']);
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['text', 'enter']);
+});
+
+for (const [status, flags] of [['idle', []], ['busy', ['--now']]]) {
+  test(`(c) a slash command, whose Enter goes with its text, needs a composer on the screen (${status}${flags.length ? ' --now' : ''})`, async () => {
+    await reset('burst', status);
+    await fs.writeFile(path.join(stateDir, 'screen'), BG.PERMISSION_PROMPT_NO_FOOTER);
+    const r = await runScript(['--to', WID, '--text', '/rename x', ...flags, '--timeout', '2']);
+    assert.deepEqual(await calls(), [], 'its Enter would have selected Yes');
+    assert.equal(r.code, 11, `${r.out}${r.err}`);
+  });
+}
+
+test('(c) the slash retry gets no Enter once the record says waiting', async () => {
+  await reset('never');
+  await fs.writeFile(path.join(stateDir, 'screen_dyn'), '');
+  await fs.writeFile(path.join(stateDir, 'rule'), '─'.repeat(40));
+  await fs.writeFile(path.join(stateDir, 'record_path'), path.join(claudeDir, 'sessions', `${process.pid}.json`));
+  await fs.writeFile(path.join(stateDir, 'waiting_record'), JSON.stringify({ pid: process.pid, sessionId: SID, cwd: CWD, status: 'waiting' }));
+  await fs.writeFile(path.join(stateDir, 'waiting_at'), 'text');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--timeout', '4']);
+  assert.deepEqual(await calls(), ['burst'], 'no extra Enter');
+  assert.equal(r.code, 16, `${r.out}${r.err}`);
 });
 
 test('a busy Claude tab parked by --idle-when remains pending, not falsely delivered', async () => {

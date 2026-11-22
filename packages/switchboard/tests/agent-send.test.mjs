@@ -22,6 +22,7 @@ import path from 'node:path';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import * as BG from './fixtures/claude-background-screens.mjs';
 import {
   ack,
   appendMessage,
@@ -1960,6 +1961,176 @@ for (const args of [['--now'], ['--stop'], []]) {
     assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'exactly one queued row');
     assert.match(stderr, /next tool call/);
     assert.doesNotMatch(stderr, /next prompt/);
+  });
+}
+
+// Claude Code records `busy` also after its turn has ended while background
+// agents still work; the seat then waits at an empty prompt and answers a typed
+// message at once. Queued rows to such a seat sat undelivered for up to two
+// hours. The screen tells that state from its own turn
+// (fixtures/claude-background-screens.mjs); a dialog stays held.
+for (const args of [['--now'], []]) {
+  test(`(a) ${args[0] ?? 'a bare send'} to a seat at its prompt with only background agents (record busy) is typed`, async () => {
+    const { code, killed, stderr, argv } = await queueSend(['--to', '991001', ...args], {
+      title: 'my renamed seat', status: 'busy', screen: BG.BACKGROUND_AT_PROMPT,
+      envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10' },
+    });
+    assert.equal(killed, false, stderr);
+    assert.ok(argv, `kitty-send ran: ${stderr}`);
+    assert.equal(code, 0, stderr);
+  });
+}
+
+test('(a) --queue to a seat at its prompt with only background agents (record busy) is typed in and exits 0', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: 'my renamed seat', status: 'busy', screen: BG.BACKGROUND_AT_PROMPT_TITLED,
+  });
+  assert.equal(killed, false, `the row was never delivered to a seat waiting at its prompt: ${stderr}`);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
+  assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  assert.equal(typedRows().length, 1);
+});
+
+test('(a) a row queued during its own turn is typed once the turn ends and only background agents run', async () => {
+  const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--queue'], {
+    title: 'my renamed seat', status: 'busy', screen: BG.OWN_TURN_WITH_BACKGROUND,
+    envExtra: { AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' },
+    whileRunning: async () => {
+      await sleep(2500);
+      assert.equal(fs.existsSync(fallbackArgv), false, 'nothing typed while its own turn ran');
+      fs.writeFileSync(path.join(binDir, 'queue-screen'), BG.BACKGROUND_AT_PROMPT);
+    },
+  });
+  assert.equal(killed, false, stderr);
+  assert.equal(code, 0, stderr);
+  assert.ok(argv?.includes('--wait-idle'), `argv: ${argv}`);
+  assert.equal(typedRows().length, 1);
+});
+
+// A command that ends or wipes the conversation is refused (exit 23, as --retire
+// and --close give) where the seat is idle only because background work runs.
+const withoutConsumer = async (fn) => {
+  const saved = fs.readFileSync(presFile, 'utf-8');
+  try {
+    writePresence([{ sessionId: 's1', cwd: '/repo/a' }]);
+    return await fn();
+  } finally { fs.writeFileSync(presFile, saved); }
+};
+const SEAT_KINDS = [['with a mailbox', (fn) => fn()], ['with no mailbox consumer', withoutConsumer]];
+const endingSend = (args, text, opts = {}) => queueSend(['--to', '991001', ...args], {
+  title: 'my renamed seat', status: 'busy', screen: BG.BACKGROUND_AT_PROMPT, killAfterMs: 6000, text,
+  envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' },
+  ...opts,
+});
+for (const [kind, within] of SEAT_KINDS) {
+  for (const command of ['/exit', '/quit', '/clear', '/new']) {
+    for (const args of [[], ['--now'], ['--stop'], ['--queue']]) {
+      test(`(d) ${command} (${args[0] ?? 'bare'}) to a seat ${kind}, idle only by background work, exits 23`, () => within(async () => {
+        const { code, stderr, argv } = await endingSend(args, command);
+        assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+        assert.equal(code, 23, stderr);
+        assert.match(stderr, /background/);
+        assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'nothing is queued');
+        assert.equal(typedRows().length, 0);
+      }));
+    }
+  }
+  for (const text of ['  /clear my notes ', 'exit']) {
+    test(`(d) ${JSON.stringify(text)} to a seat ${kind}, idle only by background work, exits 23`, () => within(async () => {
+      const { code, stderr, argv } = await endingSend([], text);
+      assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+      assert.equal(code, 23, stderr);
+    }));
+  }
+  test(`(d) /exit to a seat ${kind} with a background shell (status shell) exits 23`, () => within(async () => {
+    const { code, stderr, argv } = await endingSend([], '/exit', { status: 'shell', screen: EMPTY_COMPOSER });
+    assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+    assert.equal(code, 23, stderr);
+  }));
+  test(`(d) --no-wait /exit to a seat ${kind}, idle only by background work, exits 23 and queues nothing`, () => within(async () => {
+    const { code, stderr } = await endingSend(['--no-wait'], '/exit');
+    assert.equal(code, 23, stderr);
+    assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), []);
+  }));
+  // The seat can change after agent-send looked: kitty-send's own refusal passes through.
+  for (const [args, text] of [[[], '/exit'], [['--now'], '/exit'], [['--queue'], 'exit']]) {
+    test(`(d) kitty-send exit 23 (${args[0] ?? 'bare'}) to a seat ${kind} passes through, never re-queued`, () => within(async () => {
+      const { code, stderr, argv } = await endingSend(args, text, {
+        status: 'idle', screen: EMPTY_COMPOSER,
+        envExtra: { AGENT_SEND_VERBOSE: '', AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', KITTY_SEND_STUB_EXIT: '23' },
+      });
+      assert.ok(argv, `kitty-send did not run: ${stderr}`);
+      assert.equal(code, 23, stderr);
+      assert.match(stderr, /kitty-send exit 23 .*nothing was sent/);
+      assert.deepEqual(readUnacked(KEY_S1, { dir: mboxDir }), [], 'a refused command is not put back');
+    }));
+  }
+  for (const text of ['an ordinary message', '/rename x']) {
+    test(`(d) control: ${JSON.stringify(text)} still reaches a seat ${kind}, idle only by background work`, () => within(async () => {
+      const { code, stderr, argv } = await endingSend([], text);
+      assert.ok(argv, `kitty-send did not run: ${stderr}`);
+      assert.equal(code, 0, stderr);
+    }));
+  }
+  test(`(d) control: /exit still reaches a truly idle seat ${kind}`, () => within(async () => {
+    const { code, stderr, argv } = await endingSend([], '/exit', { status: 'idle', screen: EMPTY_COMPOSER });
+    assert.ok(argv, `kitty-send did not run: ${stderr}`);
+    assert.equal(code, 0, stderr);
+  }));
+}
+test('(d) /exit queued during its own turn is never typed once only background work runs', async () => {
+  const { stderr, argv } = await endingSend(['--queue'], '/exit', {
+    screen: BG.OWN_TURN_WITH_BACKGROUND,
+    whileRunning: async () => {
+      await sleep(2000);
+      fs.writeFileSync(path.join(binDir, 'queue-screen'), BG.BACKGROUND_AT_PROMPT);
+    },
+  });
+  assert.equal(argv, null, `kitty-send ran: ${stderr}`);
+  assert.equal(typedRows().length, 0);
+});
+
+const heldOn = async (args, opts) => {
+  const { killed, stderr, argv } = await queueSend(['--to', '991001', ...args], {
+    title: 'my renamed seat', killAfterMs: 5000,
+    envExtra: { AGENT_SEND_BUSY_WAIT_S: '1', AGENT_SEND_BUDGET_S: '10', AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' },
+    ...opts,
+  });
+  assert.equal(argv, null, `kitty-send ran, so text was typed: ${argv}`);
+  assert.equal(typedRows().length, 0);
+  return { killed, stderr };
+};
+
+for (const args of [['--queue'], ['--now'], []]) {
+  test(`(b) ${args[0] ?? 'a bare send'} to a seat in its own turn with background agents (record busy) types nothing`, async () => {
+    await heldOn(args, { status: 'busy', screen: BG.OWN_TURN_WITH_BACKGROUND });
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
+  });
+}
+for (const args of [['--queue'], ['--now'], ['--stop'], []]) {
+  for (const [name, screen] of [
+    ['screen A', BG.COMPACTING_WITH_DRAFT],
+    ['screen B', BG.COMPACTING_CLIPPED],
+    ['screen C', BG.SPINNER_ABOVE_TASKS_WITH_DRAFT],
+    ['a draft under the waiting line', BG.WAITING_WITH_DRAFT],
+    ['only a draft', BG.ONLY_DRAFT['a draft']],
+  ]) {
+    test(`(b) ${args[0] ?? 'a bare send'} to ${name} (record busy) types nothing`, async () => {
+      await heldOn(args, { status: 'busy', screen });
+      assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
+    });
+  }
+}
+// --now and a bare send leave the dialog question to kitty-send's typing proof,
+// the last read before a keystroke (tests/kitty-send-claude.test.mjs covers it
+// for this screen); the queue wait answers it here.
+for (const status of ['waiting', 'busy']) {
+  test(`(c) --queue to a seat showing a question while background agents run (record ${status}) types nothing`, async () => {
+    const { stderr } = await heldOn(['--queue'], { status, screen: BG.QUESTION_WITH_BACKGROUND, envExtra: { AGENT_SEND_VERBOSE: '1', AGENT_SEND_QUEUE_POLL_MS: '300', AGENT_SEND_QUEUE_POLL_CAP_MS: '600' } });
+    // A busy record with a dialog drawn is not idle, so the wait never gets as far as the proof.
+    if (status === 'waiting') assert.match(stderr, /status waiting/);
+    assert.equal(readUnacked(KEY_S1, { dir: mboxDir }).length, 1, 'the row stays queued for its drain');
   });
 }
 

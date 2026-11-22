@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
+import * as BG from './fixtures/claude-background-screens.mjs';
 
 const run = promisify(execFile);
 const SCRIPT = fileURLToPath(new URL('../bin/claude-tab.sh', import.meta.url));
@@ -60,6 +61,7 @@ before(async () => {
       '            [ -x "$state/on-launch" ] && "$state/on-launch"',
       '            echo ' + WID + ' ;;',
       '  @/close-window) printf \'%s\\n\' "$*" > "$state/closed" ;;',
+      '  @/get-text) [ -f "$state/screen" ] && cat "$state/screen" ;;',
       'esac',
       'exit 0',
       '',
@@ -78,7 +80,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  for (const f of ['launch-args', 'closed', 'ls.json', 'ls-fail-after', 'ls-count', 'ls-fail-after-launch', 'ls-after-count', 'launched', 'claim-calls-launch', 'fake-claim-launch.mjs', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'on-sleep', 'hang', 'kitty-calls', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'closed', 'screen', 'ls.json', 'ls-fail-after', 'ls-count', 'ls-fail-after-launch', 'ls-after-count', 'launched', 'claim-calls-launch', 'fake-claim-launch.mjs', 'switchboard.db', 'switchboard.db-wal', 'switchboard.db-shm', 'nokitty', 'gone', 'session.jsonl', 'on-launch', 'on-sleep', 'hang', 'kitty-calls', 'sessions', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { recursive: true, force: true });
   }
   await fs.rm(projects, { recursive: true, force: true });
@@ -616,6 +618,51 @@ test('--retire refuses the caller\'s own window with exit 22, even with a valid 
   assert.equal(await exists('closed'), false);
 });
 
+// Idle for delivery is not idle for closing: the window's background agents die with it.
+test('--retire refuses a seat at its prompt while its background agents still run, with exit 23', async () => {
+  await handover();
+  await windows({ status: 'busy' });
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  const r = await retire();
+  assert.equal(r.code, 23, r.err);
+  assert.match(r.err, /background agents or tasks/);
+  assert.equal(await exists('closed'), false);
+  assert.equal((await handoverRows())[0].retired_at, null);
+});
+
+test('--list names why a seat with live background work reads idle', async () => {
+  await handover();
+  await windows({ status: 'busy' });
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await fs.writeFile(path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid), `${OTHER_WID} ${other.pid} @other-seat claude: background seat\n`);
+  const r = await tab(['--list']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /state=idle [^\n]*reason=claude-background/);
+});
+
+for (const [name, screen] of [
+  ['compacting', BG.COMPACTING_CLIPPED],
+  ['holding a draft', BG.ONLY_DRAFT['a draft']],
+]) {
+  test(`--retire refuses a seat ${name} over background agents, with exit 23`, async () => {
+    await handover();
+    await windows({ status: 'busy' });
+    await fs.writeFile(path.join(stateDir, 'screen'), screen);
+    const r = await retire();
+    assert.equal(r.code, 23, r.err);
+    assert.equal(await exists('closed'), false);
+  });
+  test(`--close --after-loka refuses a seat ${name} over background agents, with exit 23`, async () => {
+    await windows({ status: 'busy' });
+    await fs.writeFile(path.join(stateDir, 'screen'), screen);
+    await seatTranscript();
+    await lokaDone();
+    const r = await closeFinished();
+    assert.equal(r.code, 23, r.err);
+    assert.equal(await exists('closed'), false);
+  });
+}
+
 test('--retire refuses a busy seat with exit 23, and a seat whose state is unknown', async () => {
   await handover();
   await windows({ status: 'busy' });
@@ -849,6 +896,17 @@ test('--close --after-loka refuses a busy seat with exit 23 even with a marker o
   const r = await closeFinished();
   assert.equal(r.code, 23);
   assert.match(r.err, /not idle/);
+  assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka refuses a seat at its prompt while its background agents still run, with exit 23', async () => {
+  await windows({ status: 'busy' });
+  await fs.writeFile(path.join(stateDir, 'screen'), BG.BACKGROUND_AT_PROMPT);
+  await seatTranscript();
+  await lokaDone();
+  const r = await closeFinished();
+  assert.equal(r.code, 23, r.err);
+  assert.match(r.err, /background agents or tasks/);
   assert.equal(await exists('closed'), false);
 });
 

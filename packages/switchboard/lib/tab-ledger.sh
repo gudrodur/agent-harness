@@ -128,7 +128,9 @@ tab_ledger_list() {
       if [ -n "$st" ]; then
         tl=$(printf '%s' "$stline" | grep -o 'tool=[^ ]*' | head -1)
         ag=$(printf '%s' "$stline" | grep -o 'age=[^ ]*' | head -1)
-        stab="$st ${tl:-tool=-} ${ag:-age=-}"
+        # The one reason shown: that idle is not safe to close (exit 23).
+        rs=$(printf '%s' "$stline" | grep -o 'reason=claude-background' | head -1)
+        stab="$st ${tl:-tool=-} ${ag:-age=-}${rs:+ $rs}"
       fi
     fi
     printf '%-6s %-8s %-12s %-28s %s\n' "$id" "$s" "$launcher" "$stab" "$title"
@@ -238,9 +240,16 @@ _tab_ledger_release_gone() {
   sed -i "/^$1 /d" "$STATE" 2>/dev/null
   claim_cli --release-owner "kitty:$1" >/dev/null 2>&1 || true
 }
+# Idle to type into is not idle to close: a seat at its prompt with background
+# agents or tasks (reason=claude-background) loses that work with the window.
 _tab_ledger_require_idle() {
-  local st
-  st=$("$TAB_LEDGER_BIN/tab-state.sh" "$1" 2>/dev/null | sed -n 's/^window [0-9]* //p' | grep -o 'state=[^ ]*' | head -1)
+  local line st
+  line=$("$TAB_LEDGER_BIN/tab-state.sh" "$1" 2>/dev/null | sed -n 's/^window [0-9]* //p')
+  case " $line " in
+    *" reason=claude-background "*)
+      die "window $1 is not idle enough to close (its background agents or tasks still run and would end with it) — $2; retry when they have finished." 23 ;;
+  esac
+  st=$(printf '%s\n' "$line" | grep -o 'state=[^ ]*' | head -1)
   [ "$st" = "state=idle" ] \
     || die "window $1 is not idle (${st:-state=unknown}) — $2; retry when it is idle." 23
 }

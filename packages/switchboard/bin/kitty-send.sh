@@ -24,7 +24,9 @@
 #      (the only proofs that name the tab receiving the text)
 #   1  usage / precondition error (no such window, a refused flag pair)
 #   3  sent, but could not prove it landed (nothing is retried for you).
-#      The window WAS typed into: never re-queue or resend blind.
+#      The window WAS typed into: never re-queue or resend blind. Also when
+#      the Enter after the text was withheld ("Enter withheld"): a prompt had
+#      opened, or the screen could no longer prove that none had.
 #   4  the target is showing a selection dialog, or its session record says
 #      `waiting`/`blocked` — NOTHING WAS SENT, in EVERY mode (--now included;
 #      see below)
@@ -49,8 +51,11 @@
 #      --queue, --wait-idle, --deadline and the detached waiter) did not pass:
 #      a Claude Code tab that is not idle, a draft in the composer, or node / the
 #      module missing (a tab with no Claude Code process gets the dialog check
-#      only; a "/" text is not refused here). The window was not
-#      typed into, so a caller may put the message back safely. (Until
+#      only; a "/" text is not refused here). In the other modes (a bare
+#      send, --now, --idle-when): a Claude Code tab recorded busy whose
+#      composer holds text. Also a recovery Enter withheld, and a slash command
+#      (its Enter goes with it) with no composer on the screen. The window was
+#      not typed into, so a caller may put the message back safely. (Until
 #      2026-11-13 these two shared exit 3 with "sent, unproven".)
 #   10 typed, not proven submitted: the window has no session record to read,
 #      so the only proof is the screen. The text reached the window (it
@@ -61,10 +66,19 @@
 #      "delivered", and never resend blind: the text may already sit in the
 #      composer.
 #   16 a slash command was typed into a Claude Code tab and its composer STILL
-#      holds the command text after SLASH_ENTER_TRIES extra Enters: typed, not
+#      holds the command text after SLASH_ENTER_TRIES extra Enters, or the
+#      next Enter was withheld because a prompt may have opened: typed, not
 #      proven submitted. Same meaning as 10 for the caller (look at the window,
 #      never resend blind); a distinct code because here the text is known to
 #      sit unsubmitted in the composer.
+#   23 a command that ends or wipes the conversation (/exit, /quit, /clear,
+#      /new, /reset, or a bare exit, quit, :q, :q!, :wq, :wq!) for a Claude Code
+#      seat that is idle only because background work runs, or, where it would
+#      be typed mid-turn (--now, --idle-when), for a turn with such work listed.
+#      NOTHING WAS SENT, in every mode; --queue refuses before it starts a
+#      waiter. A waiter queued earlier refuses too (23 in its log), except an
+#      unbounded one, which holds it until no background work runs. The same
+#      code, for the same loss, as claude-tab.sh --retire and --close.
 #   12 kitty remote control did not answer (a timeout or an unreachable
 #      socket) — NOTHING WAS SENT; agent-send reads it as the cue to point a
 #      Claude Code caller at SendMessage. (Until 2026-11-13 this was exit 1.)
@@ -276,6 +290,10 @@ Options:
               a pattern: `pkill -f` with the target's own argv also matches
               the shell running the pkill (seen twice, exit 144).
   --quiet     only errors on stderr
+
+No option, --now included, types a command that ends or wipes the
+conversation (/exit, /quit, /clear, /new, /reset, bare exit or quit) into a
+Claude Code seat over its background work: exit 23, nothing sent.
 KITTY_SEND_USAGE
 }
 
@@ -428,9 +446,10 @@ title_busy() {
 # module proves a queued send's target idle with an empty composer, so the two
 # questions cannot drift apart.
 TYPING_PROOF="${KITTY_SEND_TYPING_PROOF:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/typing-proof.mjs}"
-# run_proof <window id> <idle|dialog>: sets PROOF_RC (0 proven/clear, 2 refused,
+# run_proof <window id> <idle|dialog|enter|ending> [proof flag]: sets PROOF_RC (0 proven/clear, 2 refused,
 # 3 a dialog is open, anything else = the proof could not run) and PROOF_REASON.
-# Neither mode reads stdin (the slash-text refusal is agent-send's). Node or the module missing is
+# Only `ending` reads stdin, the text about to be typed (the general slash-text refusal is agent-send's);
+# its own codes are 0 clear, 2 only background work runs, 3 a turn with such work, else it could not tell. Node or the module missing is
 # PROOF_RC=127: callers refuse, they never fall back to typing unproven.
 # KITTY_SEND_TYPING_PROOF is a test seam (a path to a stand-in or a missing
 # file); production never sets it.
@@ -441,28 +460,55 @@ run_proof() {
     PROOF_RC=127; PROOF_REASON="the typing proof ($TYPING_PROOF, run by node) is not available"
     return 0
   fi
-  if [ "$2" = idle ]; then
+  if [ "$2" = ending ]; then
+    # A here-string, so a proof that never reads stdin breaks no pipe.
+    PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode ending --stdin 2>&1 >/dev/null <<<"$TEXT") || PROOF_RC=$?
+  elif [ "$2" = idle ]; then
     PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode idle --other-tabs ${3:-} 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
   else
-    PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode dialog 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
+    PROOF_REASON=$(node "$TYPING_PROOF" --window "$1" --mode "$2" ${3:-} 2>&1 >/dev/null </dev/null) || PROOF_RC=$?
   fi
 }
 # proof_gate [--no-composer]: the verdict for the keystroke about to go out.
 # A mode that CLAIMS the seat is idle (--queue, --wait-idle, --deadline, the
 # detached waiter; not --idle-when, whose caller states its own parked proof)
-# gets the Claude Code idle proof; every other mode the dialog verdict only. A
-# dialog is refused in EVERY mode (exit 4); no proof, or no node, exits 11.
+# gets the Claude Code idle proof; every other mode the dialog verdict, plus
+# --refuse-draft: a seat recorded busy with text in its composer is refused,
+# or the Enter would submit that draft. A dialog is refused in EVERY mode
+# (exit 4); no proof, or no node, exits 11.
 # --no-composer is for the stranded-chip recovery's Enter, which acts on a
 # composer that holds kitty-send's own chip by design.
 proof_gate() {
-  local mode=dialog
+  local mode=dialog flag="${1:-}"
   if { [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; } && [ -z "$IDLE_WHEN" ]; then mode=idle; fi
-  run_proof "$WID" "$mode" "${1:-}"
+  if [ "$mode" = dialog ] && [ -z "$flag" ]; then flag=--refuse-draft; fi
+  run_proof "$WID" "$mode" "$flag"
   case "$PROOF_RC" in
     0) ;;
     3) die "refusing to type into a dialog (nothing was sent): ${PROOF_REASON} — answer it in the window" 4 ;;
     *) die "the typing proof did not pass (nothing was sent): ${PROOF_REASON:-exit $PROOF_RC}" 11 ;;
   esac
+}
+# The one refusal of a command that ends or wipes the conversation where
+# background work runs (exit 23, as claude-tab.sh --retire and --close give).
+refuse_ending() {
+  die "refusing to type a command that ends or wipes the conversation (nothing was sent): ${PROOF_REASON}; send it once no background work runs" 23
+}
+# enter_allowed: asked immediately before EVERY Enter that is not typed in
+# one call with its text, because a prompt can open in between and that Enter
+# would select its highlighted "Yes". The first refusal holds for the whole
+# send (ENTER_BLOCKED says why): no later Enter is tried.
+ENTER_BLOCKED=""
+enter_allowed() {
+  [ -z "$ENTER_BLOCKED" ] || return 1
+  if copilot_dialog_open "$WID"; then
+    ENTER_BLOCKED="a Copilot permission dialog is open"
+    return 1
+  fi
+  run_proof "$WID" enter
+  [ "$PROOF_RC" != 0 ] || return 0
+  ENTER_BLOCKED="${PROOF_REASON:-the proof exited $PROOF_RC}"
+  return 1
 }
 # 0 = dialog on screen, 1 = none, 2 = the screen could not be read. A failed
 # read is NOT "no dialog": failing open here would type into exactly the
@@ -741,6 +787,10 @@ fi
 # group, which is what lets --cancel kill the waiter and its sleep together
 # by pid and touch nothing else.
 if [ "$QUEUE" = 1 ]; then
+  # Refused here, not only in the waiter, whose exit the caller never sees. A
+  # turn that still runs is held instead; the waiter asks again before it types.
+  run_proof "$WID" ending
+  [ "$PROOF_RC" != 2 ] || refuse_ending
   # No bound -> UNBOUNDED. The old fixed 600 s default died
   # on any tab inside a pre-push suite ("target still busy after 600s", x4 on
   # 2026-09-05); an unbounded waiter delivers whenever the tab finally goes
@@ -798,11 +848,15 @@ WAIT_UNBOUNDED=0
 # "give up": a refusal at the chokepoint would exit 11 and drop a send whose
 # caller already got exit 0. Only a refusal (PROOF_RC 2) keeps it polling; a
 # proof that cannot run (127, a dialog) falls through to proof_gate, which
-# fails loudly.
+# fails loudly. A proven seat still holds a command that ends the conversation
+# while background work runs, or while that cannot be told.
 unbounded_proof_refuses() {
-  [ "$WAIT_UNBOUNDED" = 1 ] && [ -z "$IDLE_WHEN" ] || return 1
-  run_proof "$WID" idle
-  [ "$PROOF_RC" = 2 ]
+  [ "$WAIT_UNBOUNDED" = 1 ] || return 1
+  if [ -z "$IDLE_WHEN" ]; then run_proof "$WID" idle; else run_proof "$WID" dialog --refuse-draft; fi
+  [ "$PROOF_RC" != 2 ] || return 0
+  [ "$PROOF_RC" = 0 ] || return 1
+  run_proof "$WID" ending
+  [ "$PROOF_RC" != 0 ]
 }
 if [ "$WAIT_IDLE" -gt 0 ] || [ "$WAIT_UNBOUNDED" = 1 ]; then
   idle_deadline=$(( $(date +%s) + WAIT_IDLE ))
@@ -1119,6 +1173,7 @@ if [ "$STATE_KNOWN" = 0 ] && printf '%s' "$before_screen" | grep -qF -- '[Pasted
   if [ "$_owned" = 1 ]; then
     note "window $WID's composer already holds unsubmitted pasted text (chips ${_chips_before}) left by an earlier kitty-send — pressing Enter once to recover it"
     proof_gate --no-composer
+    enter_allowed || die "Enter withheld from window $WID's stranded chip (nothing was sent): $ENTER_BLOCKED. Look at the window first." 11
     press_enter "$WID"
     _rec_deadline=$(( $(date +%s) + TIMEOUT ))
     _cleared=0
@@ -1156,14 +1211,28 @@ CLAUDE_ENTERS=0
 # agent-send's --wait-idle on its withdraw path, not a gap between the last
 # idle poll and this line. A mode that CLAIMS the seat is idle (--queue,
 # --wait-idle, --deadline, the detached waiter) gets the full proof: Claude Code
-# tab, record status idle, no dialog, an empty composer; any other tab: the dialog
+# tab, at its prompt (claudeSeatState), no dialog, an empty composer; any other tab: the dialog
 # verdict only). A "/" text is NOT refused here: an explicit /rename or /compact
 # sent by a caller that means it must go through (agent-send's mailbox path
 # refuses it on its own). Every other mode (--now, a bare send, --idle-when, whose
-# caller states its own parked proof) gets the dialog verdict only: a busy
-# mid-turn seat stays allowed there and the composer is not read. A dialog is
-# refused in EVERY mode (exit 4); no proof, or no node, refuses exit 11.
+# caller states its own parked proof) gets the dialog verdict: a busy
+# mid-turn seat stays allowed there, but not one whose composer holds text
+# (exit 11). A dialog is refused in EVERY mode (exit 4); no proof, or no
+# node, refuses exit 11.
 proof_gate
+# A slash command goes out in one call with its Enter, so that Enter's proof
+# runs here: without a composer on the screen it could answer a prompt.
+if [ "$CLAUDE_TAB" = 1 ] && [ "$SLASH_SEND" = 1 ]; then
+  enter_allowed || die "Enter withheld from window $WID's slash command (nothing was sent): $ENTER_BLOCKED. Look at the window first." 11
+fi
+# The last check, keyed on the text and not on SLASH_SEND (--expect clears
+# that, and a bare "exit" is no slash).
+run_proof "$WID" ending
+case "$PROOF_RC" in
+  0) ;;
+  2|3) refuse_ending ;;
+  *) die "cannot type a command that ends the conversation (nothing was sent): ${PROOF_REASON:-the proof exited $PROOF_RC}" 11 ;;
+esac
 # From here the keystrokes are out. SENT=1 plus the EXIT trap is the one
 # mechanism that keeps the promise of the exit codes: any exit that is not one
 # this section chooses (0, 3, 8, 10, 16) becomes 3, "sent, delivery not proven". A
@@ -1188,7 +1257,8 @@ if { [ "$CLAUDE_TAB" = 1 ] || [ "$COPILOT_TAB" = 1 ]; } && [ "$SLASH_SEND" = 0 ]
     copilot_row_landed || row_landed=0
   fi
   if [ "$row_landed" = 0 ] \
-     && { [ "$CLAUDE_TAB" = 0 ] || [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; then
+     && { [ "$CLAUDE_TAB" = 0 ] || [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; } \
+     && enter_allowed; then
     kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
     CLAUDE_ENTERS=1
   fi
@@ -1235,7 +1305,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     if { [ "$COPILOT_TAB" = 1 ] || { [ "$CLAUDE_TAB" = 1 ] && { [ "$NOW" = 1 ] || [ "$WAS_BUSY_BEFORE_SEND" = 0 ]; }; }; } \
        && [ "$CLAUDE_ENTERS" = 1 ] \
        && [ "$(( $(date +%s) - LAST_ENTER_AT ))" -ge "$CLAUDE_ENTER_AFTER" ] \
-       && { [ "$COPILOT_TAB" = 0 ] || { copilot_composer_holds_text && ! copilot_busy "$WID" && ! copilot_dialog_open "$WID"; }; }; then
+       && { [ "$COPILOT_TAB" = 0 ] || { copilot_composer_holds_text && ! copilot_busy "$WID" && ! copilot_dialog_open "$WID"; }; } \
+       && enter_allowed; then
       kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
       CLAUDE_ENTERS=2
       note "no prompt row in window $WID's transcript yet: sent a second lone Enter"
@@ -1266,7 +1337,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # most once per send, and only a chip gone AND the fragment echoed confirms.
     chip_now=$(printf '%s' "$screen" | grep -oE 'Pastedtext#[0-9]+' | sort -u | tr '\n' ' ' || true)
     saw_chip=1
-    if [ "$ENTER_SENT" = 0 ]; then
+    if [ "$ENTER_SENT" = 0 ] && enter_allowed; then
       press_enter "$WID"
       ENTER_SENT=1
     fi
@@ -1336,6 +1407,10 @@ if [ "$SLASH_SEND" = 1 ] && [ "$CLAUDE_TAB" = 1 ] && win_record "$WID"; then
       note "typed the slash command into window $WID, but its composer still holds the text after $SLASH_ENTER_TRIES extra Enter(s): typed, not proven submitted. Look at the window before resending (exit 16)."
       exit 16
     fi
+    if ! enter_allowed; then
+      note "Enter withheld in window $WID: $ENTER_BLOCKED. The slash command is typed, not submitted: look at the window before resending (exit 16)."
+      exit 16
+    fi
     kitty @ send-text --match "id:$WID" $'\r' 2>/dev/null || true
     _slash_tries=$(( _slash_tries + 1 ))
     note "the composer of window $WID still holds the slash command: pressed Enter again ($_slash_tries of $SLASH_ENTER_TRIES)"
@@ -1354,6 +1429,12 @@ if [ "$confirmed" = 1 ]; then
   # invite a resend: the text may already sit in the composer.
   note "typed, not proven submitted in window $WID — ${where:-observed on screen} (no session file to read: nothing proves the target submitted it; look at the window before resending)"
   exit 10
+fi
+# An Enter was withheld: the text is typed and not submitted. Said before the
+# mid-turn verdict below, whose "pending in its steering queue" would be false.
+if [ -n "$ENTER_BLOCKED" ]; then
+  note "Enter withheld in window $WID: $ENTER_BLOCKED. The text is typed, not submitted: look at the window first, do not resend."
+  [ "$saw_chip" = 1 ] || exit 3
 fi
 # A chip survived the send (and the one Enter): the message reached the text
 # box but was never submitted, so this is exit 3 with the chip named — not a

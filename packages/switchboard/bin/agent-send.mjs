@@ -89,7 +89,7 @@ import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
-import { typingVerdict, proofVerdict, windowIsBusy as recordIsBusy, PROVEN, REFUSED } from '../lib/typing-proof.mjs';
+import { typingVerdict, proofVerdict, endingVerdict, windowIsBusy as recordIsBusy, PROVEN, REFUSED, ENDING_BACKGROUND } from '../lib/typing-proof.mjs';
 
 // --verbose / AGENT_SEND_VERBOSE: the trace of every step. Off, only the final
 // verdict line and errors reach stderr.
@@ -248,6 +248,10 @@ const usage = () => `Usage:
     15  --topic suppressed the send: the topic was already delivered to the
         recipient within --topic-window, so THIS message was not sent (benign
         when the earlier delivery is what you wanted; --force-topic sends anyway)
+    23  refused, nothing sent and nothing queued: a command that ends or wipes
+        the conversation (/exit, /quit, /clear, /new, /reset, bare exit or
+        quit) for a seat that is idle only because background work runs, in
+        every mode. Send it once that work has finished
     any other code is unexpected: treat the message as not delivered, and look
     at the tab before resending
 `;
@@ -265,6 +269,9 @@ const KITTY_RC_DOWN = 12;
 // 16: a slash command typed into a Claude Code tab still sits in its composer
 // after kitty-send's bounded extra Enters. Typed, not proven submitted, like 10.
 const KITTY_TYPED_UNSUBMITTED = 16;
+// 23: a command that ends or wipes the conversation, over background work.
+// Deliberately not in KITTY_SENT_NOTHING: that set is put back, this is refused.
+const KITTY_ENDING_REFUSED = 23;
 const KITTY_SENT_NOTHING = new Set([1, 4, 5, 6, 7, 9, 11, KITTY_RC_DOWN, 17]);
 // kitty-send's 11 and 12 are not agent-send's own 11 (--claim-role refused) and
 // 12 (--release-role refused): both leave as 1, "nothing sent".
@@ -776,6 +783,17 @@ const main = (argv) => {
   // --stop is an alias of --now for a busy seat: nothing is interrupted, the row
   // is queued. The words ride inside the one verdict line (never a second line).
   const stopNote = mode === 'stop' ? '--stop on a busy seat queues like --now; nothing is interrupted' : '';
+  // A command that ends or wipes the conversation, for a window idle only
+  // because background work runs: refused before a row is written, so none
+  // waits to fire later. kitty-send refuses again before it types (a title
+  // target, or a seat that changed since this read). A note is never a command.
+  const refuseEnding = (winId) => {
+    if (file != null || text.includes('\n') || !/^\d+$/.test(String(winId ?? ''))) return;
+    const v = endingVerdict(winId, text);
+    if (v.kind !== ENDING_BACKGROUND) return;
+    process.stderr.write(`agent-send: not sent to ${to}: the command ends or wipes the conversation and ${v.reason}; nothing was sent and nothing is queued; send it once that work has finished (exit ${KITTY_ENDING_REFUSED})\n`);
+    process.exit(KITTY_ENDING_REFUSED);
+  };
   // One kitty-send run; returns its exit status (null when a signal killed it).
   // requeue: the caller re-queues the row when kitty-send sent nothing, so this
   // function prints no verdict of its own for those codes (one line, not two).
@@ -828,6 +846,11 @@ const main = (argv) => {
     // On 0, 3, 8 and 10 agent-send prints its own single verdict line (below), so
     // kitty-send's chatter is trace; a failure it cannot explain still shows.
     if (holdErr && r.stderr?.length && ![0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) && !(requeue && KITTY_SENT_NOTHING.has(r.status) && r.status !== 1 && r.status !== 11 && r.status !== 17) && !(r.status === 7 && midTurnHeld)) process.stderr.write(r.stderr);
+    // Refused, not "try later": no caller may put it back or hand it to a waiter.
+    if (r.status === KITTY_ENDING_REFUSED) {
+      process.stderr.write(`agent-send: kitty-send exit ${r.status} for ${args[1]}: nothing was sent and nothing is queued: the command ends or wipes the conversation and background work runs; send it once that work has finished\n`);
+      process.exit(KITTY_ENDING_REFUSED);
+    }
     // The typed copy is a delivery the store must see (a --queue waiter only
     // started is not one). Best-effort: a failed record never fails the send.
     if (typedKey != null && ([0, 3, 8, 10, KITTY_TYPED_UNSUBMITTED].includes(r.status) || (r.status == null && r.signal != null)) && !args.includes('--queue')) {
@@ -903,6 +926,8 @@ const main = (argv) => {
   // the seat's own drain and the exit is 3; without one nothing is queued and
   // the exit is 1, so the sender knows the message did not go.
   const kittyFallback = (why, queueKey = null) => {
+    const t = recipient?.role != null ? recipient.beaconWindowId : to;
+    refuseEnding(t);
     // --no-wait only writes a mailbox row: never type, never wait on a proof.
     if (noWait) {
       if (queueKey == null) die(`${why}; --no-wait only queues, there is no mailbox to queue in, so nothing was sent and nothing is queued`);
@@ -913,7 +938,6 @@ const main = (argv) => {
       );
       process.exit(3);
     }
-    const t = recipient?.role != null ? recipient.beaconWindowId : to;
     if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
     const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null, when = 'at its next prompt') => {
@@ -1084,6 +1108,9 @@ const main = (argv) => {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
   }
+  // Where the row would be typed if nobody drains it.
+  const target = recipient.windowId ?? recipient.beaconWindowId ?? (/__/.test(to) || recipient.role != null ? null : to);
+  if (recipient.mailboxOnly !== true) refuseEnding(target);
   const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
   const row = appendMessage({ to: recipient.key, from, priority, text, topic, id: takeRowId() });
   const mbox = mailboxPath(recipient.key);
@@ -1255,7 +1282,6 @@ const main = (argv) => {
   // key whose beacon recorded no window id (a tab before its consumer
   // records one, or a cwd two sessions share) has nowhere to fall back to, so
   // the row stays queued for the consumer's next tool call, prompt or turn end.
-  const target = recipient.windowId ?? recipient.beaconWindowId ?? (/__/.test(to) || recipient.role != null ? null : to);
   if (target == null) {
     pendingLine(row.id, `agent-send: queued, recipient busy/parked for ${row.id} in ${mbox}; no kitty window for ${to}, so the row stays queued and is delivered at the recipient's next tool call, next prompt or when its current turn ends (exit 3: not delivered yet, do not resend; withdraw it with --cancel --id ${row.id}, or re-send with --to <window-id>)\n`);
     process.exit(3);
