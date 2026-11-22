@@ -283,6 +283,35 @@ test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.deepEqual(shellWords("echo '> note' >out"), ["echo", "> note", ">out"]);
 });
 
+// Bash removes a backslash and the newline after it before it reads the words, outside single quotes.
+test("shellWordsDetailed joins a line continuation as bash does", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, bareStart, expands }) => [word, bareStart, expands]);
+  const NL = "\\\n";
+  const cases = [
+    [`al${NL}pha`, [["alpha", true, false]]],
+    [`"al${NL}pha"`, [["alpha", false, false]]],
+    [`al${NL}${NL}pha`, [["alpha", true, false]]],
+    [`alpha ${NL}beta`, [["alpha", true, false], ["beta", true, false]]],
+    [`alpha${NL}`, [["alpha", true, false]]],
+    [`${NL}`, []],
+    [`${NL}~`, [["~", true, true]]],
+    [`${NL}>out`, [[">out", true, false]]],
+    [`$${NL}HOME`, [["$HOME", true, true]]],
+    [`"$${NL}HOME"`, [["$HOME", false, true]]],
+    [`<${NL}(date)`, [["<(date)", true, true]]],
+    [`$${NL}'x'`, [["$x", true, true]]],
+    [`'al${NL}pha'`, [[`al${NL}pha`, false, false]]],
+    [`$'al${NL}pha'`, [[`$al${NL}pha`, true, true]]],
+    [`al\\\\\npha`, [["al\\", true, false], ["pha", true, false]]],
+    [`"al\\\\\npha"`, [["al\\\npha", false, false]]],
+  ];
+  for (const [input, words] of cases) assert.deepEqual(w(input), words, JSON.stringify(input));
+});
+
+test("shellWordsDetailed keeps a backslash that ends a comment: that line continues nothing", () => {
+  assert.deepEqual(shellWords("alpha # note\\\nbeta"), ["alpha", "#", "note\nbeta"]);
+});
+
 // A gate that reads a word's text needs to know when the shell would expand it, and where a bare
 // `<` or `>` inside the word starts a redirection.
 test("shellWordsDetailed marks a word that expands and the bare < and > inside it", () => {

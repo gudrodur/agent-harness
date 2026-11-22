@@ -118,10 +118,50 @@ var splitSegmentsDetailed = (command) => {
   push("");
   return segs;
 };
+var joinLines = (text) => {
+  if (!text.includes("\\\n"))
+    return text;
+  let out = "";
+  let quote = null;
+  let dollar = false;
+  let wordStart = true;
+  for (let i = 0;i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\" && quote !== "'" && quote !== "#") {
+      const next = text[i + 1];
+      if (next === `
+` && quote !== "$") {
+        i++;
+        continue;
+      }
+      out += next === undefined ? c : c + next;
+      i++;
+      dollar = wordStart = false;
+      continue;
+    }
+    out += c;
+    if (quote) {
+      if (quote === "#" ? c === `
+` : c === (quote === "$" ? "'" : quote)) {
+        quote = null;
+        wordStart = c === `
+`;
+      }
+      continue;
+    }
+    if (c === '"' || c === "'")
+      quote = c === "'" && dollar ? "$" : c;
+    else if (c === "#" && wordStart)
+      quote = "#";
+    dollar = c === "$" && !dollar;
+    wordStart = !quote && /[\s;&|()]/.test(c);
+  }
+  return out;
+};
 var EXPANSION_START_QUOTED = /[A-Za-z0-9_{(\[@*#?$!-]/;
 var EXPANSION_START_BARE = /[A-Za-z0-9_{(\[@*#?$!'"-]/;
 var shellWordsDetailed = (segment) => {
-  const text = String(segment ?? "");
+  const text = joinLines(String(segment ?? ""));
   const words = [];
   let cur = null;
   let bareStart = false;

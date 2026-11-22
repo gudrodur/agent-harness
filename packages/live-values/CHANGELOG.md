@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare
+  and in double quotes the pair is removed before the words are read, so a word
+  split over two lines reads whole. Single quotes, `$'...'` and a comment keep it. (#57)
 - A `word` or `int` query whose earlier pipeline stage died is could-not-check, even with
   stderr silenced: `grep -oP … 2>/dev/null | wc -w` no longer reads
   0. Only exit 2 or more on an earlier stage counts, and 141 (SIGPIPE from `head -1`) is

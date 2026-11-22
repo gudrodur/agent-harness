@@ -411,15 +411,52 @@ export const splitSegmentsDetailed = (command) => {
 // - `procSubAt`: the offsets in `word` of each bare `<(` or `>(`, a process
 //   substitution. Bash passes a `/dev/fd` path to a command it runs alongside, so a
 //   gate can neither read the word as a file nor know what that command writes.
-// Out of scope: history `!` expansion, word splitting of an unquoted expansion, a
-// backslash-newline joining two lines (an issue of its own), and the words inside a
-// process substitution: they come back as plain words, and splitSegments splits at a
-// `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it were outside.
+// A backslash-newline outside single quotes joins two lines, as in bash (joinLines).
+// Out of scope: history `!` expansion, word splitting of an unquoted expansion, and
+// the words inside a process substitution: they come back as plain words, and
+// splitSegments splits at a `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it
+// were outside.
+// The text without the backslash-newline pairs bash removes before it reads the words:
+// bare and in double quotes. Single quotes, `$'…'` and a comment keep them.
+const joinLines = (text) => {
+  if (!text.includes('\\\n')) return text;
+  let out = '';
+  let quote = null; // `'`, `"`, `$` for `$'…'`, `#` for a comment
+  let dollar = false; // the last bare character kept is a `$` that may open `$'…'`
+  let wordStart = true;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '\\' && quote !== "'" && quote !== '#') {
+      const next = text[i + 1];
+      if (next === '\n' && quote !== '$') {
+        i++;
+        continue;
+      }
+      out += next === undefined ? c : c + next;
+      i++;
+      dollar = wordStart = false;
+      continue;
+    }
+    out += c;
+    if (quote) {
+      if (quote === '#' ? c === '\n' : c === (quote === '$' ? "'" : quote)) {
+        quote = null;
+        wordStart = c === '\n';
+      }
+      continue;
+    }
+    if (c === '"' || c === "'") quote = c === "'" && dollar ? '$' : c;
+    else if (c === '#' && wordStart) quote = '#';
+    dollar = c === '$' && !dollar;
+    wordStart = !quote && /[\s;&|()]/.test(c);
+  }
+  return out;
+};
 // What may follow a `$` for the shell to expand it, in double quotes and bare.
 const EXPANSION_START_QUOTED = /[A-Za-z0-9_{(\[@*#?$!-]/;
 const EXPANSION_START_BARE = /[A-Za-z0-9_{(\[@*#?$!'"-]/;
 export const shellWordsDetailed = (segment) => {
-  const text = String(segment ?? '');
+  const text = joinLines(String(segment ?? ''));
   const words = [];
   let cur = null;
   let bareStart = false;
