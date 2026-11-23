@@ -411,12 +411,15 @@ export const splitSegmentsDetailed = (command) => {
 // - `procSubAt`: the offsets in `word` of each bare `<(` or `>(`, a process
 //   substitution. Bash passes a `/dev/fd` path to a command it runs alongside, so a
 //   gate can neither read the word as a file nor know what that command writes.
-// A backslash-newline is removed first, where bash removes it (joinContinuations).
+// A backslash-newline is removed first, where bash removes it (joinContinuations): bare,
+// in double quotes and in backticks. Single quotes, `$'…'`, a comment and a quoted heredoc
+// body keep it, inside a `$(…)` or `${…}` as at the top level.
 // Out of scope: history `!` expansion, word splitting of an unquoted expansion, and
 // the words inside a process substitution: they come back as plain words, and
 // splitSegments splits at a `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it
-// were outside. It does not join, so an operator split by a backslash-newline gives
-// different segments.
+// were outside. splitSegments does not join, so an operator split by a backslash-newline
+// gives different segments. A lone backslash at the very end of the text, after any
+// number of joins, is kept.
 
 // What ends a word to bash outside quotes: its blanks and operators, and no other white
 // space (a carriage return and a form feed are part of a word).
@@ -433,9 +436,11 @@ const ASSIGNS = /^[A-Za-z_]\w*(?:\[|\+?=)/;
 //   as bash looks for the closing backtick first.
 // - Kept: in single quotes and `$'…'`, in a comment, and in the body of a heredoc with
 //   a quoted delimiter, each also inside `$(…)`, and a backslash that is itself escaped.
-// A `#` opens a comment only at the start of a word, and a pair removed before it does
-// not start one. A `case` is followed only from a word in command position, so that its
-// pattern's `)` does not close a `$(…)`.
+// A `#` opens a comment only at the start of a word, that is after bash's own blanks
+// (space, tab, newline) and operators (`;&|()<>`), and never after a carriage return, a
+// form feed or a closed substitution glued to it; a pair removed before it does not start
+// one. A `case` is followed only from a word in command position, so that its pattern's
+// `)` does not close a `$(…)`.
 // Joining joined text changes nothing. Linear in the text.
 export const joinContinuations = (input) => {
   const s = String(input ?? '');

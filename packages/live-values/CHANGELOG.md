@@ -14,9 +14,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare
-  and in double quotes the pair is removed before the words are read, so a word
-  split over two lines reads whole. Single quotes, `$'...'` and a comment keep it. (#57)
+- `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare,
+  in double quotes and in backticks the pair is removed before the words are read, so a
+  word split over two lines reads whole. Single quotes, `$'...'`, a comment and a quoted
+  heredoc body keep it, also inside `$(...)` and `${...}`: the join follows a stack of
+  those contexts (`joinContinuations`, exported), and a `#` opens a comment only after
+  bash's own blanks and operators. The second `$` of `$$` opens no `$'...'`, so a quote
+  after the pid parameter hides no flag after it. Known limits: `splitSegments` does not
+  join, so an operator split by a backslash-newline gives different segments, and a lone
+  backslash at the very end of the text is kept. (#57)
 - A `word` or `int` query whose earlier pipeline stage died is could-not-check, even with
   stderr silenced: `grep -oP … 2>/dev/null | wc -w` no longer reads
   0. Only exit 2 or more on an earlier stage counts, and 141 (SIGPIPE from `head -1`) is
