@@ -297,6 +297,19 @@ test("splitSegments reads `$'…'` with its escapes, and `$$'…'` as the pid an
   ]) assert.deepEqual(shell.splitSegments(run), segments, run);
 });
 
+// Bash reads `$'` literally in a quote glued to a word (it opens there, though this
+// splitter's quote gate does not), in a `#` comment and in a heredoc body. There a quote
+// closes at the next quote character, so the `;` or newline after it splits. Each split
+// is the one bash runs.
+test("splitSegments reads `$'` literally in a glued quote, a comment and a heredoc body", () => {
+  for (const [run, segments] of [
+    [String.raw`echo a"$'\'";git commit --no-verify -m x;echo ''`, [String.raw`echo a"$'\'"`, "git commit --no-verify -m x", "echo ''"]],
+    [String.raw`echo a'x$'\';git commit --no-verify -m x;echo ''`, [String.raw`echo a'x$'\'`, "git commit --no-verify -m x", "echo ''"]],
+    ["echo hi # c $'\\'\ngit commit --no-verify -m x\necho ''", ["echo hi # c $'\\'", "git commit --no-verify -m x", "echo ''"]],
+    ["cat <<EOF\necho $'\\'\nEOF\ngit commit --no-verify -m x\necho ''", ["cat <<EOF", "echo $'\\'", "EOF", "git commit --no-verify -m x", "echo ''"]],
+  ]) assert.deepEqual(shell.splitSegments(run), segments, run);
+});
+
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");

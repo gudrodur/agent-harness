@@ -28,6 +28,8 @@ All notable changes to this project are documented here. The format follows
 - `splitSegments` reads a backslash in `$'…'` (ANSI-C quoting) as an escape, as bash does:
   `echo $'\'';git commit -m x;echo \'` is three segments again, not one that hid the commit.
   `$$'x'` is the pid and a plain single quote, so a backslash in it stays a character.
+  Where bash reads `$'` literally (a quote glued to a word, as in `a"$'\'"`, a `#` comment
+  and a heredoc body) a backslash stays a character too, so the command after it splits.
 - `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare,
   in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
   matched) the pair is removed before the words are read, so a word split over two lines

@@ -47,7 +47,234 @@ import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 // engine/lib/shell-command.mjs
+var WORD_END = /[\s;&|()<>]/;
+var isCommandContext = (t) => t === "top" || t === "sub" || t === "paren";
+var readDelimiter = (line, i) => {
+  let tag = "";
+  let quoted = false;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === "'") {
+      const close = line.indexOf("'", i + 1);
+      if (close < 0)
+        return null;
+      tag += line.slice(i + 1, close);
+      quoted = true;
+      i = close + 1;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < line.length && line[j] !== '"') {
+        if (line[j] === "`" || line[j] === "$" && (line[j + 1] === "(" || line[j + 1] === "{"))
+          return null;
+        if (line[j] === "\\" && /["\\$`]/.test(line[j + 1] ?? ""))
+          j++;
+        tag += line[j];
+        j++;
+      }
+      if (j >= line.length)
+        return null;
+      quoted = true;
+      i = j + 1;
+    } else if (c === "\\") {
+      if (i + 1 >= line.length)
+        return null;
+      tag += line[i + 1];
+      quoted = true;
+      i += 2;
+    } else if (c === "`" || c === "$" && (line[i + 1] === "(" || line[i + 1] === "{" || line[i + 1] === "'")) {
+      return null;
+    } else if (WORD_END.test(c)) {
+      break;
+    } else {
+      tag += c;
+      i++;
+    }
+  }
+  return tag === "" && !quoted ? null : { tag, quoted, end: i };
+};
+var keywordAt = (line, j, word, wordStart) => wordStart && line.startsWith(word, j) && (j + word.length === line.length || /[\s;&|()]/.test(line[j + word.length]));
+var arith = (close) => ({ t: "arith", open: close === "]" ? "[" : "(", close, depth: 0 });
 var SUBSCRIPT = /[A-Za-z_]\w*\[/y;
+var expansion = (line, j, stack, inDq) => {
+  const c = line[j];
+  if (c === "$" && line[j + 1] === "[") {
+    stack.push(arith("]"));
+    return j + 2;
+  }
+  if (c === "$" && line[j + 1] === "(") {
+    if (line[j + 2] === "(") {
+      stack.push(arith(")"));
+      return j + 3;
+    }
+    stack.push({ t: "sub", cases: 0 });
+    return j + 2;
+  }
+  if (c === "$" && line[j + 1] === "{") {
+    stack.push({ t: "param", inDq });
+    return j + 2;
+  }
+  if (c === "`") {
+    stack.push({ t: "bq" });
+    return j + 1;
+  }
+  return j + 1;
+};
+var scanLine = (line, stack, found, firstStartsWord) => {
+  const n = line.length;
+  const wordStart = (j2) => j2 === 0 ? firstStartsWord : WORD_END.test(line[j2 - 1]);
+  let continued = false;
+  let j = 0;
+  while (j < n) {
+    const ctx = stack[stack.length - 1];
+    const c = line[j];
+    if (ctx.t === "sq") {
+      if (c === "'")
+        stack.pop();
+      j++;
+    } else if (ctx.t === "bq") {
+      if (c === "\\")
+        j += 2;
+      else {
+        if (c === "`")
+          stack.pop();
+        j++;
+      }
+    } else if (ctx.t === "ansi") {
+      if (c === "\\")
+        j += 2;
+      else {
+        if (c === "'")
+          stack.pop();
+        j++;
+      }
+    } else if (ctx.t === "arith") {
+      if (c === ctx.open) {
+        ctx.depth++;
+        j++;
+      } else if (c === ctx.close) {
+        if (ctx.depth > 0) {
+          ctx.depth--;
+          j++;
+        } else {
+          stack.pop();
+          j += c === ")" && line[j + 1] === ")" ? 2 : 1;
+        }
+      } else if (c === "'") {
+        stack.push({ t: "sq" });
+        j++;
+      } else if (c === '"') {
+        stack.push({ t: "dq" });
+        j++;
+      } else if (c === "\\")
+        j += 2;
+      else
+        j = expansion(line, j, stack, false);
+    } else if (ctx.t === "dq") {
+      if (c === "\\")
+        j += 2;
+      else if (c === '"') {
+        stack.pop();
+        j++;
+      } else
+        j = expansion(line, j, stack, true);
+    } else if (ctx.t === "param") {
+      if (c === "\\")
+        j += 2;
+      else if (c === "}") {
+        stack.pop();
+        j++;
+      } else if (c === '"') {
+        stack.push({ t: "dq" });
+        j++;
+      } else if (c === "'" && !ctx.inDq) {
+        stack.push({ t: "sq" });
+        j++;
+      } else
+        j = expansion(line, j, stack, ctx.inDq);
+    } else if (c === "\\") {
+      if (j + 1 >= n)
+        continued = true;
+      j += 2;
+    } else if (c === "$" && line[j + 1] === "'") {
+      stack.push({ t: "ansi" });
+      j += 2;
+    } else if (c === "'") {
+      stack.push({ t: "sq" });
+      j++;
+    } else if (c === '"') {
+      stack.push({ t: "dq" });
+      j++;
+    } else if (c === "#" && wordStart(j)) {
+      j = n;
+    } else if (wordStart(j) && (SUBSCRIPT.lastIndex = j, SUBSCRIPT.test(line))) {
+      stack.push(arith("]"));
+      j = SUBSCRIPT.lastIndex;
+    } else if (c === "(" && line[j + 1] === "(") {
+      stack.push(arith(")"));
+      j += 2;
+    } else if (c === "(") {
+      stack.push({ t: "paren", cases: 0 });
+      j++;
+    } else if (c === ")") {
+      if (ctx.cases === 0 && (ctx.t === "sub" || ctx.t === "paren"))
+        stack.pop();
+      j++;
+    } else if (c === "<" && line[j + 1] === "<") {
+      if (line[j + 2] === "<") {
+        j += 3;
+        continue;
+      }
+      let k = j + 2;
+      if (line[k] === "-")
+        k++;
+      while (line[k] === " " || line[k] === "\t")
+        k++;
+      const d = readDelimiter(line, k);
+      if (d) {
+        found.push({ head: line, tag: d.tag, quoted: d.quoted });
+        j = d.end;
+      } else
+        j += 2;
+    } else if (keywordAt(line, j, "case", wordStart(j))) {
+      ctx.cases++;
+      j += 4;
+    } else if (keywordAt(line, j, "esac", wordStart(j))) {
+      ctx.cases = Math.max(0, ctx.cases - 1);
+      j += 4;
+    } else
+      j = expansion(line, j, stack, false);
+  }
+  return {
+    ends: !continued && isCommandContext(stack[stack.length - 1].t),
+    nextStartsWord: !continued || n < 2 || WORD_END.test(line[n - 2])
+  };
+};
+var scanHeredocs = (lines) => {
+  const out = [];
+  const stack = [{ t: "top", cases: 0 }];
+  const found = [];
+  let startsWord = true;
+  let i = 0;
+  while (i < lines.length) {
+    const { ends, nextStartsWord } = scanLine(lines[i], stack, found, startsWord);
+    startsWord = nextStartsWord;
+    i++;
+    if (!ends || found.length === 0)
+      continue;
+    for (const h of found) {
+      const from = i;
+      while (i < lines.length && lines[i].trim() !== h.tag)
+        i++;
+      out.push({ head: h.head, tag: h.tag, quoted: h.quoted, from, to: i });
+      if (i < lines.length)
+        i++;
+    }
+    found.length = 0;
+  }
+  for (const h of found)
+    out.push({ head: h.head, tag: h.tag, quoted: h.quoted, from: lines.length, to: lines.length });
+  return out;
+};
 var stripQuoted = (text) => String(text ?? "").replace(/(?<=[=\s([{;&|<>$`'"]|^)'(?:[^'\\]|\\.)*'|(?<=[=\s([{;&|<>$`'"]|^)"(?:[^"\\]|\\.)*"/gs, " ");
 var QUOTE_OPEN_PRECEDER = /[=\s([{;&|<>$`'"]/;
 var splitSegments = (command) => splitSegmentsDetailed(command).map((s) => s.text);
@@ -73,11 +300,40 @@ var splitSegmentsDetailed = (command) => {
     }
     return -1;
   };
+  const literal = [];
+  {
+    const lines = text.split(`
+`);
+    const starts = [];
+    for (let k = 0, at = 0;k < lines.length; at += lines[k].length + 1, k++)
+      starts.push(at);
+    for (const h of scanHeredocs(lines)) {
+      if (h.from >= lines.length)
+        continue;
+      const end = h.to < lines.length ? starts[h.to] + lines[h.to].length : text.length;
+      literal.push([starts[h.from], end]);
+    }
+  }
+  let nextLiteral = 0;
+  let literalEnd = -1;
   let i = 0;
   let dollarOpens = false;
   while (i < text.length) {
     const c = text[i];
-    const ansi = dollarOpens;
+    while (nextLiteral < literal.length && literal[nextLiteral][0] <= i) {
+      literalEnd = Math.max(literalEnd, literal[nextLiteral][1]);
+      nextLiteral++;
+    }
+    if (i > literalEnd) {
+      if (c === "#" && (i === 0 || /[\s;&|()<>]/.test(text[i - 1]))) {
+        const nl = text.indexOf(`
+`, i);
+        literalEnd = nl < 0 ? text.length : nl;
+      } else if ((c === '"' || c === "'") && i > 0 && !QUOTE_OPEN_PRECEDER.test(text[i - 1])) {
+        literalEnd = Math.max(literalEnd, findClose(c, i + 1, false));
+      }
+    }
+    const ansi = dollarOpens && i > literalEnd;
     dollarOpens = false;
     if ((c === "'" || c === '"') && (i === 0 || QUOTE_OPEN_PRECEDER.test(text[i - 1]))) {
       const close = findClose(c, i + 1, c === "'" && ansi);

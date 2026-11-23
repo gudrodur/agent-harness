@@ -145,6 +145,18 @@ test("checkLocal judges the command after a `$'…'` span, where bash splits", (
   assert.deepEqual(checkLocal(String.raw`echo $$'a\';echo b`, "/"), { ok: true });
 });
 
+test("checkLocal judges the command after a `$'` that bash reads literally", () => {
+  // A glued quote and a comment: the commit is its own segment again.
+  for (const run of [
+    String.raw`echo a"$'\'";git commit --no-verify -m x;echo ''`,
+    String.raw`echo a'x$'\';git commit --no-verify -m x;echo ''`,
+    "echo hi # c $'\\'\ngit commit --no-verify -m x\necho ''",
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: false, reason: "git commit is not a read subcommand" }, run);
+  // A heredoc body: checkLocal reads the body and terminator lines as commands, so the
+  // first refusal names the terminator, but the commit no longer hides in one span.
+  assert.equal(checkLocal("cat <<EOF\necho $'\\'\nEOF\ngit commit --no-verify -m x\necho ''", "/").ok, false);
+});
+
 test("runCommand returns stdout, and a failure as text that is never empty", () => {
   assert.deepEqual(runCommand("printf 7", { root: "/", timeoutMs: 5000 }), { ok: true, stdout: "7" });
   const bad = runCommand("exit 3", { root: "/", timeoutMs: 5000 });

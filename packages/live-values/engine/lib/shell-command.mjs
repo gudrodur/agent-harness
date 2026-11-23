@@ -333,13 +333,43 @@ export const splitSegmentsDetailed = (command) => {
     }
     return -1;
   };
+  // Where bash reads `$'` literally, the old split stands and a quote closes at the next
+  // quote character: a heredoc body with its terminator, a `#` comment, and a quote glued
+  // to a word (`a"$'\'"`, `a'x$'`), which bash opens but this splitter does not. Reading
+  // escapes there would fold the next command into the span. `literalEnd` is the last
+  // index of the literal stretch being read.
+  const literal = [];
+  {
+    const lines = text.split('\n');
+    const starts = [];
+    for (let k = 0, at = 0; k < lines.length; at += lines[k].length + 1, k++) starts.push(at);
+    for (const h of scanHeredocs(lines)) {
+      if (h.from >= lines.length) continue;
+      const end = h.to < lines.length ? starts[h.to] + lines[h.to].length : text.length;
+      literal.push([starts[h.from], end]);
+    }
+  }
+  let nextLiteral = 0;
+  let literalEnd = -1;
   let i = 0;
   // The previous character was a bare `$` that opens what follows: not the second `$` of
   // `$$` (the pid, so `$$'x'` is a plain single quote) and not an escaped `\$`.
   let dollarOpens = false;
   while (i < text.length) {
     const c = text[i];
-    const ansi = dollarOpens;
+    while (nextLiteral < literal.length && literal[nextLiteral][0] <= i) {
+      literalEnd = Math.max(literalEnd, literal[nextLiteral][1]);
+      nextLiteral++;
+    }
+    if (i > literalEnd) {
+      if (c === '#' && (i === 0 || /[\s;&|()<>]/.test(text[i - 1]))) {
+        const nl = text.indexOf('\n', i);
+        literalEnd = nl < 0 ? text.length : nl;
+      } else if ((c === '"' || c === "'") && i > 0 && !QUOTE_OPEN_PRECEDER.test(text[i - 1])) {
+        literalEnd = Math.max(literalEnd, findClose(c, i + 1, false));
+      }
+    }
+    const ansi = dollarOpens && i > literalEnd;
     dollarOpens = false;
     if (
       (c === "'" || c === '"') &&
