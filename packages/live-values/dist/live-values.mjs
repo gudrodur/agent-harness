@@ -47,6 +47,7 @@ import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 // engine/lib/shell-command.mjs
+var SUBSCRIPT = /[A-Za-z_]\w*\[/y;
 var stripQuoted = (text) => String(text ?? "").replace(/(?<=[=\s([{;&|<>$`'"]|^)'(?:[^'\\]|\\.)*'|(?<=[=\s([{;&|<>$`'"]|^)"(?:[^"\\]|\\.)*"/gs, " ");
 var QUOTE_OPEN_PRECEDER = /[=\s([{;&|<>$`'"]/;
 var splitSegments = (command) => splitSegmentsDetailed(command).map((s) => s.text);
@@ -118,10 +119,385 @@ var splitSegmentsDetailed = (command) => {
   push("");
   return segs;
 };
+var WORD_BREAK = ` 	
+;&|()<>`;
+var COMMAND_NEXT = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "coproc"]);
+var ASSIGNS = /^[A-Za-z_]\w*(?:\[|\+?=)/;
+var joinContinuations = (input) => {
+  const s = String(input ?? "");
+  if (!s.includes("\\\n"))
+    return s;
+  const n = s.length;
+  let out = "";
+  let i = 0;
+  let wordStart = true;
+  let word = "";
+  let last = "";
+  const context = (kind, glued, list = false) => ({ kind, glued, list, before: word && `${word}"`, depth: 0, cs: [], pending: [], first: kind === "cmd" && !list });
+  const stack = [context("cmd", false)];
+  const commandPos = (ctx) => ctx.first && (ctx.cs.length === 0 || ctx.cs.at(-1) === "body");
+  const caseState = (ctx, state) => {
+    ctx.cs[ctx.cs.length - 1] = state;
+  };
+  const skip = (from) => {
+    let j = from;
+    while (s[j] === "\\" && s[j + 1] === `
+`)
+      j += 2;
+    return j;
+  };
+  const enter = (kind, opener, next, glued = true, list = false) => {
+    stack.push(context(kind, glued, list));
+    out += opener;
+    i = next;
+    wordStart = true;
+    word = last = "";
+  };
+  const leave = () => {
+    const { glued, before, pending } = stack.pop();
+    stack.at(-1).pending.push(...pending);
+    wordStart = !glued;
+    word = glued ? before : "";
+    last = "";
+    if (!glued)
+      stack.at(-1).first = true;
+  };
+  const inWord = () => {
+    wordStart = false;
+    if (word)
+      word += '"';
+  };
+  const endWord = (ctx) => {
+    if (!wordStart) {
+      const state = ctx.cs.at(-1);
+      if (state === "subject")
+        caseState(ctx, "in");
+      else if (state === "in") {
+        if (word === "in")
+          caseState(ctx, "pats");
+      } else if (state === "pats") {
+        if (word === "esac")
+          ctx.cs.pop();
+        else
+          caseState(ctx, "pat");
+      } else if (state !== "pat") {
+        const reserved = commandPos(ctx);
+        if (reserved && word === "case")
+          ctx.cs.push("subject");
+        else if (reserved && word === "esac" && state === "body")
+          ctx.cs.pop();
+        ctx.first = reserved && (COMMAND_NEXT.has(word) || ASSIGNS.test(word));
+      }
+    }
+    word = "";
+  };
+  const backticks = () => {
+    out += "`";
+    i++;
+    while (i < n) {
+      if (s[i] === "\\") {
+        if (s[i + 1] !== `
+`)
+          out += s.slice(i, i + 2);
+        i += 2;
+      } else {
+        out += s[i++];
+        if (s[i - 1] === "`")
+          break;
+      }
+    }
+    inWord();
+  };
+  const quoted = (opener, from, ansi) => {
+    let j = from;
+    while (j < n && s[j] !== "'")
+      j += ansi && s[j] === "\\" ? 2 : 1;
+    const end = Math.min(j + 1, n);
+    out += opener + s.slice(from, end);
+    i = end;
+    inWord();
+  };
+  const heredoc = (after) => {
+    out += "<<";
+    let j = skip(after);
+    const strip = s[j] === "-";
+    if (strip) {
+      out += "-";
+      j = skip(j + 1);
+    }
+    while (s[j] === " " || s[j] === "\t") {
+      out += s[j];
+      j = skip(j + 1);
+    }
+    let tag = "";
+    let named = false;
+    let literal = false;
+    let quote = "";
+    while (j < n) {
+      const d = s[j];
+      if (d === "\\" && quote !== "'") {
+        const next = s[j + 1] ?? "";
+        if (next !== `
+`) {
+          out += d + next;
+          tag += !quote || '$`"\\'.includes(next) ? next : d + next;
+          named = literal = true;
+        }
+        j += 2;
+        continue;
+      }
+      if (quote ? d === `
+` : WORD_BREAK.includes(d))
+        break;
+      if (d === quote)
+        quote = "";
+      else if (!quote && (d === "'" || d === '"')) {
+        quote = d;
+        literal = true;
+      } else
+        tag += d;
+      named = true;
+      out += d;
+      j++;
+    }
+    if (named)
+      stack.at(-1).pending.push({ tag, literal, strip });
+    i = j;
+    wordStart = false;
+  };
+  const body = (doc) => {
+    while (i < n) {
+      let line = "";
+      while (i < n && s[i] !== `
+`) {
+        if (!doc.literal && s[i] === "\\") {
+          if (s[i + 1] !== `
+`)
+            line += s.slice(i, i + 2);
+          i += 2;
+        } else
+          line += s[i++];
+      }
+      out += line;
+      if (i < n) {
+        out += `
+`;
+        i++;
+      }
+      if ((doc.strip ? line.replace(/^\t+/, "") : line) === doc.tag)
+        break;
+    }
+  };
+  const dollar = (inDouble) => {
+    const j = skip(i + 1);
+    const next = s[j];
+    if (next === "(") {
+      const k = skip(j + 1);
+      if (s[k] === "(")
+        enter("arith", "$((", k + 1);
+      else
+        enter("cmd", "$(", j + 1);
+    } else if (next === "$") {
+      out += "$$";
+      i = j + 1;
+      inWord();
+    } else if (next === "{")
+      enter("brace", "${", j + 1);
+    else if (next === "[")
+      enter("bracket", "$[", j + 1);
+    else if (next === "'" && !inDouble)
+      quoted("$'", j + 1, true);
+    else {
+      out += "$";
+      i++;
+      inWord();
+    }
+  };
+  while (i < n) {
+    const ctx = stack.at(-1);
+    const c = s[i];
+    if (c === "\\") {
+      if (s[i + 1] !== `
+`) {
+        out += s.slice(i, i + 2);
+        inWord();
+        last = "";
+      }
+      i += 2;
+      continue;
+    }
+    if (c === "$") {
+      dollar(ctx.kind === "dq");
+      continue;
+    }
+    if (c === "`") {
+      backticks();
+      continue;
+    }
+    if (c === '"') {
+      if (ctx.kind === "dq")
+        leave();
+      else
+        stack.push(context("dq", true));
+      out += c;
+      i++;
+      wordStart = false;
+      continue;
+    }
+    if (ctx.kind === "dq") {
+      out += c;
+      i++;
+      continue;
+    }
+    if (c === "'") {
+      quoted(c, i + 1, false);
+      continue;
+    }
+    if (ctx.kind === "cmd") {
+      const list = c === "(" && !wordStart && last !== "" && "=?*+@!".includes(last);
+      if (WORD_BREAK.includes(c) && !list)
+        endWord(ctx);
+      if (c === "<" || c === ">")
+        ctx.first = false;
+      if (c === ";" && ctx.cs.at(-1) === "body" && ";&".includes(s[skip(i + 1)] ?? "\x00"))
+        caseState(ctx, "pats");
+      if (c === `
+` && ctx.pending.length) {
+        out += c;
+        i++;
+        for (const doc of ctx.pending.splice(0))
+          body(doc);
+        wordStart = true;
+        ctx.first = !ctx.list;
+        continue;
+      }
+      if (c === "#" && wordStart) {
+        let end = s.indexOf(`
+`, i);
+        if (end < 0)
+          end = n;
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (wordStart && commandPos(ctx) && /[A-Za-z_]/.test(c)) {
+        SUBSCRIPT.lastIndex = i;
+        if (SUBSCRIPT.test(s)) {
+          word = s.slice(i, SUBSCRIPT.lastIndex);
+          stack.push(context("bracket", true));
+          out += word;
+          i = SUBSCRIPT.lastIndex;
+          wordStart = false;
+          continue;
+        }
+      }
+      if (c === "<" || c === ">") {
+        const j = skip(i + 1);
+        if (s[j] === "(") {
+          enter("cmd", `${c}(`, j + 1);
+          continue;
+        }
+        if (c === "<" && s[j] === "<") {
+          const k = skip(j + 1);
+          if (s[k] === "<") {
+            out += "<<<";
+            i = k + 1;
+            wordStart = true;
+          } else
+            heredoc(j + 1);
+          continue;
+        }
+      }
+      if (c === "(" && !list && ctx.cs.at(-1) === "pats") {
+        caseState(ctx, "pat");
+        out += c;
+        i++;
+        wordStart = true;
+        continue;
+      }
+      if (c === "(") {
+        const j = skip(i + 1);
+        if (wordStart && s[j] === "(")
+          enter("arith", "((", j + 1, false);
+        else
+          enter("cmd", "(", i + 1, list, list);
+        continue;
+      }
+    }
+    out += c;
+    i++;
+    if (ctx.kind === "brace") {
+      wordStart = false;
+      if (c === "}")
+        leave();
+      continue;
+    }
+    if (ctx.kind === "bracket") {
+      if (c === "[")
+        ctx.depth++;
+      else if (c === "]") {
+        if (ctx.depth)
+          ctx.depth--;
+        else
+          leave();
+      }
+      continue;
+    }
+    if (ctx.kind === "arith") {
+      if (c === "(")
+        ctx.depth++;
+      else if (c === ")") {
+        if (ctx.depth)
+          ctx.depth--;
+        else {
+          const j = skip(i);
+          if (s[j] === ")") {
+            out += ")";
+            i = j + 1;
+            leave();
+            continue;
+          }
+          ctx.kind = "cmd";
+          ctx.first = false;
+          word = "";
+        }
+      }
+      wordStart = WORD_BREAK.includes(c);
+      continue;
+    }
+    if (c === ")") {
+      const state = ctx.cs.at(-1);
+      if (state === "pats" || state === "pat") {
+        caseState(ctx, "body");
+        ctx.first = true;
+        wordStart = true;
+        last = "";
+        continue;
+      }
+      if (state === undefined && stack.length > 1) {
+        leave();
+        continue;
+      }
+    }
+    const redirects = c === "&" && (last === "<" || last === ">");
+    last = c;
+    if (WORD_BREAK.includes(c)) {
+      wordStart = true;
+      if (`;&|)
+`.includes(c) && !redirects)
+        ctx.first = !ctx.list;
+    } else {
+      if (wordStart || word)
+        word += c;
+      wordStart = false;
+    }
+  }
+  return out;
+};
 var EXPANSION_START_QUOTED = /[A-Za-z0-9_{(\[@*#?$!-]/;
 var EXPANSION_START_BARE = /[A-Za-z0-9_{(\[@*#?$!'"-]/;
 var shellWordsDetailed = (segment) => {
-  const text = String(segment ?? "");
+  const text = joinContinuations(segment);
   const words = [];
   let cur = null;
   let bareStart = false;
@@ -191,7 +567,7 @@ var shellWordsDetailed = (segment) => {
       i += 2;
       continue;
     }
-    if (c === "$" && text[i + 1] === "'") {
+    if (c === "$" && text[i + 1] === "'" && !paramNext) {
       expands = true;
       add("$", true);
       let j = i + 2;

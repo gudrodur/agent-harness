@@ -233,9 +233,9 @@ const median = (fn, input) => {
   }
   return times.sort((x, y) => x - y)[2];
 };
-const growth = (fn) => {
-  const small = openers(8_000);
-  const large = openers(128_000);
+const growth = (fn, make = openers) => {
+  const small = make(8_000);
+  const large = make(128_000);
   let best = Infinity;
   for (let attempt = 0; attempt < 3 && best >= 48; attempt++) {
     best = Math.min(best, median(fn, large) / Math.max(median(fn, small), 0.05));
@@ -249,6 +249,13 @@ for (const [name, fn] of [["stripHeredocBodies", stripHeredocBodies], ["heredocB
     assert.ok(ratio < 48, `16x the openers took ${ratio.toFixed(1)}x the time`);
   });
 }
+
+test("joinContinuations grows linearly with the text", () => {
+  for (const unit of ['x "$(y)" a\\\nb ', "a", "$(", "<\\\n", "x[1] "]) {
+    const ratio = growth((s) => shell.joinContinuations(s), (n) => `${unit.repeat(n / 4)}\\\n`);
+    assert.ok(ratio < 48, `${JSON.stringify(unit)}: 16x the text took ${ratio.toFixed(1)}x the time`);
+  }
+});
 
 // `>|` writes a file even under noclobber: one redirection operator, not `>` and a pipe.
 test("splitSegmentsDetailed keeps >| inside its segment; a real pipe still splits", () => {
@@ -281,6 +288,231 @@ test("shellWordsDetailed marks a word whose first character is bare", () => {
     { word: ">$g", bareStart: true },
   ]);
   assert.deepEqual(shellWords("echo '> note' >out"), ["echo", "> note", ">out"]);
+});
+
+// Bash removes a backslash and the newline after it before it reads the words, outside single quotes.
+test("shellWordsDetailed joins a line continuation as bash does", () => {
+  const w = (s) => shell.shellWordsDetailed(s).map(({ word, bareStart, expands }) => [word, bareStart, expands]);
+  const NL = "\\\n";
+  const cases = [
+    [`al${NL}pha`, [["alpha", true, false]]],
+    [`"al${NL}pha"`, [["alpha", false, false]]],
+    [`al${NL}${NL}pha`, [["alpha", true, false]]],
+    [`alpha ${NL}beta`, [["alpha", true, false], ["beta", true, false]]],
+    [`alpha${NL}`, [["alpha", true, false]]],
+    [`${NL}`, []],
+    [`${NL}~`, [["~", true, true]]],
+    [`${NL}>out`, [[">out", true, false]]],
+    [`$${NL}HOME`, [["$HOME", true, true]]],
+    [`"$${NL}HOME"`, [["$HOME", false, true]]],
+    [`<${NL}(date)`, [["<(date)", true, true]]],
+    [`$${NL}'x'`, [["$x", true, true]]],
+    [`'al${NL}pha'`, [[`al${NL}pha`, false, false]]],
+    [`$'al${NL}pha'`, [[`$al${NL}pha`, true, true]]],
+    [`al\\\\\npha`, [["al\\", true, false], ["pha", true, false]]],
+    [`"al\\\\\npha"`, [["al\\\npha", false, false]]],
+  ];
+  for (const [input, words] of cases) assert.deepEqual(w(input), words, JSON.stringify(input));
+});
+
+test("shellWordsDetailed keeps a backslash that ends a comment: that line continues nothing", () => {
+  assert.deepEqual(shellWords("alpha # note\\\nbeta"), ["alpha", "#", "note\nbeta"]);
+});
+
+// The cases below are read as text. `J` is a backslash followed by a newline.
+const J = "\\\n";
+const wrongWords = (cases) => cases.filter(([input, words]) => JSON.stringify(shellWords(input)) !== JSON.stringify(words)).map(([input]) => [input, shellWords(input)]);
+
+// The second `$` of `$$` names the pid parameter, so the quote after it is a plain one.
+test("shellWordsDetailed: a quote after $$ opens no $'…' string and hides no word after it, joined or glued", () => {
+  const cases = [
+    [`cmd $$${J}'\\' --flag`, ["cmd", "$$\\", "--flag"]],
+    ["cmd $$'\\' --flag", ["cmd", "$$\\", "--flag"]],
+    [`cmd $${J}$'\\' --flag`, ["cmd", "$$\\", "--flag"]],
+    [`cmd $${J}$${J}'\\' --flag`, ["cmd", "$$\\", "--flag"]],
+    ["cmd $$$$'\\' --flag", ["cmd", "$$$$\\", "--flag"]],
+    [`cmd $$'\\' -${J}X`, ["cmd", "$$\\", "-X"]],
+    // A third `$` opens one again.
+    ["cmd $$$'a\\'b' --flag", ["cmd", "$$$a\\'b", "--flag"]],
+  ];
+  assert.deepEqual(wrongWords(cases), []);
+});
+
+test("shellWordsDetailed keeps a pair that bash keeps inside a substitution", () => {
+  const cases = [
+    [`"$(printf %s 'a${J}b')"`, [`$(printf %s 'a${J}b')`]],
+    [`"$(printf %s $'a${J}b')"`, [`$(printf %s $'a${J}b')`]],
+    [`"$(: # note${J}next)"`, [`$(: # note${J}next)`]],
+    [`"$(echo "$(printf 'a${J}b')")"`, [`$(echo $(printf`, `a${J}b))`]],
+    [`"$( (:); printf 'a${J}b')"`, [`$( (:); printf 'a${J}b')`]],
+    [`"$((echo a); printf 'a${J}b')"`, [`$((echo a); printf 'a${J}b')`]],
+    [`"\${x:-'a${J}b'}"`, [`\${x:-'a${J}b'}`]],
+    [`"$(case a in a) printf 'a${J}b';; esac)"`, [`$(case a in a) printf 'a${J}b';; esac)`]],
+    [`"$(case a in (a) :;; esac; printf 'a${J}b')"`, [`$(case a in (a) :;; esac; printf 'a${J}b')`]],
+    [`"$(echo case)" 'a${J}b'`, ["$(echo case)", `a${J}b`]],
+    // A quoted or escaped `case` is a plain word.
+    [`"$(ca''se)" 'a${J}b'`, ["$(ca''se)", `a${J}b`]],
+    [`"$(ca\\se)" 'a${J}b'`, ["$(ca\\se)", `a${J}b`]],
+    [`"\`printf x\`" '"' 'a${J}b'`, ["`printf x`", '"', `a${J}b`]],
+    [`"\`echo "x"\`" 'a${J}b'`, ["`echo x`", `a${J}b`]],
+  ];
+  assert.deepEqual(wrongWords(cases), []);
+});
+
+test("shellWordsDetailed keeps the terminator of a quoted heredoc inside a substitution", () => {
+  for (const tag of ["'E'", '\\E', `'E'${J}`]) {
+    const [word] = shellWords(`"$(cat <<${tag}\nbody${J}E\nnext --flag\n)"`);
+    assert.match(word, /body\\\nE\n/, tag);
+    const program = stripHeredocBodies(word.slice(2, -1));
+    assert.ok(program.split("\n").includes("next --flag"), `${tag}: ${JSON.stringify(program)}`);
+  }
+});
+
+test("shellWordsDetailed joins after nested quoting, and a # opens a comment only after bash's blanks and operators", () => {
+  const cases = [
+    [`cmd "$(printf "fix #57")" -${J}X`, ["cmd", "$(printf fix", "#57)", "-X"]],
+    [`cmd "\`printf "fix #57"\`" -${J}X`, ["cmd", "`printf fix", "#57`", "-X"]],
+    [`cmd "\${x:-"fix #57"}" -${J}X`, ["cmd", "${x:-fix", "#57}", "-X"]],
+    [`cmd "$(case a in a) printf "fix #57";; esac)" -${J}X`, ["cmd", "$(case a in a) printf fix", "#57;; esac)", "-X"]],
+    // Part of a word: no comment.
+    [`cmd $(:)#x -${J}X`, ["cmd", "$(:)#x", "-X"]],
+    [`cmd $(:)${J}#x -${J}X`, ["cmd", "$(:)#x", "-X"]],
+    [`cmd $((1+1))#x -${J}X`, ["cmd", "$((1+1))#x", "-X"]],
+    [`cmd <(:)#x -${J}X`, ["cmd", "<(:)#x", "-X"]],
+    [`cmd @(a)#x -${J}X`, ["cmd", "@(a)#x", "-X"]],
+    [`a=(1)#x cmd -${J}X`, ["a=(1)#x", "cmd", "-X"]],
+    [`cmd \${x:- #a} -${J}X`, ["cmd", "${x:-", "#a}", "-X"]],
+    [`cmd $[ #a] -${J}X`, ["cmd", "$[", "#a]", "-X"]],
+    [`cmd a\r#x -${J}X`, ["cmd", "a", "#x", "-X"]],
+    [`cmd a\f#x -${J}X`, ["cmd", "a", "#x", "-X"]],
+    [`cmd a #x -${J}X`, ["cmd", "a", "#x", "-X"]],
+    // After a blank or an operator: a comment, and its last backslash continues nothing.
+    [`cmd\t#c${J}next`, ["cmd", "#c\nnext"]],
+    [`cmd;#c${J}next`, ["cmd;#c\nnext"]],
+    [`cmd >#c${J}next`, ["cmd", ">#c\nnext"]],
+    [`cmd <#c${J}next`, ["cmd", "<#c\nnext"]],
+    [`(:)#c${J}next`, ["(:)#c\nnext"]],
+    [`((1))#c${J}next`, ["((1))#c\nnext"]],
+  ];
+  assert.deepEqual(wrongWords(cases), []);
+});
+
+// A flag split by `J` after a substitution is joined only when the scanner has left the
+// substitution where bash did. Each input below put it in the wrong place: a `case` word that
+// is no keyword, a redirection's word read as one, a heredoc drained in the wrong context.
+const stuckProbes = [
+  ["a `case` in a pattern list", `git commit "$(case q in q|case) printf q;; esac)" '"' -${J}-no-verify`, "--no-verify"],
+  ["`in case` in a command's arguments", `"$(case q in q) printf %s in case;; esac)" '"' -${J}X`, "-X"],
+  ["`for v in case`", `"$(case q in q) for v in case; do :; done;; esac)" '"' -${J}X`, "-X"],
+  ["a word after `<`", `"$(< case printf q)" '"' -${J}X`, "-X"],
+  ["`case case in case`", `"$(case case in case) printf q;; esac)" '"' -${J}X`, "-X"],
+  ["a word after `<<<`", `"$(<<<case cat)" '"' -${J}X`, "-X"],
+  ["a heredoc opened outside a substitution that holds a newline", `git commit <<'E' "$(printf a\n)" -${J}-no-verify\nb\nE\n`, "--no-verify"],
+];
+for (const [name, input, flag] of stuckProbes) {
+  test(`shellWords joins the flag after ${name}`, () => {
+    const words = shellWords(input);
+    assert.ok(words.includes(flag), JSON.stringify(words));
+    assert.ok(!words.some((w) => w.includes("-\n")), JSON.stringify(words));
+  });
+}
+
+test("shellWords follows the case grammar: a keyword stands only in command position", () => {
+  const cases = [
+    // The `)` after a pattern ends the pattern list, however the pattern is written.
+    [`"$(case q in (q) :;; esac)" '"' -${J}X`],
+    [`"$(case q in q|r) :;& r) :;;& esac)" '"' -${J}X`],
+    [`"$(case q in esac) :;; esac)" '"' -${J}X`],
+    [`"$(case q\nin\nq) :;;\nesac)" '"' -${J}X`],
+    [`"$(case q in q) case r in r) :;; esac;; esac)" '"' -${J}X`],
+    [`"$(case q in q) :;; esac; case q in q) :;; esac)" '"' -${J}X`],
+    // `esac` ends a body without `;;`, and a pattern after `;;` is no command.
+    [`"$(case q in q) :; esac)" '"' -${J}X`],
+    [`"$(case q in q) :;; case) :;; esac)" '"' -${J}X`],
+    // A redirection's word, and a word of a command, is no keyword.
+    [`"$(printf q >case; :)" '"' -${J}X`],
+    [`"$(printf q 2>&1 case)" '"' -${J}X`],
+    [`"$(printf q >&2 case)" '"' -${J}X`],
+    [`"$(printf q >& case)" '"' -${J}X`],
+    [`"$(cat <<<case; :)" '"' -${J}X`],
+    // `case` after a keyword, an assignment or a separator is one.
+    [`"$(if :; then case q in q) :;; esac; fi)" '"' -${J}X`],
+    [`"$(v=1 case q in q) :;; esac)" '"' -${J}X`],
+  ];
+  for (const [input] of cases) {
+    const words = shellWords(input);
+    assert.equal(words.at(-1), "-X", JSON.stringify([input, words]));
+  }
+});
+
+test("joinContinuations hands a heredoc opened in a substitution to the line that ends the command", () => {
+  // Bash reads the body of `$(cat <<E)` from the lines after it, and a newline inside the
+  // substitution before that belongs to the substitution.
+  assert.equal(shell.joinContinuations(`x=$(cat <<E)\nfoo${J}E\nE\necho 'a${J}b'`), `x=$(cat <<E)\nfooE\nE\necho 'a${J}b'`);
+  assert.equal(shell.joinContinuations(`x=$(cat <<'E')\nfoo${J}E\nE\necho c${J}d`), `x=$(cat <<'E')\nfoo${J}E\nE\necho cd`);
+  assert.equal(shell.joinContinuations(`cat <<'E' "$(:\n)" c${J}d\nfoo${J}E\nE\necho c${J}d`), `cat <<'E' "$(:\n)" cd\nfoo${J}E\nE\necho cd`);
+});
+
+test("shellWordsDetailed gives pattern, operatorAt and procSubAt of the joined word", () => {
+  // [input, word, bareStart, expands, pattern, operatorAt, procSubAt]
+  const cases = [
+    [`a${J}b${J}>f`, "ab>f", true, false, false, [2], []],
+    [`${J}>out`, ">out", true, false, false, [0], []],
+    [`2>${J}&1`, "2>&1", true, false, false, [1], []],
+    [`x>${J}>g`, "x>>g", true, false, false, [1, 2], []],
+    [`x<${J}(a)`, "x<(a)", true, true, false, [], [1]],
+    [`a${J}b>${J}(c)`, "ab>(c)", true, true, false, [], [2]],
+    [`{a${J},b}`, "{a,b}", true, true, true, [], []],
+    [`{a.${J}.c}`, "{a..c}", true, true, true, [], []],
+    [`@${J}(a)`, "@(a)", true, true, true, [], []],
+    [`$$${J}*`, "$$*", true, true, true, [], []],
+    [`$${J}?`, "$?", true, true, false, [], []],
+    [`$${J}{a,b}`, "${a,b}", true, true, false, [], []],
+    [`$$${J}'\\'>g`, "$$\\>g", true, true, false, [3], []],
+    ["$$'*'>g", "$$*>g", true, true, false, [3], []],
+    [`'a${J}b'>f`, `a${J}b>f`, false, false, false, [4], []],
+    [`'a${J}b'<(c)`, `a${J}b<(c)`, false, true, false, [], [4]],
+    [`"$(printf 'a${J}b')">f`, `$(printf 'a${J}b')>f`, false, true, false, [16], []],
+  ];
+  for (const [input, word, bareStart, expands, pattern, operatorAt, procSubAt] of cases) {
+    assert.deepEqual(shell.shellWordsDetailed(input), [{ word, bareStart, expands, pattern, operatorAt, procSubAt }], JSON.stringify(input));
+  }
+});
+
+test("joinContinuations removes a pair where bash does and keeps it where bash does", () => {
+  const cases = [
+    [`cat $${J}(x)`, "cat $(x)"],
+    [`echo "$(echo a${J}b)"`, 'echo "$(echo ab)"'],
+    [`echo $${J}'a\\'b' c${J}d`, "echo $'a\\'b' cd"],
+    // Inside double quotes `$'` opens nothing: the pair is removed and the quote is a character.
+    [`echo "$'a${J}b'"`, `echo "$'ab'"`],
+    ["echo a\\\\\nb" + J, "echo a\\\\\nb"],
+    [`echo a ${J}#c${J}next`, `echo a #c${J}next`],
+    [`echo a${J}#b${J}c`, "echo a#bc"],
+    // An unquoted body is joined before its terminator is matched; a quoted one is kept.
+    [`cat <<E\nfoo${J}E\nbar\nE\necho a${J}b`, "cat <<E\nfooE\nbar\nE\necho ab"],
+    [`cat <<E${J}OF\nx\nEOF\necho 'a${J}b'`, `cat <<EOF\nx\nEOF\necho 'a${J}b'`],
+    [`cat <${J}<'E'\na${J}b\nE\necho c${J}d`, `cat <<'E'\na${J}b\nE\necho cd`],
+    [`cat <<${J}-E\n\tE\necho 'a${J}b'`, `cat <<-E\n\tE\necho 'a${J}b'`],
+    [`cat <<'E F'\na${J}b\nE F\necho c${J}d`, `cat <<'E F'\na${J}b\nE F\necho cd`],
+    // No heredoc: a herestring, a shift, a subscript, an expansion.
+    [`cat <<${J}<x\necho 'a${J}b'`, `cat <<<x\necho 'a${J}b'`],
+    [`echo $${J}((1<<2))\necho 'a${J}b'`, `echo $((1<<2))\necho 'a${J}b'`],
+    [`echo $[1<<2]\necho 'a${J}b'`, `echo $[1<<2]\necho 'a${J}b'`],
+    [`echo \${x:-<<E}\necho 'a${J}b'`, `echo \${x:-<<E}\necho 'a${J}b'`],
+    [`a[1<<2]=3\necho 'a${J}b'`, `a[1<<2]=3\necho 'a${J}b'`],
+    [`x=1 a[1<<2]=3\necho 'a${J}b'`, `x=1 a[1<<2]=3\necho 'a${J}b'`],
+    // Inside backticks bash removes every pair, then reads the program; an escaped backslash stays.
+    [`echo \`echo 'a${J}b'\``, "echo `echo 'ab'`"],
+    [`echo \`echo a # c${J}echo b\``, "echo `echo a # cecho b`"],
+    [`echo \`echo 'a\\${J}b'\``, `echo \`echo 'a\\${J}b'\``],
+    [`echo \`true\`'a${J}b'`, `echo \`true\`'a${J}b'`],
+  ];
+  assert.equal(typeof shell.joinContinuations, "function");
+  for (const [input, joined] of cases) {
+    assert.equal(shell.joinContinuations(input), joined, JSON.stringify(input));
+    assert.equal(shell.joinContinuations(joined), joined, `again: ${JSON.stringify(joined)}`);
+  }
 });
 
 // A gate that reads a word's text needs to know when the shell would expand it, and where a bare

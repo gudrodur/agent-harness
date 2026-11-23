@@ -411,15 +411,391 @@ export const splitSegmentsDetailed = (command) => {
 // - `procSubAt`: the offsets in `word` of each bare `<(` or `>(`, a process
 //   substitution. Bash passes a `/dev/fd` path to a command it runs alongside, so a
 //   gate can neither read the word as a file nor know what that command writes.
-// Out of scope: history `!` expansion, word splitting of an unquoted expansion, a
-// backslash-newline joining two lines (an issue of its own), and the words inside a
-// process substitution: they come back as plain words, and splitSegments splits at a
-// `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it were outside.
+// A backslash-newline is removed first, where bash removes it (joinContinuations): bare,
+// in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
+// matched). Single quotes, `$'…'`, a comment and a quoted heredoc body keep it, inside a
+// `$(…)` as at the top level.
+// Out of scope: history `!` expansion, word splitting of an unquoted expansion, and
+// the words inside a process substitution: they come back as plain words, and
+// splitSegments splits at a `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it
+// were outside. splitSegments does not join, so an operator split by a backslash-newline
+// gives different segments. A lone backslash at the very end of the text, after any
+// number of joins, is kept.
+
+// What ends a word to bash outside quotes: its blanks and operators, and no other white
+// space (a carriage return and a form feed are part of a word).
+const WORD_BREAK = ' \t\n;&|()<>';
+// After one of these, or an assignment, the next word is still in command position.
+const COMMAND_NEXT = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'time', 'coproc']);
+const ASSIGNS = /^[A-Za-z_]\w*(?:\[|\+?=)/;
+
+// The text without the backslash-newline pairs bash removes before it reads the words.
+// Bash applies its quoting rules afresh in each substitution, so a stack holds the open
+// contexts: `"$(echo 'a')"` is single-quoted inside double quotes.
+// - Removed: bare, in double quotes, in an unquoted heredoc body (before its terminator
+//   is matched), and anywhere between backticks, a quote or a comment there included,
+//   as bash looks for the closing backtick first.
+// - Kept: in single quotes and `$'…'`, in a comment, and in the body of a heredoc with
+//   a quoted delimiter, each also inside `$(…)`, and a backslash that is itself escaped.
+// A `#` opens a comment only at the start of a word, that is after bash's own blanks
+// (space, tab, newline) and operators (`;&|()<>`), and never after a carriage return, a
+// form feed or a closed substitution glued to it; a pair removed before it does not start
+// one. A `case` statement is followed as a grammar, per context, so that the `)` that ends
+// a pattern does not close a `$(…)`: `case` and `esac` count only in command position (not
+// after a redirection operator, nor as a pattern or an argument), `in` only right after the
+// subject, and a `|` in a pattern list starts no command. A heredoc is read from the
+// newline of the context that opened it (one that opens in a `$(…)` closed on its line
+// is read after the outer line).
+// Joining joined text changes nothing. Linear in the text.
+export const joinContinuations = (input) => {
+  const s = String(input ?? '');
+  if (!s.includes('\\\n')) return s;
+  const n = s.length;
+  let out = '';
+  let i = 0;
+  let wordStart = true;
+  let word = ''; // the bare start of the word being read, for reserved words and assignments
+  let last = ''; // the bare character just read
+  // `cmd`: top level, `$( )`, `<( )`, `( )` and a list that is part of a word (`a=( )`,
+  // `@( )`); `arith`: `$(( ))`, `(( ))`; `bracket`: `$[ ]` and a subscript; `brace`:
+  // `${ }`; `dq`: double quotes. Only `cmd` has comments and heredocs. `glued` says the
+  // word goes on after the context closes, and `first` that a reserved word may stand here.
+  // `pending` holds the heredocs opened on the current line of this context, and `cs` the
+  // open `case` statements, innermost last, each in one state: `subject` (to the word after
+  // `case`), `in` (to the word `in`), `pats` (at the start of a pattern list: `esac` ends the
+  // statement), `pat` (in a pattern, to the `)`), `body` (the commands after it, to `;;`).
+  const context = (kind, glued, list = false) =>
+    ({ kind, glued, list, before: word && `${word}"`, depth: 0, cs: [], pending: [], first: kind === 'cmd' && !list });
+  const stack = [context('cmd', false)];
+  // A reserved word stands only where a command may start, and no pattern or subject does.
+  const commandPos = (ctx) => ctx.first && (ctx.cs.length === 0 || ctx.cs.at(-1) === 'body');
+  const caseState = (ctx, state) => {
+    ctx.cs[ctx.cs.length - 1] = state;
+  };
+  // An operator's next character, past the pairs bash removes between the two.
+  const skip = (from) => {
+    let j = from;
+    while (s[j] === '\\' && s[j + 1] === '\n') j += 2;
+    return j;
+  };
+  const enter = (kind, opener, next, glued = true, list = false) => {
+    stack.push(context(kind, glued, list));
+    out += opener;
+    i = next;
+    wordStart = true;
+    word = last = '';
+  };
+  const leave = () => {
+    const { glued, before, pending } = stack.pop();
+    // Bash reads a heredoc opened here from the lines after the one that ends the outer command.
+    stack.at(-1).pending.push(...pending);
+    wordStart = !glued;
+    word = glued ? before : '';
+    last = '';
+    if (!glued) stack.at(-1).first = true;
+  };
+  // A quote, an escape or an expansion in a word: it is then no reserved word.
+  const inWord = () => {
+    wordStart = false;
+    if (word) word += '"';
+  };
+  const endWord = (ctx) => {
+    if (!wordStart) {
+      const state = ctx.cs.at(-1);
+      if (state === 'subject') caseState(ctx, 'in');
+      else if (state === 'in') {
+        if (word === 'in') caseState(ctx, 'pats');
+      } else if (state === 'pats') {
+        if (word === 'esac') ctx.cs.pop();
+        else caseState(ctx, 'pat');
+      } else if (state !== 'pat') {
+        const reserved = commandPos(ctx);
+        if (reserved && word === 'case') ctx.cs.push('subject');
+        else if (reserved && word === 'esac' && state === 'body') ctx.cs.pop();
+        ctx.first = reserved && (COMMAND_NEXT.has(word) || ASSIGNS.test(word));
+      }
+    }
+    word = '';
+  };
+  // To the first backtick no backslash escapes.
+  const backticks = () => {
+    out += '`';
+    i++;
+    while (i < n) {
+      if (s[i] === '\\') {
+        if (s[i + 1] !== '\n') out += s.slice(i, i + 2);
+        i += 2;
+      } else {
+        out += s[i++];
+        if (s[i - 1] === '`') break;
+      }
+    }
+    inWord();
+  };
+  // Literal to the closing quote; in `$'…'` a backslash escapes the next character.
+  const quoted = (opener, from, ansi) => {
+    let j = from;
+    while (j < n && s[j] !== "'") j += ansi && s[j] === '\\' ? 2 : 1;
+    const end = Math.min(j + 1, n);
+    out += opener + s.slice(from, end);
+    i = end;
+    inWord();
+  };
+  // The delimiter word after `<<`, itself joined, with its quotes read off.
+  const heredoc = (after) => {
+    out += '<<';
+    let j = skip(after);
+    const strip = s[j] === '-';
+    if (strip) {
+      out += '-';
+      j = skip(j + 1);
+    }
+    while (s[j] === ' ' || s[j] === '\t') {
+      out += s[j];
+      j = skip(j + 1);
+    }
+    let tag = '';
+    let named = false;
+    let literal = false;
+    let quote = '';
+    while (j < n) {
+      const d = s[j];
+      if (d === '\\' && quote !== "'") {
+        const next = s[j + 1] ?? '';
+        if (next !== '\n') {
+          out += d + next;
+          tag += !quote || '$`"\\'.includes(next) ? next : d + next;
+          named = literal = true;
+        }
+        j += 2;
+        continue;
+      }
+      if (quote ? d === '\n' : WORD_BREAK.includes(d)) break;
+      if (d === quote) quote = '';
+      else if (!quote && (d === "'" || d === '"')) {
+        quote = d;
+        literal = true;
+      } else tag += d;
+      named = true;
+      out += d;
+      j++;
+    }
+    if (named) stack.at(-1).pending.push({ tag, literal, strip });
+    i = j;
+    wordStart = false;
+  };
+  // A heredoc body, line by line to its terminator.
+  const body = (doc) => {
+    while (i < n) {
+      let line = '';
+      while (i < n && s[i] !== '\n') {
+        if (!doc.literal && s[i] === '\\') {
+          if (s[i + 1] !== '\n') line += s.slice(i, i + 2);
+          i += 2;
+        } else line += s[i++];
+      }
+      out += line;
+      if (i < n) {
+        out += '\n';
+        i++;
+      }
+      if ((doc.strip ? line.replace(/^\t+/, '') : line) === doc.tag) break;
+    }
+  };
+  // What a `$` opens, read past the pairs after it.
+  const dollar = (inDouble) => {
+    const j = skip(i + 1);
+    const next = s[j];
+    if (next === '(') {
+      const k = skip(j + 1);
+      if (s[k] === '(') enter('arith', '$((', k + 1);
+      else enter('cmd', '$(', j + 1);
+    } else if (next === '$') {
+      out += '$$'; // the pid parameter: its second `$` opens nothing
+      i = j + 1;
+      inWord();
+    } else if (next === '{') enter('brace', '${', j + 1);
+    else if (next === '[') enter('bracket', '$[', j + 1);
+    else if (next === "'" && !inDouble) quoted("$'", j + 1, true);
+    else {
+      out += '$';
+      i++;
+      inWord();
+    }
+  };
+
+  while (i < n) {
+    const ctx = stack.at(-1);
+    const c = s[i];
+    if (c === '\\') {
+      if (s[i + 1] !== '\n') {
+        out += s.slice(i, i + 2);
+        inWord();
+        last = '';
+      }
+      i += 2; // a removed pair leaves the word where it was
+      continue;
+    }
+    if (c === '$') {
+      dollar(ctx.kind === 'dq');
+      continue;
+    }
+    if (c === '`') {
+      backticks();
+      continue;
+    }
+    if (c === '"') {
+      if (ctx.kind === 'dq') leave();
+      else stack.push(context('dq', true));
+      out += c;
+      i++;
+      wordStart = false;
+      continue;
+    }
+    if (ctx.kind === 'dq') {
+      out += c;
+      i++;
+      continue;
+    }
+    if (c === "'") {
+      quoted(c, i + 1, false);
+      continue;
+    }
+    if (ctx.kind === 'cmd') {
+      // `a=(` and the extglob `@(` go on as one word; any other `(` is an operator.
+      const list = c === '(' && !wordStart && last !== '' && '=?*+@!'.includes(last);
+      if (WORD_BREAK.includes(c) && !list) endWord(ctx);
+      // The word after a redirection operator, or a process substitution, is no reserved word.
+      if (c === '<' || c === '>') ctx.first = false;
+      // `;;`, `;&` and `;;&` end a case body: a pattern list or `esac` follows.
+      if (c === ';' && ctx.cs.at(-1) === 'body' && ';&'.includes(s[skip(i + 1)] ?? '\0')) caseState(ctx, 'pats');
+      if (c === '\n' && ctx.pending.length) {
+        out += c;
+        i++;
+        for (const doc of ctx.pending.splice(0)) body(doc);
+        wordStart = true;
+        ctx.first = !ctx.list;
+        continue;
+      }
+      if (c === '#' && wordStart) {
+        let end = s.indexOf('\n', i);
+        if (end < 0) end = n;
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (wordStart && commandPos(ctx) && /[A-Za-z_]/.test(c)) {
+        // `a[1<<2]=3` shifts up to the `]`.
+        SUBSCRIPT.lastIndex = i;
+        if (SUBSCRIPT.test(s)) {
+          word = s.slice(i, SUBSCRIPT.lastIndex);
+          stack.push(context('bracket', true));
+          out += word;
+          i = SUBSCRIPT.lastIndex;
+          wordStart = false;
+          continue;
+        }
+      }
+      if (c === '<' || c === '>') {
+        const j = skip(i + 1);
+        if (s[j] === '(') {
+          enter('cmd', `${c}(`, j + 1);
+          continue;
+        }
+        if (c === '<' && s[j] === '<') {
+          const k = skip(j + 1);
+          if (s[k] === '<') {
+            out += '<<<';
+            i = k + 1;
+            wordStart = true;
+          } else heredoc(j + 1);
+          continue;
+        }
+      }
+      if (c === '(' && !list && ctx.cs.at(-1) === 'pats') {
+        // The optional `(` before a pattern: its `)` ends the list, not a subshell.
+        caseState(ctx, 'pat');
+        out += c;
+        i++;
+        wordStart = true;
+        continue;
+      }
+      if (c === '(') {
+        const j = skip(i + 1);
+        if (wordStart && s[j] === '(') enter('arith', '((', j + 1, false);
+        else enter('cmd', '(', i + 1, list, list);
+        continue;
+      }
+    }
+    out += c;
+    i++;
+    if (ctx.kind === 'brace') {
+      wordStart = false;
+      if (c === '}') leave();
+      continue;
+    }
+    if (ctx.kind === 'bracket') {
+      if (c === '[') ctx.depth++;
+      else if (c === ']') {
+        if (ctx.depth) ctx.depth--;
+        else leave();
+      }
+      continue;
+    }
+    if (ctx.kind === 'arith') {
+      if (c === '(') ctx.depth++;
+      else if (c === ')') {
+        if (ctx.depth) ctx.depth--;
+        else {
+          const j = skip(i);
+          if (s[j] === ')') {
+            out += ')';
+            i = j + 1;
+            leave();
+            continue;
+          }
+          // `$((a); b)` is a substitution that opens with a subshell.
+          ctx.kind = 'cmd';
+          ctx.first = false;
+          word = '';
+        }
+      }
+      wordStart = WORD_BREAK.includes(c);
+      continue;
+    }
+    if (c === ')') {
+      const state = ctx.cs.at(-1);
+      if (state === 'pats' || state === 'pat') {
+        // The `)` that ends a pattern list; the commands follow.
+        caseState(ctx, 'body');
+        ctx.first = true;
+        wordStart = true;
+        last = '';
+        continue;
+      }
+      if (state === undefined && stack.length > 1) {
+        leave();
+        continue;
+      }
+    }
+    const redirects = c === '&' && (last === '<' || last === '>');
+    last = c;
+    if (WORD_BREAK.includes(c)) {
+      wordStart = true;
+      // An `&` that follows `<` or `>` is part of a redirection (`>&2`), not a command separator.
+      if (';&|)\n'.includes(c) && !redirects) ctx.first = !ctx.list;
+    } else {
+      if (wordStart || word) word += c;
+      wordStart = false;
+    }
+  }
+  return out;
+};
 // What may follow a `$` for the shell to expand it, in double quotes and bare.
 const EXPANSION_START_QUOTED = /[A-Za-z0-9_{(\[@*#?$!-]/;
 const EXPANSION_START_BARE = /[A-Za-z0-9_{(\[@*#?$!'"-]/;
 export const shellWordsDetailed = (segment) => {
-  const text = String(segment ?? '');
+  const text = joinContinuations(segment);
   const words = [];
   let cur = null;
   let bareStart = false;
@@ -485,7 +861,8 @@ export const shellWordsDetailed = (segment) => {
       i += 2;
       continue;
     }
-    if (c === '$' && text[i + 1] === "'") {
+    // The second `$` of `$$` names the pid, so it opens no `$'…'`.
+    if (c === '$' && text[i + 1] === "'" && !paramNext) {
       // ANSI-C quoting: a backslash escapes the next character, `\'` included. The word keeps
       // the text undecoded, as before; it expands, so no gate reads it as literal anyway.
       expands = true;
