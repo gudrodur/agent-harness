@@ -149,6 +149,14 @@ test('a model that is not a Claude alias or id is refused', async () => {
   assert.match(r.err, /--model takes opus/);
 });
 
+test('--snapshot-model stands in for --model when there is none, and an explicit --model wins over it', async () => {
+  const alone = await tab(['--title', 't', '--brief', brief, '--snapshot-model', 'gpt-5', '--cwd', cwd]);
+  assert.equal(alone.code, 1);
+  assert.match(alone.err, /--model takes opus, sonnet, haiku, fable or a full claude-\* id, got: gpt-5/);
+  const both = await tab(full('--snapshot-model', 'gpt-5'));
+  assert.doesNotMatch(both.err, /unknown argument|--model takes/);
+});
+
 test('a relative --brief is refused', async () => {
   const r = await tab(['--title', 't', '--brief', 'brief.md', '--model', 'opus', '--cwd', cwd]);
   assert.equal(r.code, 1);

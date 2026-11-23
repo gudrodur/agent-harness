@@ -161,7 +161,12 @@ replay() {
       printf 'SKIP %s live in pid %s\n' "$sid" "$(printf '%s' "$live" | jq -r .pid)"
       continue
     fi
-    local args=(--resume "$sid" --title "$(printf '%s' "$row" | jq -r .title)" --model "$(printf '%s' "$row" | jq -r .model)")
+    role=$(printf '%s' "$row" | jq -r '.role // ""')
+    # A role seat's recorded model is only what it last ran on, so it travels as --snapshot-model:
+    # the launcher lets the role's agent model win over it. A seat with no role keeps --model.
+    local model_flag=--model
+    [ -z "$role" ] || model_flag=--snapshot-model
+    local args=(--resume "$sid" --title "$(printf '%s' "$row" | jq -r .title)" "$model_flag" "$(printf '%s' "$row" | jq -r .model)")
     if [ "$(printf '%s' "$row" | jq -r .rc)" = true ]; then
       rc_name=$(printf '%s' "$row" | jq -r .rcName)
       if [ -n "${TAKEN_RC["$rc_name"]:-}" ]; then
@@ -172,7 +177,6 @@ replay() {
       TAKEN_RC["$rc_name"]=1
       args+=(--rc "$rc_name")
     fi
-    role=$(printf '%s' "$row" | jq -r '.role // ""')
     [ -z "$role" ] || args+=(--role "$role")
     if [ "$dry" = 1 ]; then
       printf 'WOULD %s' "$TAB"; printf ' %q' "${args[@]}"; printf '\n'
