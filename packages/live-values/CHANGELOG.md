@@ -15,11 +15,12 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 - `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare,
-  in double quotes and in backticks the pair is removed before the words are read, so a
-  word split over two lines reads whole. Single quotes, `$'...'`, a comment and a quoted
-  heredoc body keep it, also inside `$(...)` and `${...}`: the join follows a stack of
-  those contexts (`joinContinuations`, exported), and a `#` opens a comment only after
-  bash's own blanks and operators. The second `$` of `$$` opens no `$'...'`, so a quote
+  in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
+  matched) the pair is removed before the words are read, so a word split over two lines
+  reads whole. Single quotes, `$'...'`, a comment and a quoted heredoc body keep it, also
+  inside `$(...)`: the join follows a stack of those contexts (`joinContinuations`,
+  exported) with the `case` grammar and the heredocs of each, and a `#` opens a comment
+  only after bash's own blanks and operators. The second `$` of `$$` opens no `$'...'`, so a quote
   after the pid parameter hides no flag after it. Known limits: `splitSegments` does not
   join, so an operator split by a backslash-newline gives different segments, and a lone
   backslash at the very end of the text is kept. (#57)

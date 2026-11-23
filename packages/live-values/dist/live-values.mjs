@@ -133,9 +133,12 @@ var joinContinuations = (input) => {
   let wordStart = true;
   let word = "";
   let last = "";
-  const pending = [];
-  const context = (kind, glued, list = false) => ({ kind, glued, list, before: word && `${word}"`, depth: 0, cases: 0, first: kind === "cmd" && !list });
+  const context = (kind, glued, list = false) => ({ kind, glued, list, before: word && `${word}"`, depth: 0, cs: [], pending: [], first: kind === "cmd" && !list });
   const stack = [context("cmd", false)];
+  const commandPos = (ctx) => ctx.first && (ctx.cs.length === 0 || ctx.cs.at(-1) === "body");
+  const caseState = (ctx, state) => {
+    ctx.cs[ctx.cs.length - 1] = state;
+  };
   const skip = (from) => {
     let j = from;
     while (s[j] === "\\" && s[j + 1] === `
@@ -151,7 +154,8 @@ var joinContinuations = (input) => {
     word = last = "";
   };
   const leave = () => {
-    const { glued, before } = stack.pop();
+    const { glued, before, pending } = stack.pop();
+    stack.at(-1).pending.push(...pending);
     wordStart = !glued;
     word = glued ? before : "";
     last = "";
@@ -165,11 +169,25 @@ var joinContinuations = (input) => {
   };
   const endWord = (ctx) => {
     if (!wordStart) {
-      if (ctx.first && word === "case")
-        ctx.cases++;
-      else if (ctx.first && word === "esac" && ctx.cases > 0)
-        ctx.cases--;
-      ctx.first = ctx.first && (COMMAND_NEXT.has(word) || ASSIGNS.test(word)) || ctx.cases > 0 && word === "in";
+      const state = ctx.cs.at(-1);
+      if (state === "subject")
+        caseState(ctx, "in");
+      else if (state === "in") {
+        if (word === "in")
+          caseState(ctx, "pats");
+      } else if (state === "pats") {
+        if (word === "esac")
+          ctx.cs.pop();
+        else
+          caseState(ctx, "pat");
+      } else if (state !== "pat") {
+        const reserved = commandPos(ctx);
+        if (reserved && word === "case")
+          ctx.cs.push("subject");
+        else if (reserved && word === "esac" && state === "body")
+          ctx.cs.pop();
+        ctx.first = reserved && (COMMAND_NEXT.has(word) || ASSIGNS.test(word));
+      }
     }
     word = "";
   };
@@ -243,7 +261,7 @@ var joinContinuations = (input) => {
       j++;
     }
     if (named)
-      pending.push({ tag, literal, strip });
+      stack.at(-1).pending.push({ tag, literal, strip });
     i = j;
     wordStart = false;
   };
@@ -339,11 +357,15 @@ var joinContinuations = (input) => {
       const list = c === "(" && !wordStart && last !== "" && "=?*+@!".includes(last);
       if (WORD_BREAK.includes(c) && !list)
         endWord(ctx);
+      if (c === "<" || c === ">")
+        ctx.first = false;
+      if (c === ";" && ctx.cs.at(-1) === "body" && ";&".includes(s[skip(i + 1)] ?? "\x00"))
+        caseState(ctx, "pats");
       if (c === `
-` && pending.length) {
+` && ctx.pending.length) {
         out += c;
         i++;
-        for (const doc of pending.splice(0))
+        for (const doc of ctx.pending.splice(0))
           body(doc);
         wordStart = true;
         ctx.first = !ctx.list;
@@ -358,7 +380,7 @@ var joinContinuations = (input) => {
         i = end;
         continue;
       }
-      if (wordStart && ctx.first && /[A-Za-z_]/.test(c)) {
+      if (wordStart && commandPos(ctx) && /[A-Za-z_]/.test(c)) {
         SUBSCRIPT.lastIndex = i;
         if (SUBSCRIPT.test(s)) {
           word = s.slice(i, SUBSCRIPT.lastIndex);
@@ -385,6 +407,13 @@ var joinContinuations = (input) => {
             heredoc(j + 1);
           continue;
         }
+      }
+      if (c === "(" && !list && ctx.cs.at(-1) === "pats") {
+        caseState(ctx, "pat");
+        out += c;
+        i++;
+        wordStart = true;
+        continue;
       }
       if (c === "(") {
         const j = skip(i + 1);
@@ -436,15 +465,26 @@ var joinContinuations = (input) => {
       wordStart = WORD_BREAK.includes(c);
       continue;
     }
-    if (c === ")" && stack.length > 1 && ctx.cases === 0) {
-      leave();
-      continue;
+    if (c === ")") {
+      const state = ctx.cs.at(-1);
+      if (state === "pats" || state === "pat") {
+        caseState(ctx, "body");
+        ctx.first = true;
+        wordStart = true;
+        last = "";
+        continue;
+      }
+      if (state === undefined && stack.length > 1) {
+        leave();
+        continue;
+      }
     }
+    const redirects = c === "&" && (last === "<" || last === ">");
     last = c;
     if (WORD_BREAK.includes(c)) {
       wordStart = true;
       if (`;&|)
-`.includes(c))
+`.includes(c) && !redirects)
         ctx.first = !ctx.list;
     } else {
       if (wordStart || word)
