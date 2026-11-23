@@ -30,6 +30,11 @@ All notable changes to this project are documented here. The format follows
   `$$'x'` is the pid and a plain single quote, so a backslash in it stays a character.
   Where bash reads `$'` literally (a quote glued to a word, as in `a"$'\'"`, a `#` comment
   and a heredoc body) a backslash stays a character too, so the command after it splits.
+  A comment is one bash sees, found by the reader `joinContinuations` uses (`commentSpans`):
+  a `#` after an escaped blank (`a\ #x`), inside `${…}` or `$((…))`, in quotes, after a
+  carriage return or after a removed backslash-newline opens none, and a comment in
+  backticks ends at the closing backtick. Before, `echo a\ #x $'\'';git commit -m x;echo ''`
+  and `echo ${x// #/y} $'\'';…` came back as one segment that hid the commit.
 - `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare,
   in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
   matched) the pair is removed before the words are read, so a word split over two lines

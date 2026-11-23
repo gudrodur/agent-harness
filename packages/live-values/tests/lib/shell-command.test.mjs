@@ -310,6 +310,33 @@ test("splitSegments reads `$'` literally in a glued quote, a comment and a hered
   ]) assert.deepEqual(shell.splitSegments(run), segments, run);
 });
 
+// A `#` opens a comment only where bash opens one: at the start of a word, in a command
+// context. After an escaped blank (`a\ #x` is one word), inside `${…}` or `$((…))`, in
+// quotes, or after a removed backslash-newline it is a character, so `$'` there is ANSI-C
+// quoting and the `;` after `$'\''` splits. In backticks and in `$(…)` a comment ends where
+// the substitution's text or line ends. Bash is the oracle: with `echo RAN` in place of the
+// commit, each command prints RAN.
+test("splitSegments opens a comment only at a word start in a command context", { skip: spawnSync("bash", ["-c", "true"]).status !== 0 && "no bash" }, () => {
+  const commit = "git commit --no-verify -m x";
+  // Each head ends in a quote bash closes; the commit runs after it.
+  const row = (head) => [`${head};${commit};echo ''`, [head, commit, "echo ''"]];
+  for (const [run, segments] of [
+    row("echo a\\ #x $'\\''"),
+    row("echo ${x// #/y} $'\\''"),
+    row("echo ${x:-a #x} $'\\''"),
+    // Not evaluated after `true ||`, so bash's arithmetic error never stops the line.
+    [`true || echo $(( 1 #2 )) $'\\'';${commit};echo ''`, ["true ", " echo $(( 1 #2 )) $'\\''", commit, "echo ''"]],
+    row("echo \"a #x\" $'\\''"),
+    row("echo a\\\n#x $'\\''"),
+    row("echo `true #x $'\\'`"),
+    [`echo $(true #x $'\\'\n);${commit};echo ''`, ["echo $(true #x $'\\'", ")", commit, "echo ''"]],
+  ]) {
+    assert.deepEqual(shell.splitSegments(run), segments, run);
+    const ran = spawnSync("bash", ["-c", run.replace(commit, "echo RAN")], { encoding: "utf8", timeout: 5000, cwd: tmpdir() });
+    assert.match(ran.stdout, /^RAN$/m, `bash runs the hidden command: ${run}`);
+  }
+});
+
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");

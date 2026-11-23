@@ -314,6 +314,9 @@ var splitSegmentsDetailed = (command) => {
       literal.push([starts[h.from], end]);
     }
   }
+  for (const [from, to] of commentSpans(text))
+    literal.push([from, to - 1]);
+  literal.sort((a, b) => a[0] - b[0]);
   let nextLiteral = 0;
   let literalEnd = -1;
   let i = 0;
@@ -324,14 +327,8 @@ var splitSegmentsDetailed = (command) => {
       literalEnd = Math.max(literalEnd, literal[nextLiteral][1]);
       nextLiteral++;
     }
-    if (i > literalEnd) {
-      if (c === "#" && (i === 0 || /[\s;&|()<>]/.test(text[i - 1]))) {
-        const nl = text.indexOf(`
-`, i);
-        literalEnd = nl < 0 ? text.length : nl;
-      } else if ((c === '"' || c === "'") && i > 0 && !QUOTE_OPEN_PRECEDER.test(text[i - 1])) {
-        literalEnd = Math.max(literalEnd, findClose(c, i + 1, false));
-      }
+    if (i > literalEnd && (c === '"' || c === "'") && i > 0 && !QUOTE_OPEN_PRECEDER.test(text[i - 1])) {
+      literalEnd = Math.max(literalEnd, findClose(c, i + 1, false));
     }
     const ansi = dollarOpens && i > literalEnd;
     dollarOpens = false;
@@ -385,8 +382,14 @@ var COMMAND_NEXT = new Set(["if", "then", "else", "elif", "do", "while", "until"
 var ASSIGNS = /^[A-Za-z_]\w*(?:\[|\+?=)/;
 var joinContinuations = (input) => {
   const s = String(input ?? "");
-  if (!s.includes("\\\n"))
-    return s;
+  return s.includes("\\\n") ? readShell(s) : s;
+};
+var commentSpans = (text) => {
+  const spans = [];
+  readShell(String(text ?? ""), spans);
+  return spans;
+};
+var readShell = (s, comments) => {
   const n = s.length;
   let out = "";
   let i = 0;
@@ -454,17 +457,41 @@ var joinContinuations = (input) => {
   const backticks = () => {
     out += "`";
     i++;
+    let text = "";
+    const at = [];
+    let close = n;
     while (i < n) {
       if (s[i] === "\\") {
-        if (s[i + 1] !== `
-`)
+        const next = s[i + 1];
+        if (next !== `
+`) {
           out += s.slice(i, i + 2);
+          if (comments && next !== undefined && "$`\\".includes(next)) {
+            text += next;
+            at.push(i + 1);
+          } else if (comments) {
+            text += s.slice(i, i + 2);
+            at.push(i);
+            if (next !== undefined)
+              at.push(i + 1);
+          }
+        }
         i += 2;
       } else {
         out += s[i++];
-        if (s[i - 1] === "`")
+        if (s[i - 1] === "`") {
+          close = i - 1;
           break;
+        }
+        if (comments) {
+          text += s[i - 1];
+          at.push(i - 1);
+        }
       }
+    }
+    if (comments) {
+      for (const [from, to] of commentSpans(text))
+        comments.push([at[from], to < text.length ? at[to] : close]);
     }
     inWord();
   };
@@ -636,6 +663,7 @@ var joinContinuations = (input) => {
 `, i);
         if (end < 0)
           end = n;
+        comments?.push([i, end]);
         out += s.slice(i, end);
         i = end;
         continue;

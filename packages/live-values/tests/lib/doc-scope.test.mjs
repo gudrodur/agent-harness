@@ -157,6 +157,14 @@ test("checkLocal judges the command after a `$'` that bash reads literally", () 
   assert.equal(checkLocal("cat <<EOF\necho $'\\'\nEOF\ngit commit --no-verify -m x\necho ''", "/").ok, false);
 });
 
+test("checkLocal judges the command after a `#` that bash reads as a character", () => {
+  // An escaped blank before it, or `${…}` around it: no comment, so `$'\''` is ANSI-C quoting.
+  for (const run of [
+    "echo a\\ #x $'\\'';git commit --no-verify -m x;echo ''",
+    "echo ${x// #/y} $'\\'';git commit --no-verify -m x;echo ''",
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: false, reason: "git commit is not a read subcommand" }, run);
+});
+
 test("runCommand returns stdout, and a failure as text that is never empty", () => {
   assert.deepEqual(runCommand("printf 7", { root: "/", timeoutMs: 5000 }), { ok: true, stdout: "7" });
   const bad = runCommand("exit 3", { root: "/", timeoutMs: 5000 });
