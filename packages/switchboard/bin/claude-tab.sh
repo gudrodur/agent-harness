@@ -191,7 +191,7 @@ if [ -n "$RESEAT" ]; then
   SEAT=1
 fi
 # A model recorded by claude-resume-set stands only when none was named: the launcher around this
-# script (agent-config scripts/claude-tab.sh) lets a role's agent model outrank it first.
+# script (the launcher of the companion configuration repo) lets a role's agent model outrank it first.
 [ -n "$MODEL" ] || MODEL="$SNAP_MODEL"
 [ -n "$MODEL" ] || die "--model is required: a tab on the account default is the run nobody chose"
 case "$MODEL" in
