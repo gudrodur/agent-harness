@@ -255,7 +255,19 @@ const readScreen = (winId) => {
     return execFileSync(kitty, args, { encoding: 'utf-8', timeout: 5000 }).split('\n').map(plainLine);
   } catch { return null; }
 };
-const dialogOnScreen = (lines) => lines.slice(-DIALOG_ROWS).some((l) => DIALOG_RE.test(l.text));
+// A dialog raised by a background agent while the main session idles is drawn
+// ABOVE the seat's own composer, footer and agents panel, so its footer can
+// stand far above the bottom of the screen: the rows read are the last
+// DIALOG_ROWS above the composer and everything under it, never fewer than the
+// last DIALOG_ROWS of the screen. Spaces of any width count as the space the
+// footer strings are written with.
+const UNICODE_SPACE_RE = /[   -   　]/g;
+const dialogOnScreen = (lines) => {
+  const text = lines.map((l) => l.text.replace(UNICODE_SPACE_RE, ' '));
+  const { top } = composerBounds(text);
+  const from = Math.min(text.length, top ?? text.length) - DIALOG_ROWS;
+  return text.slice(Math.max(0, Math.min(from, text.length - DIALOG_ROWS))).some((l) => DIALOG_RE.test(l));
+};
 
 // ---- a busy record: its own turn, or only background work ---------------------
 //

@@ -253,6 +253,21 @@ for (const flags of [[], ['--now'], ['--wait-idle', '2']]) {
   });
 }
 
+// A background agent's permission prompt over an idle main prompt: the record
+// can read busy, idle or shell, and the answer to a dialog is a key press made
+// in the window, never typed text: exit 4, nothing sent, "1" included.
+for (const screen of ['SUBAGENT_DIALOG_AT_IDLE_PROMPT', 'SUBAGENT_DIALOG_LONG_PANEL', 'SUBAGENT_DIALOG_NBSP_FOOTER']) {
+  for (const status of ['busy', 'idle']) {
+    test(`(c) --now "1" into a background agent's dialog (${screen}, record ${status}) is refused, nothing sent`, async () => {
+      await reset('burst', status);
+      await fs.writeFile(path.join(stateDir, 'screen'), BG[screen]);
+      const r = await runScript(['--to', WID, '--text', '1', '--timeout', '4', '--now']);
+      assert.equal(r.code, 4, `${r.out}${r.err}`);
+      assert.deepEqual(await calls(), []);
+    });
+  }
+}
+
 // ---- a command that ends the conversation never reaches a seat with background work ----
 // /exit and /quit would end that work, /clear and /new (and their alias /reset)
 // wipe the conversation waiting on it. Exit 23, as --retire and --close give.
