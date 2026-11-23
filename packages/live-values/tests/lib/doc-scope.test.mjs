@@ -96,6 +96,33 @@ test("runCommand's failure carries the whole stdout and stderr as raw, beyond th
   assert.match(dead.raw, /seen/);
 });
 
+test("checkLocal reads quotes the way bash does when it looks for a redirect", () => {
+  const WRITES = { ok: false, reason: "writes a file" };
+  // An escaped quote outside quotes opens no span, so the redirect after it is real.
+  for (const run of [
+    "echo \\' > /tmp \\'",
+    'echo \\" > /tmp \\"',
+    "echo \\' >/tmp/x",
+    "echo \\\\> /tmp/x",
+    "echo a\\>b > /tmp/x",
+    "echo $'\\'' > /tmp/x",
+    "echo hi >| /tmp/x",
+    "(echo hi > /tmp/x)",
+  ]) assert.deepEqual(checkLocal(run, "/"), WRITES, run);
+  // A `>` that is text, not a redirect.
+  for (const run of [
+    "echo '>' /tmp",
+    'echo ">" /tmp',
+    "echo \\> /tmp",
+    "echo a\\>b",
+    "echo $'\\'>'",
+    "echo \"say \\\"> x\\\"\"",
+    "echo hi > /dev/null",
+    "echo hi 2>&1",
+    "(echo hi > /dev/null)",
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: true }, run);
+});
+
 test("runCommand returns stdout, and a failure as text that is never empty", () => {
   assert.deepEqual(runCommand("printf 7", { root: "/", timeoutMs: 5000 }), { ok: true, stdout: "7" });
   const bad = runCommand("exit 3", { root: "/", timeoutMs: 5000 });

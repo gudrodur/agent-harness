@@ -14,6 +14,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `checkLocal` no longer misses a redirect that follows an escaped quote: `echo \' > /tmp \'`
+  returned `ok: true` because `\'` opened a quote span that hid the real `> /tmp`. The write
+  check now reads the command with the shared `shellWordsDetailed` scanner, so a backslash-escaped
+  quote opens no span, a quoted `>` stays text, and `> /dev/null` and `2>&1` stay allowed.
+  `dist/` is unchanged.
 - `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare,
   in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
   matched) the pair is removed before the words are read, so a word split over two lines

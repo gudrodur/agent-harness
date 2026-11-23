@@ -22,7 +22,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { commandStart, commandWord, shellWords, splitSegments, splitSegmentsDetailed } from "./shell-command.mjs";
+import { commandStart, commandWord, shellWords, shellWordsDetailed, splitSegments, splitSegmentsDetailed } from "./shell-command.mjs";
 
 // live-values' scope, portable to any repo it is copied into:
 // collectFiles plus the agent-facing docs of a project repo - root CLAUDE.md,
@@ -151,11 +151,21 @@ const NODE_TEST_FILE_RE = /^(?:~\/\.[\w-]+\/|\.\/)?(?:scripts|skills|templates)\
 const REDIRECT_WORD_RE = /^(?:\d*>&?\d*|>>?|<)$/;
 
 // Output redirected anywhere but /dev/null (or a descriptor, `2>&1`) writes a file.
+// Read with the shared word scanner, so quotes and backslashes mean what they mean to bash: an
+// escaped quote opens no span, and a quoted `>` is text. A `>` the scanner saw bare is a redirect.
 const writesFile = (segment) => {
-  const bare = segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, " ");
-  for (const m of bare.matchAll(/(?:\d*|&)>>?\s*(&?)([^\s;|&)]*)/g)) {
-    if (m[1] === "&" || m[2] === "/dev/null") continue;
-    return true;
+  const words = shellWordsDetailed(segment);
+  for (let w = 0; w < words.length; w++) {
+    const { word, operatorAt } = words[w];
+    for (const at of operatorAt) {
+      if (word[at] !== ">") continue;
+      // `>>`, then `&` for a descriptor (`2>&1`, `>&2`) or `|` for clobber; the rest is the target.
+      let rest = word.slice(at + 1).replace(/^>/, "");
+      if (rest.startsWith("&")) continue;
+      if (rest === "") rest = words[w + 1]?.word ?? "";
+      if (rest.match(/^[^;|&)]*/)[0] === "/dev/null") continue;
+      return true;
+    }
   }
   return false;
 };
