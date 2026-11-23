@@ -428,6 +428,8 @@ test("joinContinuations removes a pair where bash does and keeps it where bash d
     [`cat $${J}(x)`, "cat $(x)"],
     [`echo "$(echo a${J}b)"`, 'echo "$(echo ab)"'],
     [`echo $${J}'a\\'b' c${J}d`, "echo $'a\\'b' cd"],
+    // Inside double quotes `$'` opens nothing: the pair is removed and the quote is a character.
+    [`echo "$'a${J}b'"`, `echo "$'ab'"`],
     ["echo a\\\\\nb" + J, "echo a\\\\\nb"],
     [`echo a ${J}#c${J}next`, `echo a #c${J}next`],
     [`echo a${J}#b${J}c`, "echo a#bc"],
