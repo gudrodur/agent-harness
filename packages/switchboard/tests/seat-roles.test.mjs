@@ -91,14 +91,18 @@ test('a later claim takes the role over', async () => {
 
 test('rolesForSessionLatest lists a session\'s roles newest claim first', async () => {
   const { claimRole, rolesForSessionLatest } = await roles();
-  await withDb((db) => {
+  // Its own store: the shared one feeds the candidate-list cases below, which count role holders.
+  const { openStore } = await import('../lib/store.mjs');
+  const own = openStore(path.join(fs.mkdtempSync(path.join(tmp, 'latest-')), 'state.db'));
+  try {
+    const db = own;
     claimRole(db, { role: 'a-old', sessionId: 'multi-1', now: 1000 });
     claimRole(db, { role: 'z-new', sessionId: 'multi-1', now: 3000 });
     claimRole(db, { role: 'm-mid', sessionId: 'multi-1', now: 2000 });
     assert.deepEqual(rolesForSessionLatest(db, 'multi-1'), ['z-new', 'm-mid', 'a-old']);
     assert.deepEqual(rolesForSessionLatest(db, 'nobody'), []);
     assert.deepEqual(rolesForSessionLatest(db, null), []);
-  });
+  } finally { own.close(); }
 });
 
 test('a send queued for a role names --cancel --id, and that withdraws it', () => {
