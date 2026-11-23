@@ -14,6 +14,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `checkLocal` no longer misses a redirect that follows an escaped quote: `echo \' > /tmp \'`
+  returned `ok: true` because `\'` opened a quote span that hid the real `> /tmp`. The write
+  check now reads the command two ways and counts a write if either sees one: the shared
+  `shellWordsDetailed` scanner (a backslash-escaped quote opens no span) and the older
+  closed-span regex (which still sees a `>` after an unterminated quote or a quote glued to a
+  letter, as in `echo a'b;echo c'>x`). Cost: a backslash-escaped `>` (`echo \> x`) still counts
+  as a write; never a missed one.
+- `>&` is a descriptor only before a bare number or `-` (`2>&1`, `>&-`); `>&x`, `>&1x`,
+  `>'&1'` and `>\&1` write a file, as in bash.
+- `splitSegments` reads a backslash in single quotes as a character: `'a\'` is a closed span,
+  so a `;` after it splits and a `>` after it is seen. The bundle in `dist/` is rebuilt.
+- `splitSegments` reads a backslash in `$'…'` (ANSI-C quoting) as an escape, as bash does:
+  `echo $'\'';git commit -m x;echo \'` is three segments again, not one that hid the commit.
+  `$$'x'` is the pid and a plain single quote, so a backslash in it stays a character.
+  Where bash reads `$'` literally (a quote glued to a word, as in `a"$'\'"`, a `#` comment
+  and a heredoc body) a backslash stays a character too, so the command after it splits.
+  A comment is one bash sees, found by the reader `joinContinuations` uses (`commentSpans`):
+  a `#` after an escaped blank (`a\ #x`), inside `${…}` or `$((…))`, in quotes, after a
+  carriage return or after a removed backslash-newline opens none, and a comment in
+  backticks ends at the closing backtick. Before, `echo a\ #x $'\'';git commit -m x;echo ''`
+  and `echo ${x// #/y} $'\'';…` came back as one segment that hid the commit.
 - `shellWordsDetailed` and `shellWords` join a backslash-newline as bash does: bare,
   in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
   matched) the pair is removed before the words are read, so a word split over two lines

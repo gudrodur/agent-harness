@@ -275,6 +275,68 @@ test("splitSegmentsDetailed keeps >| inside its segment; a real pipe still split
   assert.deepEqual(splitSegmentsDetailed("echo \\> | cat").length, 2);
 });
 
+// Inside single quotes a backslash is a character: it escapes nothing, `'a\'` is closed.
+test("splitSegments reads a backslash in single quotes as a character", () => {
+  assert.deepEqual(shell.splitSegments("echo 'a\\' ; echo 'b' > x"), ["echo 'a\\' ", " echo 'b' > x"]);
+  // In double quotes it still escapes the quote.
+  assert.deepEqual(shell.splitSegments('echo "a\\" ; b" ; ls'), ['echo "a\\" ; b" ', " ls"]);
+});
+
+// `$'…'` is ANSI-C quoting: a backslash escapes the next character, so `$'\''` is one quote
+// character and the `;` after it splits. `$$` is the pid, so in `$$'x'` the quote is a plain
+// single quote and a backslash in it is a character; `$$$'x'` is the pid and then `$'x'`, and an
+// escaped `\$` opens nothing. Each split is the one bash runs.
+test("splitSegments reads `$'…'` with its escapes, and `$$'…'` as the pid and a plain quote", () => {
+  for (const [run, segments] of [
+    [String.raw`echo $'\'';git commit --no-verify -m x;echo \'`, [String.raw`echo $'\''`, "git commit --no-verify -m x", String.raw`echo \'`]],
+    [String.raw`echo $'\\';git commit --no-verify -m x;echo x`, [String.raw`echo $'\\'`, "git commit --no-verify -m x", "echo x"]],
+    [String.raw`echo $'a\'b ';git commit --no-verify -m x;echo 'c'`, [String.raw`echo $'a\'b '`, "git commit --no-verify -m x", "echo 'c'"]],
+    [String.raw`echo $$$'a\'';git commit --no-verify -m x;echo \'`, [String.raw`echo $$$'a\''`, "git commit --no-verify -m x", String.raw`echo \'`]],
+    [String.raw`echo $$'a\';echo b`, [String.raw`echo $$'a\'`, "echo b"]],
+    [String.raw`echo \$'a\';echo b`, [String.raw`echo \$'a\'`, "echo b"]],
+  ]) assert.deepEqual(shell.splitSegments(run), segments, run);
+});
+
+// Bash reads `$'` literally in a quote glued to a word (it opens there, though this
+// splitter's quote gate does not), in a `#` comment and in a heredoc body. There a quote
+// closes at the next quote character, so the `;` or newline after it splits. Each split
+// is the one bash runs.
+test("splitSegments reads `$'` literally in a glued quote, a comment and a heredoc body", () => {
+  for (const [run, segments] of [
+    [String.raw`echo a"$'\'";git commit --no-verify -m x;echo ''`, [String.raw`echo a"$'\'"`, "git commit --no-verify -m x", "echo ''"]],
+    [String.raw`echo a'x$'\';git commit --no-verify -m x;echo ''`, [String.raw`echo a'x$'\'`, "git commit --no-verify -m x", "echo ''"]],
+    ["echo hi # c $'\\'\ngit commit --no-verify -m x\necho ''", ["echo hi # c $'\\'", "git commit --no-verify -m x", "echo ''"]],
+    ["cat <<EOF\necho $'\\'\nEOF\ngit commit --no-verify -m x\necho ''", ["cat <<EOF", "echo $'\\'", "EOF", "git commit --no-verify -m x", "echo ''"]],
+  ]) assert.deepEqual(shell.splitSegments(run), segments, run);
+});
+
+// A `#` opens a comment only where bash opens one: at the start of a word, in a command
+// context. After an escaped blank (`a\ #x` is one word), inside `${…}` or `$((…))`, in
+// quotes, or after a removed backslash-newline it is a character, so `$'` there is ANSI-C
+// quoting and the `;` after `$'\''` splits. In backticks and in `$(…)` a comment ends where
+// the substitution's text or line ends. Bash is the oracle: with `echo RAN` in place of the
+// commit, each command prints RAN.
+test("splitSegments opens a comment only at a word start in a command context", { skip: spawnSync("bash", ["-c", "true"]).status !== 0 && "no bash" }, () => {
+  const commit = "git commit --no-verify -m x";
+  // Each head ends in a quote bash closes; the commit runs after it.
+  const row = (head) => [`${head};${commit};echo ''`, [head, commit, "echo ''"]];
+  for (const [run, segments] of [
+    row("echo a\\ #x $'\\''"),
+    row("echo ${x// #/y} $'\\''"),
+    row("echo ${x:-a #x} $'\\''"),
+    // Not evaluated after `true ||`, so bash's arithmetic error never stops the line.
+    [`true || echo $(( 1 #2 )) $'\\'';${commit};echo ''`, ["true ", " echo $(( 1 #2 )) $'\\''", commit, "echo ''"]],
+    row("echo \"a #x\" $'\\''"),
+    row("echo a\\\n#x $'\\''"),
+    row("echo `true #x $'\\'`"),
+    [`echo $(true #x $'\\'\n);${commit};echo ''`, ["echo $(true #x $'\\'", ")", commit, "echo ''"]],
+  ]) {
+    assert.deepEqual(shell.splitSegments(run), segments, run);
+    const ran = spawnSync("bash", ["-c", run.replace(commit, "echo RAN")], { encoding: "utf8", timeout: 5000, cwd: tmpdir() });
+    assert.match(ran.stdout, /^RAN$/m, `bash runs the hidden command: ${run}`);
+  }
+});
+
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");

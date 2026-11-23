@@ -96,6 +96,75 @@ test("runCommand's failure carries the whole stdout and stderr as raw, beyond th
   assert.match(dead.raw, /seen/);
 });
 
+test("checkLocal reads quotes the way bash does when it looks for a redirect", () => {
+  const WRITES = { ok: false, reason: "writes a file" };
+  // An escaped quote outside quotes opens no span, so the redirect after it is real.
+  for (const run of [
+    "echo \\' > /tmp \\'",
+    'echo \\" > /tmp \\"',
+    "echo \\' >/tmp/x",
+    "echo \\\\> /tmp/x",
+    "echo a\\>b > /tmp/x",
+    "echo $'\\'' > /tmp/x",
+    "echo hi >| /tmp/x",
+    "(echo hi > /tmp/x)",
+    // A quote glued to a letter is no span to the splitter, but one to bash: the `;` it hides
+    // is inside the word, and the `>x` after it is a real redirect.
+    "echo a'b;echo c'>x",
+    "echo don't > x; echo it's",
+    // Only a bare `>&N` or `>&-` is a descriptor; a quoted `&` or a non-number is a file name.
+    "echo hi >'&1'",
+    "echo hi >\\&1",
+    "echo hi >&x",
+    "echo hi >& /tmp/x",
+    "echo hi >&1x",
+  ]) assert.deepEqual(checkLocal(run, "/"), WRITES, run);
+  // A `>` that is text, not a redirect.
+  for (const run of [
+    "echo '>' /tmp",
+    'echo ">" /tmp',
+    "echo \"say \\\"> x\\\"\"",
+    "echo hi > /dev/null",
+    "echo hi 2>&1",
+    "echo hi >&2",
+    "echo hi >&-",
+    "echo hi >&/dev/null",
+    "(echo hi > /dev/null)",
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: true }, run);
+});
+
+test("checkLocal judges the command after a `$'…'` span, where bash splits", () => {
+  // In `$'…'` a backslash escapes the next character, so each span ends where bash ends it.
+  for (const run of [
+    String.raw`echo $'\'';git commit --no-verify -m x;echo \'`,
+    String.raw`echo $'\\';git commit --no-verify -m x;echo x`,
+    String.raw`echo $'a\'b ';git commit --no-verify -m x;echo 'c'`,
+    String.raw`echo $$$'a\'';git commit --no-verify -m x;echo \'`,
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: false, reason: "git commit is not a read subcommand" }, run);
+  // `$$` is the pid: the quote after it is plain, and a backslash in it is a character.
+  assert.deepEqual(checkLocal(String.raw`echo $$'a\';echo b`, "/"), { ok: true });
+});
+
+test("checkLocal judges the command after a `$'` that bash reads literally", () => {
+  // A glued quote and a comment: the commit is its own segment again.
+  for (const run of [
+    String.raw`echo a"$'\'";git commit --no-verify -m x;echo ''`,
+    String.raw`echo a'x$'\';git commit --no-verify -m x;echo ''`,
+    "echo hi # c $'\\'\ngit commit --no-verify -m x\necho ''",
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: false, reason: "git commit is not a read subcommand" }, run);
+  // A heredoc body: checkLocal reads the body and terminator lines as commands, so the
+  // first refusal names the terminator, but the commit no longer hides in one span.
+  assert.equal(checkLocal("cat <<EOF\necho $'\\'\nEOF\ngit commit --no-verify -m x\necho ''", "/").ok, false);
+});
+
+test("checkLocal judges the command after a `#` that bash reads as a character", () => {
+  // An escaped blank before it, or `${…}` around it: no comment, so `$'\''` is ANSI-C quoting.
+  for (const run of [
+    "echo a\\ #x $'\\'';git commit --no-verify -m x;echo ''",
+    "echo ${x// #/y} $'\\'';git commit --no-verify -m x;echo ''",
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: false, reason: "git commit is not a read subcommand" }, run);
+});
+
 test("runCommand returns stdout, and a failure as text that is never empty", () => {
   assert.deepEqual(runCommand("printf 7", { root: "/", timeoutMs: 5000 }), { ok: true, stdout: "7" });
   const bad = runCommand("exit 3", { root: "/", timeoutMs: 5000 });

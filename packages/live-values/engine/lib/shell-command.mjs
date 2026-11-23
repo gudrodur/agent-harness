@@ -320,10 +320,12 @@ export const splitSegmentsDetailed = (command) => {
     cur = '';
     sep = next;
   };
-  const findClose = (q, from) => {
+  // A backslash escapes the next character inside double quotes and inside `$'…'` (ANSI-C
+  // quoting); in plain single quotes it is a character.
+  const findClose = (q, from, ansi) => {
     for (let j = from; j < text.length; j++) {
       const c = text[j];
-      if (c === '\\') {
+      if (c === '\\' && (q === '"' || ansi)) {
         j++;
         continue;
       }
@@ -331,14 +333,49 @@ export const splitSegmentsDetailed = (command) => {
     }
     return -1;
   };
+  // Where bash reads `$'` literally, the old split stands and a quote closes at the next
+  // quote character: a heredoc body with its terminator, a `#` comment, and a quote glued
+  // to a word (`a"$'\'"`, `a'x$'`), which bash opens but this splitter does not. Reading
+  // escapes there would fold the next command into the span. `literalEnd` is the last
+  // index of the literal stretch being read.
+  // A comment is one bash sees (commentSpans): a `#` after an escaped blank (`a\ #x`), in
+  // `${…}` or `$((…))`, or after a removed backslash-newline is a character, and `$'` after
+  // it is ANSI-C quoting again. A comment in backticks ends at the closing backtick.
+  const literal = [];
+  {
+    const lines = text.split('\n');
+    const starts = [];
+    for (let k = 0, at = 0; k < lines.length; at += lines[k].length + 1, k++) starts.push(at);
+    for (const h of scanHeredocs(lines)) {
+      if (h.from >= lines.length) continue;
+      const end = h.to < lines.length ? starts[h.to] + lines[h.to].length : text.length;
+      literal.push([starts[h.from], end]);
+    }
+  }
+  for (const [from, to] of commentSpans(text)) literal.push([from, to - 1]);
+  literal.sort((a, b) => a[0] - b[0]);
+  let nextLiteral = 0;
+  let literalEnd = -1;
   let i = 0;
+  // The previous character was a bare `$` that opens what follows: not the second `$` of
+  // `$$` (the pid, so `$$'x'` is a plain single quote) and not an escaped `\$`.
+  let dollarOpens = false;
   while (i < text.length) {
     const c = text[i];
+    while (nextLiteral < literal.length && literal[nextLiteral][0] <= i) {
+      literalEnd = Math.max(literalEnd, literal[nextLiteral][1]);
+      nextLiteral++;
+    }
+    if (i > literalEnd && (c === '"' || c === "'") && i > 0 && !QUOTE_OPEN_PRECEDER.test(text[i - 1])) {
+      literalEnd = Math.max(literalEnd, findClose(c, i + 1, false));
+    }
+    const ansi = dollarOpens && i > literalEnd;
+    dollarOpens = false;
     if (
       (c === "'" || c === '"') &&
       (i === 0 || QUOTE_OPEN_PRECEDER.test(text[i - 1]))
     ) {
-      const close = findClose(c, i + 1);
+      const close = findClose(c, i + 1, c === "'" && ansi);
       if (close < 0) {
         cur += c;
         i++;
@@ -377,6 +414,7 @@ export const splitSegmentsDetailed = (command) => {
       i++;
       continue;
     }
+    dollarOpens = c === '$' && !ansi;
     cur += c;
     i++;
   }
@@ -449,7 +487,23 @@ const ASSIGNS = /^[A-Za-z_]\w*(?:\[|\+?=)/;
 // Joining joined text changes nothing. Linear in the text.
 export const joinContinuations = (input) => {
   const s = String(input ?? '');
-  if (!s.includes('\\\n')) return s;
+  return s.includes('\\\n') ? readShell(s) : s;
+};
+
+// Each comment bash sees in `text`, as [start, end) offsets: from the `#` to its newline,
+// or, inside a backtick substitution, to the backtick that closes it. The reader is the one
+// joinContinuations uses, so a `#` counts only where it counts there.
+export const commentSpans = (text) => {
+  const spans = [];
+  readShell(String(text ?? ''), spans);
+  return spans;
+};
+
+// The reader behind joinContinuations and commentSpans: returns the joined text, and pushes
+// each comment to `comments` when one is given. Bash takes a backtick substitution's text
+// first (a backslash before `$`, a backtick or a backslash removed) and reads it as
+// commands again, so a comment there is found by reading that text, and ends with it.
+const readShell = (s, comments) => {
   const n = s.length;
   let out = '';
   let i = 0;
@@ -517,18 +571,43 @@ export const joinContinuations = (input) => {
     }
     word = '';
   };
-  // To the first backtick no backslash escapes.
+  // To the first backtick no backslash escapes. With `comments`, `text` is the substitution's
+  // text as bash reads it again and `at` the offset in `s` of each of its characters.
   const backticks = () => {
     out += '`';
     i++;
+    let text = '';
+    const at = [];
+    let close = n;
     while (i < n) {
       if (s[i] === '\\') {
-        if (s[i + 1] !== '\n') out += s.slice(i, i + 2);
+        const next = s[i + 1];
+        if (next !== '\n') {
+          out += s.slice(i, i + 2);
+          if (comments && next !== undefined && '$`\\'.includes(next)) {
+            text += next;
+            at.push(i + 1);
+          } else if (comments) {
+            text += s.slice(i, i + 2);
+            at.push(i);
+            if (next !== undefined) at.push(i + 1);
+          }
+        }
         i += 2;
       } else {
         out += s[i++];
-        if (s[i - 1] === '`') break;
+        if (s[i - 1] === '`') {
+          close = i - 1;
+          break;
+        }
+        if (comments) {
+          text += s[i - 1];
+          at.push(i - 1);
+        }
       }
+    }
+    if (comments) {
+      for (const [from, to] of commentSpans(text)) comments.push([at[from], to < text.length ? at[to] : close]);
     }
     inWord();
   };
@@ -680,6 +759,7 @@ export const joinContinuations = (input) => {
       if (c === '#' && wordStart) {
         let end = s.indexOf('\n', i);
         if (end < 0) end = n;
+        comments?.push([i, end]);
         out += s.slice(i, end);
         i = end;
         continue;
