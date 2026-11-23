@@ -397,6 +397,62 @@ test("shellWordsDetailed joins after nested quoting, and a # opens a comment onl
   assert.deepEqual(wrongWords(cases), []);
 });
 
+// A flag split by `J` after a substitution is joined only when the scanner has left the
+// substitution where bash did. Each input below put it in the wrong place: a `case` word that
+// is no keyword, a redirection's word read as one, a heredoc drained in the wrong context.
+const stuckProbes = [
+  ["a `case` in a pattern list", `git commit "$(case q in q|case) printf q;; esac)" '"' -${J}-no-verify`, "--no-verify"],
+  ["`in case` in a command's arguments", `"$(case q in q) printf %s in case;; esac)" '"' -${J}X`, "-X"],
+  ["`for v in case`", `"$(case q in q) for v in case; do :; done;; esac)" '"' -${J}X`, "-X"],
+  ["a word after `<`", `"$(< case printf q)" '"' -${J}X`, "-X"],
+  ["`case case in case`", `"$(case case in case) printf q;; esac)" '"' -${J}X`, "-X"],
+  ["a word after `<<<`", `"$(<<<case cat)" '"' -${J}X`, "-X"],
+  ["a heredoc opened outside a substitution that holds a newline", `git commit <<'E' "$(printf a\n)" -${J}-no-verify\nb\nE\n`, "--no-verify"],
+];
+for (const [name, input, flag] of stuckProbes) {
+  test(`shellWords joins the flag after ${name}`, () => {
+    const words = shellWords(input);
+    assert.ok(words.includes(flag), JSON.stringify(words));
+    assert.ok(!words.some((w) => w.includes("-\n")), JSON.stringify(words));
+  });
+}
+
+test("shellWords follows the case grammar: a keyword stands only in command position", () => {
+  const cases = [
+    // The `)` after a pattern ends the pattern list, however the pattern is written.
+    [`"$(case q in (q) :;; esac)" '"' -${J}X`],
+    [`"$(case q in q|r) :;& r) :;;& esac)" '"' -${J}X`],
+    [`"$(case q in esac) :;; esac)" '"' -${J}X`],
+    [`"$(case q\nin\nq) :;;\nesac)" '"' -${J}X`],
+    [`"$(case q in q) case r in r) :;; esac;; esac)" '"' -${J}X`],
+    [`"$(case q in q) :;; esac; case q in q) :;; esac)" '"' -${J}X`],
+    // `esac` ends a body without `;;`, and a pattern after `;;` is no command.
+    [`"$(case q in q) :; esac)" '"' -${J}X`],
+    [`"$(case q in q) :;; case) :;; esac)" '"' -${J}X`],
+    // A redirection's word, and a word of a command, is no keyword.
+    [`"$(printf q >case; :)" '"' -${J}X`],
+    [`"$(printf q 2>&1 case)" '"' -${J}X`],
+    [`"$(printf q >&2 case)" '"' -${J}X`],
+    [`"$(printf q >& case)" '"' -${J}X`],
+    [`"$(cat <<<case; :)" '"' -${J}X`],
+    // `case` after a keyword, an assignment or a separator is one.
+    [`"$(if :; then case q in q) :;; esac; fi)" '"' -${J}X`],
+    [`"$(v=1 case q in q) :;; esac)" '"' -${J}X`],
+  ];
+  for (const [input] of cases) {
+    const words = shellWords(input);
+    assert.equal(words.at(-1), "-X", JSON.stringify([input, words]));
+  }
+});
+
+test("joinContinuations hands a heredoc opened in a substitution to the line that ends the command", () => {
+  // Bash reads the body of `$(cat <<E)` from the lines after it, and a newline inside the
+  // substitution before that belongs to the substitution.
+  assert.equal(shell.joinContinuations(`x=$(cat <<E)\nfoo${J}E\nE\necho 'a${J}b'`), `x=$(cat <<E)\nfooE\nE\necho 'a${J}b'`);
+  assert.equal(shell.joinContinuations(`x=$(cat <<'E')\nfoo${J}E\nE\necho c${J}d`), `x=$(cat <<'E')\nfoo${J}E\nE\necho cd`);
+  assert.equal(shell.joinContinuations(`cat <<'E' "$(:\n)" c${J}d\nfoo${J}E\nE\necho c${J}d`), `cat <<'E' "$(:\n)" cd\nfoo${J}E\nE\necho cd`);
+});
+
 test("shellWordsDetailed gives pattern, operatorAt and procSubAt of the joined word", () => {
   // [input, word, bareStart, expands, pattern, operatorAt, procSubAt]
   const cases = [

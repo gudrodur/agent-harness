@@ -412,8 +412,9 @@ export const splitSegmentsDetailed = (command) => {
 //   substitution. Bash passes a `/dev/fd` path to a command it runs alongside, so a
 //   gate can neither read the word as a file nor know what that command writes.
 // A backslash-newline is removed first, where bash removes it (joinContinuations): bare,
-// in double quotes and in backticks. Single quotes, `$'…'`, a comment and a quoted heredoc
-// body keep it, inside a `$(…)` or `${…}` as at the top level.
+// in double quotes, in backticks and in an unquoted heredoc body (before its terminator is
+// matched). Single quotes, `$'…'`, a comment and a quoted heredoc body keep it, inside a
+// `$(…)` as at the top level.
 // Out of scope: history `!` expansion, word splitting of an unquoted expansion, and
 // the words inside a process substitution: they come back as plain words, and
 // splitSegments splits at a `|` or `;` inside `<(a|b)`, as inside `$(a|b)`, as if it
@@ -439,8 +440,12 @@ const ASSIGNS = /^[A-Za-z_]\w*(?:\[|\+?=)/;
 // A `#` opens a comment only at the start of a word, that is after bash's own blanks
 // (space, tab, newline) and operators (`;&|()<>`), and never after a carriage return, a
 // form feed or a closed substitution glued to it; a pair removed before it does not start
-// one. A `case` is followed only from a word in command position, so that its pattern's
-// `)` does not close a `$(…)`.
+// one. A `case` statement is followed as a grammar, per context, so that the `)` that ends
+// a pattern does not close a `$(…)`: `case` and `esac` count only in command position (not
+// after a redirection operator, nor as a pattern or an argument), `in` only right after the
+// subject, and a `|` in a pattern list starts no command. A heredoc is read from the
+// newline of the context that opened it (one that opens in a `$(…)` closed on its line
+// is read after the outer line).
 // Joining joined text changes nothing. Linear in the text.
 export const joinContinuations = (input) => {
   const s = String(input ?? '');
@@ -451,14 +456,22 @@ export const joinContinuations = (input) => {
   let wordStart = true;
   let word = ''; // the bare start of the word being read, for reserved words and assignments
   let last = ''; // the bare character just read
-  const pending = []; // heredocs opened on the current line
   // `cmd`: top level, `$( )`, `<( )`, `( )` and a list that is part of a word (`a=( )`,
   // `@( )`); `arith`: `$(( ))`, `(( ))`; `bracket`: `$[ ]` and a subscript; `brace`:
   // `${ }`; `dq`: double quotes. Only `cmd` has comments and heredocs. `glued` says the
   // word goes on after the context closes, and `first` that a reserved word may stand here.
+  // `pending` holds the heredocs opened on the current line of this context, and `cs` the
+  // open `case` statements, innermost last, each in one state: `subject` (to the word after
+  // `case`), `in` (to the word `in`), `pats` (at the start of a pattern list: `esac` ends the
+  // statement), `pat` (in a pattern, to the `)`), `body` (the commands after it, to `;;`).
   const context = (kind, glued, list = false) =>
-    ({ kind, glued, list, before: word && `${word}"`, depth: 0, cases: 0, first: kind === 'cmd' && !list });
+    ({ kind, glued, list, before: word && `${word}"`, depth: 0, cs: [], pending: [], first: kind === 'cmd' && !list });
   const stack = [context('cmd', false)];
+  // A reserved word stands only where a command may start, and no pattern or subject does.
+  const commandPos = (ctx) => ctx.first && (ctx.cs.length === 0 || ctx.cs.at(-1) === 'body');
+  const caseState = (ctx, state) => {
+    ctx.cs[ctx.cs.length - 1] = state;
+  };
   // An operator's next character, past the pairs bash removes between the two.
   const skip = (from) => {
     let j = from;
@@ -473,7 +486,9 @@ export const joinContinuations = (input) => {
     word = last = '';
   };
   const leave = () => {
-    const { glued, before } = stack.pop();
+    const { glued, before, pending } = stack.pop();
+    // Bash reads a heredoc opened here from the lines after the one that ends the outer command.
+    stack.at(-1).pending.push(...pending);
     wordStart = !glued;
     word = glued ? before : '';
     last = '';
@@ -486,9 +501,19 @@ export const joinContinuations = (input) => {
   };
   const endWord = (ctx) => {
     if (!wordStart) {
-      if (ctx.first && word === 'case') ctx.cases++;
-      else if (ctx.first && word === 'esac' && ctx.cases > 0) ctx.cases--;
-      ctx.first = (ctx.first && (COMMAND_NEXT.has(word) || ASSIGNS.test(word))) || (ctx.cases > 0 && word === 'in');
+      const state = ctx.cs.at(-1);
+      if (state === 'subject') caseState(ctx, 'in');
+      else if (state === 'in') {
+        if (word === 'in') caseState(ctx, 'pats');
+      } else if (state === 'pats') {
+        if (word === 'esac') ctx.cs.pop();
+        else caseState(ctx, 'pat');
+      } else if (state !== 'pat') {
+        const reserved = commandPos(ctx);
+        if (reserved && word === 'case') ctx.cs.push('subject');
+        else if (reserved && word === 'esac' && state === 'body') ctx.cs.pop();
+        ctx.first = reserved && (COMMAND_NEXT.has(word) || ASSIGNS.test(word));
+      }
     }
     word = '';
   };
@@ -555,7 +580,7 @@ export const joinContinuations = (input) => {
       out += d;
       j++;
     }
-    if (named) pending.push({ tag, literal, strip });
+    if (named) stack.at(-1).pending.push({ tag, literal, strip });
     i = j;
     wordStart = false;
   };
@@ -640,10 +665,14 @@ export const joinContinuations = (input) => {
       // `a=(` and the extglob `@(` go on as one word; any other `(` is an operator.
       const list = c === '(' && !wordStart && last !== '' && '=?*+@!'.includes(last);
       if (WORD_BREAK.includes(c) && !list) endWord(ctx);
-      if (c === '\n' && pending.length) {
+      // The word after a redirection operator, or a process substitution, is no reserved word.
+      if (c === '<' || c === '>') ctx.first = false;
+      // `;;`, `;&` and `;;&` end a case body: a pattern list or `esac` follows.
+      if (c === ';' && ctx.cs.at(-1) === 'body' && ';&'.includes(s[skip(i + 1)] ?? '\0')) caseState(ctx, 'pats');
+      if (c === '\n' && ctx.pending.length) {
         out += c;
         i++;
-        for (const doc of pending.splice(0)) body(doc);
+        for (const doc of ctx.pending.splice(0)) body(doc);
         wordStart = true;
         ctx.first = !ctx.list;
         continue;
@@ -655,7 +684,7 @@ export const joinContinuations = (input) => {
         i = end;
         continue;
       }
-      if (wordStart && ctx.first && /[A-Za-z_]/.test(c)) {
+      if (wordStart && commandPos(ctx) && /[A-Za-z_]/.test(c)) {
         // `a[1<<2]=3` shifts up to the `]`.
         SUBSCRIPT.lastIndex = i;
         if (SUBSCRIPT.test(s)) {
@@ -682,6 +711,14 @@ export const joinContinuations = (input) => {
           } else heredoc(j + 1);
           continue;
         }
+      }
+      if (c === '(' && !list && ctx.cs.at(-1) === 'pats') {
+        // The optional `(` before a pattern: its `)` ends the list, not a subshell.
+        caseState(ctx, 'pat');
+        out += c;
+        i++;
+        wordStart = true;
+        continue;
       }
       if (c === '(') {
         const j = skip(i + 1);
@@ -726,14 +763,27 @@ export const joinContinuations = (input) => {
       wordStart = WORD_BREAK.includes(c);
       continue;
     }
-    if (c === ')' && stack.length > 1 && ctx.cases === 0) {
-      leave();
-      continue;
+    if (c === ')') {
+      const state = ctx.cs.at(-1);
+      if (state === 'pats' || state === 'pat') {
+        // The `)` that ends a pattern list; the commands follow.
+        caseState(ctx, 'body');
+        ctx.first = true;
+        wordStart = true;
+        last = '';
+        continue;
+      }
+      if (state === undefined && stack.length > 1) {
+        leave();
+        continue;
+      }
     }
+    const redirects = c === '&' && (last === '<' || last === '>');
     last = c;
     if (WORD_BREAK.includes(c)) {
       wordStart = true;
-      if (';&|)\n'.includes(c)) ctx.first = !ctx.list;
+      // An `&` that follows `<` or `>` is part of a redirection (`>&2`), not a command separator.
+      if (';&|)\n'.includes(c) && !redirects) ctx.first = !ctx.list;
     } else {
       if (wordStart || word) word += c;
       wordStart = false;
