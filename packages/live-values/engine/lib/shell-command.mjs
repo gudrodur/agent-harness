@@ -320,11 +320,12 @@ export const splitSegmentsDetailed = (command) => {
     cur = '';
     sep = next;
   };
-  const findClose = (q, from) => {
+  // A backslash escapes the next character inside double quotes and inside `$'…'` (ANSI-C
+  // quoting); in plain single quotes it is a character.
+  const findClose = (q, from, ansi) => {
     for (let j = from; j < text.length; j++) {
       const c = text[j];
-      // A backslash escapes only inside double quotes; in single quotes it is a character.
-      if (c === '\\' && q === '"') {
+      if (c === '\\' && (q === '"' || ansi)) {
         j++;
         continue;
       }
@@ -333,13 +334,18 @@ export const splitSegmentsDetailed = (command) => {
     return -1;
   };
   let i = 0;
+  // The previous character was a bare `$` that opens what follows: not the second `$` of
+  // `$$` (the pid, so `$$'x'` is a plain single quote) and not an escaped `\$`.
+  let dollarOpens = false;
   while (i < text.length) {
     const c = text[i];
+    const ansi = dollarOpens;
+    dollarOpens = false;
     if (
       (c === "'" || c === '"') &&
       (i === 0 || QUOTE_OPEN_PRECEDER.test(text[i - 1]))
     ) {
-      const close = findClose(c, i + 1);
+      const close = findClose(c, i + 1, c === "'" && ansi);
       if (close < 0) {
         cur += c;
         i++;
@@ -378,6 +384,7 @@ export const splitSegmentsDetailed = (command) => {
       i++;
       continue;
     }
+    dollarOpens = c === '$' && !ansi;
     cur += c;
     i++;
   }

@@ -133,6 +133,18 @@ test("checkLocal reads quotes the way bash does when it looks for a redirect", (
   ]) assert.deepEqual(checkLocal(run, "/"), { ok: true }, run);
 });
 
+test("checkLocal judges the command after a `$'…'` span, where bash splits", () => {
+  // In `$'…'` a backslash escapes the next character, so each span ends where bash ends it.
+  for (const run of [
+    String.raw`echo $'\'';git commit --no-verify -m x;echo \'`,
+    String.raw`echo $'\\';git commit --no-verify -m x;echo x`,
+    String.raw`echo $'a\'b ';git commit --no-verify -m x;echo 'c'`,
+    String.raw`echo $$$'a\'';git commit --no-verify -m x;echo \'`,
+  ]) assert.deepEqual(checkLocal(run, "/"), { ok: false, reason: "git commit is not a read subcommand" }, run);
+  // `$$` is the pid: the quote after it is plain, and a backslash in it is a character.
+  assert.deepEqual(checkLocal(String.raw`echo $$'a\';echo b`, "/"), { ok: true });
+});
+
 test("runCommand returns stdout, and a failure as text that is never empty", () => {
   assert.deepEqual(runCommand("printf 7", { root: "/", timeoutMs: 5000 }), { ok: true, stdout: "7" });
   const bad = runCommand("exit 3", { root: "/", timeoutMs: 5000 });

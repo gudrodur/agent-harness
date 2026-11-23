@@ -61,10 +61,10 @@ var splitSegmentsDetailed = (command) => {
     cur = "";
     sep = next;
   };
-  const findClose = (q, from) => {
+  const findClose = (q, from, ansi) => {
     for (let j = from;j < text.length; j++) {
       const c = text[j];
-      if (c === "\\" && q === '"') {
+      if (c === "\\" && (q === '"' || ansi)) {
         j++;
         continue;
       }
@@ -74,10 +74,13 @@ var splitSegmentsDetailed = (command) => {
     return -1;
   };
   let i = 0;
+  let dollarOpens = false;
   while (i < text.length) {
     const c = text[i];
+    const ansi = dollarOpens;
+    dollarOpens = false;
     if ((c === "'" || c === '"') && (i === 0 || QUOTE_OPEN_PRECEDER.test(text[i - 1]))) {
-      const close = findClose(c, i + 1);
+      const close = findClose(c, i + 1, c === "'" && ansi);
       if (close < 0) {
         cur += c;
         i++;
@@ -113,6 +116,7 @@ var splitSegmentsDetailed = (command) => {
       i++;
       continue;
     }
+    dollarOpens = c === "$" && !ansi;
     cur += c;
     i++;
   }

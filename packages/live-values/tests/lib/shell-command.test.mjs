@@ -282,6 +282,21 @@ test("splitSegments reads a backslash in single quotes as a character", () => {
   assert.deepEqual(shell.splitSegments('echo "a\\" ; b" ; ls'), ['echo "a\\" ; b" ', " ls"]);
 });
 
+// `$'…'` is ANSI-C quoting: a backslash escapes the next character, so `$'\''` is one quote
+// character and the `;` after it splits. `$$` is the pid, so in `$$'x'` the quote is a plain
+// single quote and a backslash in it is a character; `$$$'x'` is the pid and then `$'x'`, and an
+// escaped `\$` opens nothing. Each split is the one bash runs.
+test("splitSegments reads `$'…'` with its escapes, and `$$'…'` as the pid and a plain quote", () => {
+  for (const [run, segments] of [
+    [String.raw`echo $'\'';git commit --no-verify -m x;echo \'`, [String.raw`echo $'\''`, "git commit --no-verify -m x", String.raw`echo \'`]],
+    [String.raw`echo $'\\';git commit --no-verify -m x;echo x`, [String.raw`echo $'\\'`, "git commit --no-verify -m x", "echo x"]],
+    [String.raw`echo $'a\'b ';git commit --no-verify -m x;echo 'c'`, [String.raw`echo $'a\'b '`, "git commit --no-verify -m x", "echo 'c'"]],
+    [String.raw`echo $$$'a\'';git commit --no-verify -m x;echo \'`, [String.raw`echo $$$'a\''`, "git commit --no-verify -m x", String.raw`echo \'`]],
+    [String.raw`echo $$'a\';echo b`, [String.raw`echo $$'a\'`, "echo b"]],
+    [String.raw`echo \$'a\';echo b`, [String.raw`echo \$'a\'`, "echo b"]],
+  ]) assert.deepEqual(shell.splitSegments(run), segments, run);
+});
+
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");
