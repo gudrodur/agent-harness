@@ -569,3 +569,23 @@ for (const [name, status, screen, kind] of [
     assert.equal(r.status, kind === DIALOG ? 3 : 2, r.stderr);
   });
 }
+
+// A permission prompt from a background agent while the main session is idle at
+// its own prompt: the record may read busy or idle, and the dialog footer
+// (with the "ctrl+x ctrl+k twice to stop background agents" hint) can stand
+// above the composer, the footer and a tall agents panel. Every mode refuses it.
+for (const [name, screen] of [
+  ['with a short footer under it', BG.SUBAGENT_DIALOG_SHORT],
+  ['with a tall agents panel under it', BG.SUBAGENT_DIALOG_AT_IDLE_PROMPT],
+  ['with a long agents panel under it', BG.SUBAGENT_DIALOG_LONG_PANEL],
+  ['with no-break spaces in its footer', BG.SUBAGENT_DIALOG_NBSP_FOOTER],
+]) {
+  for (const status of ['busy', 'idle', 'shell']) {
+    test(`--mode dialog refuses a background agent's dialog ${name} (record ${status})`, () => {
+      seat({ status, screen });
+      assert.equal(proofVerdict(WIN, { mode: 'dialog' }).kind, DIALOG);
+      const r = spawnSync(process.execPath, [CLI, '--window', String(WIN), '--mode', 'dialog'], { encoding: 'utf-8', env: process.env });
+      assert.equal(r.status, 3, r.stderr);
+    });
+  }
+}

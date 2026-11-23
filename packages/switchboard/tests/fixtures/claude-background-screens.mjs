@@ -196,3 +196,47 @@ export const PERMISSION_PROMPT_NO_FOOTER = PERMISSION.join('\n');
 
 // The composer once a message has been typed into it, before its Enter.
 export const typedInto = (text) => screenOf({ above: [WAIT_LINE], box: [`❯\u00a0${text}`], footer: [`${MODE} · 2 background tasks`] });
+
+// A permission prompt raised by a BACKGROUND agent while the main session sits
+// idle at its own empty prompt: the dialog is drawn above the composer, so its
+// footer is not on the bottom rows of the screen; the composer, its footer and
+// the agents panel stand under it. The footer carries the extra "ctrl+x ctrl+k
+// twice to stop background agents" hint. Layout of a live report, texts made up.
+const SUBAGENT_DIALOG = [
+  ' Dangerous rm operation not ruled out — the shell may read this command differently than it was',
+  ' parsed',
+  '',
+  ' Do you want to proceed?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents',
+];
+const TALL_PANEL = [
+  ...PANEL,
+  '  ◯ general-purpose  Reading the logs                                     1m 02s · ↓ 9.1k tokens',
+  '  ◯ general-purpose  Running the checks                                   3m 40s · ↓ 31.0k tokens',
+  '  ◯ general-purpose  Waiting on 2 shells                                  4m 11s · ↓ 40.3k tokens',
+];
+export const SUBAGENT_DIALOG_AT_IDLE_PROMPT = screenOf({
+  above: ['● LAUNCHED', '', ...SUBAGENT_DIALOG],
+  footer: [MANAGE_FOOTER, ...TALL_PANEL],
+});
+// The same screen with a long agents panel: the dialog footer stands further
+// above the bottom of the screen than the dialog check's bottom rows reach.
+const LONG_PANEL = [...TALL_PANEL, ...Array.from({ length: 10 }, (_, i) => `  ◯ general-purpose  Task number ${i + 1}                                       ${i + 1}m 05s · ↓ 1.${i}k tokens`)];
+export const SUBAGENT_DIALOG_LONG_PANEL = screenOf({
+  above: ['● LAUNCHED', '', ...SUBAGENT_DIALOG],
+  footer: [MANAGE_FOOTER, ...LONG_PANEL],
+});
+// The same screen as drawn with no-break spaces between the footer's words,
+// as the composer's own prompt line is.
+export const SUBAGENT_DIALOG_NBSP_FOOTER = screenOf({
+  above: ['● LAUNCHED', '', ...SUBAGENT_DIALOG.map((l) => (l.includes('Esc to cancel') ? l.replaceAll(' ', ' ') : l))],
+  footer: [MANAGE_FOOTER],
+});
+// The same dialog with nothing but the dialog and a short footer under it.
+export const SUBAGENT_DIALOG_SHORT = screenOf({
+  above: ['● LAUNCHED', '', ...SUBAGENT_DIALOG],
+  footer: [MANAGE_FOOTER],
+});
