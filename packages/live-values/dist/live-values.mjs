@@ -314,9 +314,16 @@ var splitSegmentsDetailed = (command) => {
       literal.push([starts[h.from], end]);
     }
   }
-  for (const [from, to] of commentSpans(text))
+  const comments = commentSpans(text).sort((a, b) => a[0] - b[0]);
+  for (const [from, to] of comments)
     literal.push([from, to - 1]);
   literal.sort((a, b) => a[0] - b[0]);
+  let nextComment = 0;
+  const inComment = (at) => {
+    while (nextComment < comments.length && comments[nextComment][1] <= at)
+      nextComment++;
+    return nextComment < comments.length && comments[nextComment][0] <= at;
+  };
   let nextLiteral = 0;
   let literalEnd = -1;
   let i = 0;
@@ -332,6 +339,11 @@ var splitSegmentsDetailed = (command) => {
     }
     const ansi = dollarOpens && i > literalEnd;
     dollarOpens = false;
+    if ((c === "'" || c === '"' || c === "\\") && inComment(i)) {
+      cur += c;
+      i++;
+      continue;
+    }
     if ((c === "'" || c === '"') && (i === 0 || QUOTE_OPEN_PRECEDER.test(text[i - 1]))) {
       const close = findClose(c, i + 1, c === "'" && ansi);
       if (close < 0) {

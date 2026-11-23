@@ -337,6 +337,27 @@ test("splitSegments opens a comment only at a word start in a command context", 
   }
 });
 
+// Inside a comment bash sees, a quote and a backslash are plain characters up to the
+// newline (or the backtick that ends a comment in a substitution). Before #73 a quote
+// opened there and closed at the next quote character, lines later, so the lines between
+// were one segment and no guard judged the command on them. Bash is the oracle: with
+// `echo RAN` in place of the commit, each command prints RAN.
+test("splitSegments reads a quote or a backslash in a comment as a character (#73)", { skip: spawnSync("bash", ["-c", "true"]).status !== 0 && "no bash" }, () => {
+  const commit = "git commit --no-verify -m x";
+  for (const [run, segments] of [
+    [`true # 'x\n${commit}\necho '`, ["true # 'x", commit, "echo '"]],
+    [`true # "x\n${commit}\necho "`, ['true # "x', commit, 'echo "']],
+    [`true # $'x\n${commit}\necho '`, ["true # $'x", commit, "echo '"]],
+    [`true # x \\\n${commit}`, ["true # x \\", commit]],
+    ["echo `true # 'x`;" + commit + ";echo ''", ["echo `true # 'x`", commit, "echo ''"]],
+    [`echo $(true # 'x\n);${commit};echo ''`, ["echo $(true # 'x", ")", commit, "echo ''"]],
+  ]) {
+    assert.deepEqual(shell.splitSegments(run), segments, run);
+    const ran = spawnSync("bash", ["-c", run.replace(commit, "echo RAN")], { encoding: "utf8", timeout: 5000, cwd: tmpdir() });
+    assert.match(ran.stdout, /^RAN$/m, `bash runs the hidden command: ${run}`);
+  }
+});
+
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");

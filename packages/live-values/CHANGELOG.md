@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `splitSegments` reads a quote or a backslash inside a `#` comment as a character, as bash
+  does (#73): `true # 'x` followed by more lines was one segment up to the next quote, which
+  hid the lines between from every gate. The bundle in `dist/` is rebuilt.
 - `checkLocal` no longer misses a redirect that follows an escaped quote: `echo \' > /tmp \'`
   returned `ok: true` because `\'` opened a quote span that hid the real `> /tmp`. The write
   check now reads the command two ways and counts a write if either sees one: the shared
