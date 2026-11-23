@@ -161,6 +161,44 @@ test('--snapshot records the role and kitty window id from the process environme
   }
 });
 
+test('--snapshot prefers the store\'s latest claim over the stale AGENT_SEAT_ROLE of the process', async () => {
+  const dbPath = path.join(root, 'state.db');
+  await fs.rm(dbPath, { force: true });
+  const seat = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore', env: { ...process.env, AGENT_SEAT_ROLE: 'icelandic-social-lane' } });
+  try {
+    await new Promise((r) => setTimeout(r, 200));
+    await record(seat.pid, BRIDGED, { procStart: await procStart(seat.pid) });
+    await transcript(BRIDGED, 'claude-opus-5-5');
+    const { claimRole } = await import('../lib/seat-roles.mjs');
+    const { openStore } = await import('../lib/store.mjs');
+    const db = openStore(dbPath);
+    claimRole(db, { role: 'icelandic-social-lane', sessionId: BRIDGED, now: 1000 });
+    claimRole(db, { role: 'agent-config-operating-overseer', sessionId: BRIDGED, now: 2000 });
+    db.close();
+    const r = await set(['--snapshot'], { AGENT_SWITCHBOARD_DB: dbPath });
+    assert.equal(r.code, 0, r.err);
+    assert.equal((await latest()).sessions[0].role, 'agent-config-operating-overseer');
+  } finally {
+    seat.kill();
+  }
+});
+
+test('--snapshot records the role claimed last when the store holds several for the session', async () => {
+  const dbPath = path.join(root, 'state.db');
+  await fs.rm(dbPath, { force: true });
+  await record(plain.pid, BRIDGED, { procStart: await procStart(plain.pid) });
+  await transcript(BRIDGED, 'claude-opus-5-5');
+  const { claimRole } = await import('../lib/seat-roles.mjs');
+  const { openStore } = await import('../lib/store.mjs');
+  const db = openStore(dbPath);
+  claimRole(db, { role: 'a-older', sessionId: BRIDGED, now: 1000 });
+  claimRole(db, { role: 'z-newer', sessionId: BRIDGED, now: 2000 });
+  db.close();
+  const r = await set(['--snapshot'], { AGENT_SWITCHBOARD_DB: dbPath });
+  assert.equal(r.code, 0, r.err);
+  assert.equal((await latest()).sessions[0].role, 'z-newer');
+});
+
 test('--snapshot falls back to the store role when the environment has none, and to null without a store', async () => {
   const dbPath = path.join(root, 'state.db');
   await fs.rm(dbPath, { force: true });
@@ -207,7 +245,8 @@ test('--replay passes --role for a row with a role and omits it for a null role'
   const r = await set(['--replay']);
   assert.equal(r.code, 0, r.err);
   const calls = (await fs.readFile(path.join(root, 'tab-calls'), 'utf8')).trim().split('\n');
-  assert.equal(calls[0], `--resume ${DEAD} --title claude: t --model opus --role x-role`);
+  // A role seat's snapshotted model is passed as --snapshot-model: the launcher lets the role's agent model win over it.
+  assert.equal(calls[0], `--resume ${DEAD} --title claude: t --snapshot-model opus --role x-role`);
   assert.equal(calls[1], `--resume ${RECYCLED} --title claude: t --model opus`);
 });
 

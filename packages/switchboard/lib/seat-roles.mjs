@@ -62,6 +62,12 @@ export const rolesForSession = (db, sessionId) =>
     ? []
     : db.all('SELECT role FROM seat_roles WHERE session_id = ? ORDER BY role', String(sessionId)).map((r) => r.role);
 
+// The same, newest claim first (ties by name): the role a session took last is the one it runs as.
+export const rolesForSessionLatest = (db, sessionId) =>
+  sessionId == null
+    ? []
+    : db.all('SELECT role FROM seat_roles WHERE session_id = ? ORDER BY claimed_at DESC, role', String(sessionId)).map((r) => r.role);
+
 // Record that this session was shown the claim-role nudge. True only for the
 // first caller: INSERT OR IGNORE is atomic, so hooks racing on one prompt
 // cannot both nudge.

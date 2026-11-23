@@ -16,8 +16,9 @@
 #               the process has --remote-control or the record a
 #               bridgeSessionId; named by the flag's value, else the cwd's
 #               basename), the kitty tab title, `role` (the switchboard role:
-#               AGENT_SEAT_ROLE in the process's environ, else the first role
-#               the store's seat_roles holds for the session, else null) and
+#               the role the store's seat_roles holds for the session that was
+#               claimed last, else AGENT_SEAT_ROLE in the process's environ,
+#               else null) and
 #               `windowId` (KITTY_WINDOW_ID in the environ as an integer, else
 #               null). Writes FILE (default
 #               <dir>/latest.json), a timestamped copy beside it, and a .md
@@ -29,7 +30,10 @@
 #               A Remote Control name another seat holds (a live session, or an
 #               earlier row) gets a suffix, NAME-2, and a note on stderr, since
 #               two seats on one name cannot be told apart from the phone.
-#               A row with a role passes it on as claude-tab.sh --role.
+#               A row with a role passes it on as claude-tab.sh --role, and its
+#               model as --snapshot-model (a model recorded from the process, which
+#               a launcher may overrule with the role's own); a row without a role
+#               passes its model as --model.
 #   --dry-run   with --replay: print each command, launch nothing.
 #
 # <dir> is ${XDG_STATE_HOME:-$HOME/.local/state}/claude-resume-set.
@@ -97,8 +101,10 @@ snapshot() {
     title=$(printf '%s' "$kls" | jq -r --argjson pid "$pid" '
       [.[].tabs[] | select(any(.windows[].foreground_processes[]?; .pid == $pid)) | .title] | first // ""' 2>/dev/null)
     [ -n "$title" ] || title="claude: $(basename "$cwd")"
-    role=$(env_value "$pid" AGENT_SEAT_ROLE)
-    [ -n "$role" ] || role=$(node "$HERE/seat-role.mjs" "$sid" 2>/dev/null | head -n1)
+    # The store's latest claim first: the process's AGENT_SEAT_ROLE is the role it STARTED with, and a
+    # session that claimed another since runs as that one. The env role is the fallback (no store).
+    role=$(node "$HERE/seat-role.mjs" "$sid" 2>/dev/null | head -n1)
+    [ -n "$role" ] || role=$(env_value "$pid" AGENT_SEAT_ROLE)
     win=$(env_value "$pid" KITTY_WINDOW_ID)
     case "$win" in ''|*[!0-9]*) win=null ;; esac
     [ "$win" = null ] || win=$((10#$win))
@@ -161,7 +167,12 @@ replay() {
       printf 'SKIP %s live in pid %s\n' "$sid" "$(printf '%s' "$live" | jq -r .pid)"
       continue
     fi
-    local args=(--resume "$sid" --title "$(printf '%s' "$row" | jq -r .title)" --model "$(printf '%s' "$row" | jq -r .model)")
+    role=$(printf '%s' "$row" | jq -r '.role // ""')
+    # A role seat's recorded model is only what it last ran on, so it travels as --snapshot-model:
+    # the launcher lets the role's agent model win over it. A seat with no role keeps --model.
+    local model_flag=--model
+    [ -z "$role" ] || model_flag=--snapshot-model
+    local args=(--resume "$sid" --title "$(printf '%s' "$row" | jq -r .title)" "$model_flag" "$(printf '%s' "$row" | jq -r .model)")
     if [ "$(printf '%s' "$row" | jq -r .rc)" = true ]; then
       rc_name=$(printf '%s' "$row" | jq -r .rcName)
       if [ -n "${TAKEN_RC["$rc_name"]:-}" ]; then
@@ -172,7 +183,6 @@ replay() {
       TAKEN_RC["$rc_name"]=1
       args+=(--rc "$rc_name")
     fi
-    role=$(printf '%s' "$row" | jq -r '.role // ""')
     [ -z "$role" ] || args+=(--role "$role")
     if [ "$dry" = 1 ]; then
       printf 'WOULD %s' "$TAB"; printf ' %q' "${args[@]}"; printf '\n'

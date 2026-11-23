@@ -33,6 +33,7 @@
 #                --brief is optional (without one a fixed greeting starts the
 #                session, so the start can still be proven). For a tab that
 #                lives all day, such as the login seat (claude-login-seats.sh).
+#   --snapshot-model M  a model recorded by claude-resume-set: used only when no --model is given.
 #   --resume ID  reopen an existing session (claude --resume ID) as a seat. The
 #                cwd is the session's own, read from its transcript (a --cwd
 #                that differs is refused); a session live in another process
@@ -151,13 +152,14 @@ case "${1:-}" in
     tab_ledger_retire "${2:-}" "$RETIRE_AS"; exit $? ;;
 esac
 
-TITLE=""; BRIEF=""; OUT=""; MODEL=""; CWD="$PWD"; CWD_SET=0; SLOT_OVERRIDE=""; RC=0; RC_NAME=""; SEAT=0; RESUME=""; ROLE=""; RESEAT=""
+TITLE=""; BRIEF=""; OUT=""; MODEL=""; SNAP_MODEL=""; CWD="$PWD"; CWD_SET=0; SLOT_OVERRIDE=""; RC=0; RC_NAME=""; SEAT=0; RESUME=""; ROLE=""; RESEAT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --title) TITLE="${2:-}"; shift 2 ;;
     --brief) BRIEF="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --model|-m) MODEL="${2:-}"; shift 2 ;;
+    --snapshot-model) SNAP_MODEL="${2:-}"; shift 2 ;;
     --cwd) CWD="${2:-}"; CWD_SET=1; shift 2 ;;
     --resume) RESUME="${2:-}"; shift 2 ;;
     --role) ROLE="${2:-}"; shift 2 ;;
@@ -188,6 +190,9 @@ if [ -n "$RESEAT" ]; then
   # A replacement is a seat: no state row, no slot, no brief claim.
   SEAT=1
 fi
+# A model recorded by claude-resume-set stands only when none was named: the launcher around this
+# script (the launcher of the companion configuration repo) lets a role's agent model outrank it first.
+[ -n "$MODEL" ] || MODEL="$SNAP_MODEL"
 [ -n "$MODEL" ] || die "--model is required: a tab on the account default is the run nobody chose"
 case "$MODEL" in
   opus|sonnet|haiku|fable|claude-*) ;;
