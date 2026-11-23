@@ -275,6 +275,13 @@ test("splitSegmentsDetailed keeps >| inside its segment; a real pipe still split
   assert.deepEqual(splitSegmentsDetailed("echo \\> | cat").length, 2);
 });
 
+// Inside single quotes a backslash is a character: it escapes nothing, `'a\'` is closed.
+test("splitSegments reads a backslash in single quotes as a character", () => {
+  assert.deepEqual(shell.splitSegments("echo 'a\\' ; echo 'b' > x"), ["echo 'a\\' ", " echo 'b' > x"]);
+  // In double quotes it still escapes the quote.
+  assert.deepEqual(shell.splitSegments('echo "a\\" ; b" ; ls'), ['echo "a\\" ; b" ', " ls"]);
+});
+
 // A gate that reads redirections needs to know a quoted `> x` is an argument.
 test("shellWordsDetailed marks a word whose first character is bare", () => {
   assert.equal(typeof shell.shellWordsDetailed, "function");

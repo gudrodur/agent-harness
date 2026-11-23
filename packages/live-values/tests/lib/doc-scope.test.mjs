@@ -108,17 +108,27 @@ test("checkLocal reads quotes the way bash does when it looks for a redirect", (
     "echo $'\\'' > /tmp/x",
     "echo hi >| /tmp/x",
     "(echo hi > /tmp/x)",
+    // A quote glued to a letter is no span to the splitter, but one to bash: the `;` it hides
+    // is inside the word, and the `>x` after it is a real redirect.
+    "echo a'b;echo c'>x",
+    "echo don't > x; echo it's",
+    // Only a bare `>&N` or `>&-` is a descriptor; a quoted `&` or a non-number is a file name.
+    "echo hi >'&1'",
+    "echo hi >\\&1",
+    "echo hi >&x",
+    "echo hi >& /tmp/x",
+    "echo hi >&1x",
   ]) assert.deepEqual(checkLocal(run, "/"), WRITES, run);
   // A `>` that is text, not a redirect.
   for (const run of [
     "echo '>' /tmp",
     'echo ">" /tmp',
-    "echo \\> /tmp",
-    "echo a\\>b",
-    "echo $'\\'>'",
     "echo \"say \\\"> x\\\"\"",
     "echo hi > /dev/null",
     "echo hi 2>&1",
+    "echo hi >&2",
+    "echo hi >&-",
+    "echo hi >&/dev/null",
     "(echo hi > /dev/null)",
   ]) assert.deepEqual(checkLocal(run, "/"), { ok: true }, run);
 });

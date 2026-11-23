@@ -323,7 +323,8 @@ export const splitSegmentsDetailed = (command) => {
   const findClose = (q, from) => {
     for (let j = from; j < text.length; j++) {
       const c = text[j];
-      if (c === '\\') {
+      // A backslash escapes only inside double quotes; in single quotes it is a character.
+      if (c === '\\' && q === '"') {
         j++;
         continue;
       }

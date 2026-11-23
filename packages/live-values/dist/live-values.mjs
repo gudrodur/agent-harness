@@ -64,7 +64,7 @@ var splitSegmentsDetailed = (command) => {
   const findClose = (q, from) => {
     for (let j = from;j < text.length; j++) {
       const c = text[j];
-      if (c === "\\") {
+      if (c === "\\" && q === '"') {
         j++;
         continue;
       }

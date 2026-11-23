@@ -151,24 +151,43 @@ const NODE_TEST_FILE_RE = /^(?:~\/\.[\w-]+\/|\.\/)?(?:scripts|skills|templates)\
 const REDIRECT_WORD_RE = /^(?:\d*>&?\d*|>>?|<)$/;
 
 // Output redirected anywhere but /dev/null (or a descriptor, `2>&1`) writes a file.
-// Read with the shared word scanner, so quotes and backslashes mean what they mean to bash: an
-// escaped quote opens no span, and a quoted `>` is text. A `>` the scanner saw bare is a redirect.
-const writesFile = (segment) => {
+// Two readings of the segment, and a write is whatever EITHER sees, so neither one's blind spot
+// hides a redirect (the check fails closed):
+//   1. the shared word scanner, where quotes and backslashes mean what they mean to bash: an
+//      escaped quote opens no span, and a quoted `>` is text;
+//   2. the older regex that blanks closed quote spans, which still sees the `>` after an
+//      unterminated quote or a quote glued to a letter (`echo a'b;echo c'>x`), where the
+//      splitter and the scanner read one quote differently, and the `>` in `>'&1'`.
+// The price is a false positive on a backslash-escaped `>` (`echo \> x`), never a missed write.
+// Harmless targets: /dev/null, and after `>&` a bare descriptor number or `-` (`2>&1`, `>&-`).
+// `>&x` is bash's `&>x`: it writes a file named x.
+const harmlessTarget = (amp, target) => {
+  const t = target.match(/^[^;|&)]*/)[0];
+  return amp ? /^(?:\d+|-|\/dev\/null)$/.test(t) : t === "/dev/null";
+};
+const writesFileByScanner = (segment) => {
   const words = shellWordsDetailed(segment);
   for (let w = 0; w < words.length; w++) {
     const { word, operatorAt } = words[w];
     for (const at of operatorAt) {
       if (word[at] !== ">") continue;
-      // `>>`, then `&` for a descriptor (`2>&1`, `>&2`) or `|` for clobber; the rest is the target.
       let rest = word.slice(at + 1).replace(/^>/, "");
-      if (rest.startsWith("&")) continue;
+      const amp = rest.startsWith("&");
+      if (amp) rest = rest.slice(1);
       if (rest === "") rest = words[w + 1]?.word ?? "";
-      if (rest.match(/^[^;|&)]*/)[0] === "/dev/null") continue;
-      return true;
+      if (!harmlessTarget(amp, rest)) return true;
     }
   }
   return false;
 };
+const writesFileByRegex = (segment) => {
+  const bare = segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, " ");
+  for (const m of bare.matchAll(/(?:\d*|&)>>?\s*(&?)([^\s;|&)]*)/g)) {
+    if (!harmlessTarget(m[1] === "&", m[2])) return true;
+  }
+  return false;
+};
+const writesFile = (segment) => writesFileByRegex(segment) || writesFileByScanner(segment);
 
 // Per-tool argument rules for the tools that can write or run code through a flag.
 const badArgs = (word, args) => {
