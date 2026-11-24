@@ -334,10 +334,10 @@ export const splitSegmentsDetailed = (command) => {
     return -1;
   };
   // Where bash reads `$'` literally, the old split stands and a quote closes at the next
-  // quote character: a heredoc body with its terminator, a `#` comment, and a quote glued
-  // to a word (`a"$'\'"`, `a'x$'`), which bash opens but this splitter does not. Reading
-  // escapes there would fold the next command into the span. `literalEnd` is the last
-  // index of the literal stretch being read.
+  // quote character: a heredoc body with its terminator, and a quote glued to a word
+  // (`a"$'\'"`, `a'x$'`), which bash opens but this splitter does not. Reading escapes
+  // there would fold the next command into the span. `literalEnd` is the last index of
+  // the literal stretch being read. In a `#` comment no quote opens at all (#73, below).
   // A comment is one bash sees (commentSpans): a `#` after an escaped blank (`a\ #x`), in
   // `${…}` or `$((…))`, or after a removed backslash-newline is a character, and `$'` after
   // it is ANSI-C quoting again. A comment in backticks ends at the closing backtick.
@@ -352,8 +352,16 @@ export const splitSegmentsDetailed = (command) => {
       literal.push([starts[h.from], end]);
     }
   }
-  for (const [from, to] of commentSpans(text)) literal.push([from, to - 1]);
+  // Inside a comment a quote or a backslash is a character up to the comment's end (#73): bash
+  // opens no quote there, so one read as an opener hid every line up to the next quote character.
+  const comments = commentSpans(text).sort((a, b) => a[0] - b[0]);
+  for (const [from, to] of comments) literal.push([from, to - 1]);
   literal.sort((a, b) => a[0] - b[0]);
+  let nextComment = 0;
+  const inComment = (at) => {
+    while (nextComment < comments.length && comments[nextComment][1] <= at) nextComment++;
+    return nextComment < comments.length && comments[nextComment][0] <= at;
+  };
   let nextLiteral = 0;
   let literalEnd = -1;
   let i = 0;
@@ -371,6 +379,11 @@ export const splitSegmentsDetailed = (command) => {
     }
     const ansi = dollarOpens && i > literalEnd;
     dollarOpens = false;
+    if ((c === "'" || c === '"' || c === '\\') && inComment(i)) {
+      cur += c;
+      i++;
+      continue;
+    }
     if (
       (c === "'" || c === '"') &&
       (i === 0 || QUOTE_OPEN_PRECEDER.test(text[i - 1]))
