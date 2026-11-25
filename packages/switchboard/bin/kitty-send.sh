@@ -714,6 +714,15 @@ case "$TO" in
   ''|*[!0-9]*)
     kitty_ls_full fresh || { kitty_diag; die "kitty remote control unavailable (is this a kitty terminal with allow_remote_control on?) — cannot resolve --to $TO (nothing was sent)$KITTY_DIAG" 12; }
     matches=$(win_table | awk -F'\t' -v pat="$TO" 'index($2, pat) || index($3, pat) { print $1 "\t" ($3 == "" ? $2 : $3) }')
+    # A slot name (w1) is the whole "wN:" token a seat title starts with: it must not
+    # also match w10 (#2831), so an exact slot match wins over the substring.
+    case "$TO" in
+      w[0-9]*)
+        case "$TO" in *[!0-9w]*|w) ;; *)
+          slot=$(win_table | awk -F'\t' -v pat="$TO:" 'index($2, pat) == 1 || index($3, pat) == 1 { print $1 "\t" ($3 == "" ? $2 : $3) }')
+          [ -z "$slot" ] || matches="$slot" ;;
+        esac ;;
+    esac
     n=$(printf '%s' "$matches" | grep -c . || true)
     [ "$n" -ge 1 ] || die "no kitty window matches '$TO' (try --list)"
     if [ "$n" -gt 1 ]; then

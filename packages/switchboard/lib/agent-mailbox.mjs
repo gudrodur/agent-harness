@@ -463,7 +463,13 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
     return resolveWindowRecipient(seatedBeacons(beacons), win, sender, { presenceFile: file });
   }
 
-  const matches = wins.filter((w) => w.title.includes(target) || w.tabTitle.includes(target));
+  let matches = wins.filter((w) => w.title.includes(target) || w.tabTitle.includes(target));
+  // A slot name (`w1`) is the whole `wN:` token a seat's title starts with, so it
+  // must not also match `w10:` (#2831): an exact slot match wins over the substring.
+  if (/^w\d+$/.test(target)) {
+    const slot = matches.filter((w) => w.title.startsWith(`${target}:`) || w.tabTitle.startsWith(`${target}:`));
+    if (slot.length) matches = slot;
+  }
   if (matches.length === 0) throw new Error(`no kitty window matches '${target}'${seatHint(beacons, wins, sender)}`);
   if (new Set(matches.map((w) => w.id)).size > 1) {
     const ids = matches.map((w) => w.id).join(', ');
