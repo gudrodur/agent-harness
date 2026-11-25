@@ -257,10 +257,18 @@ const idleMinutes = (b) => Math.max(1, Math.round(b.idleMs / 60_000));
 
 // Every row a sender can reach: the fresh ones (a fresh row that lost its
 // window stays reachable by its own key) and the parked ones, each parked row
-// carrying idleMs. Dead, stale and unparked rows are not reachable.
+// carrying idleMs. Dead, stale and unparked rows are not reachable. The
+// verified idle-live rows need no window or /proc check, so `base` is free;
+// the legacy parked rows need one (kitty ls plus a /proc scan), so `full()`
+// pays for it only when a target could be one of them, and only once.
 const reachableBeacons = ({ presenceFile, now = Date.now() } = {}) => {
   const all = readPresenceBeacons({ presenceFile, now, includeStale: true });
-  return [...all.filter(isFreshRow), ...idleOf(all, { now })];
+  const base = [...all.filter(isFreshRow), ...idleOf(all.filter((b) => b.state !== 'legacy-idle'), { now })];
+  let full = null;
+  return {
+    base,
+    full: () => (full ??= [...base, ...idleOf(all.filter((b) => b.state === 'legacy-idle'), { now })]),
+  };
 };
 // The rows that hold a window: the superseded lost it to another occupant.
 const seatedBeacons = (beacons) => beacons.filter((b) => b.state !== 'superseded');
@@ -413,15 +421,19 @@ const resolveWindowRecipient = (beacons, win, sender, { presenceFile: file } = {
 // stays ambiguous-or-wrong. senderWindowId is the sender's KITTY_WINDOW_ID.
 export const resolveRecipient = (target, { presenceFile: file, senderSessionId = null, senderCwd = null, senderWindowId = null } = {}) => {
   const sender = senderSessionId != null || senderWindowId != null ? { sessionId: senderSessionId, cwd: senderCwd, windowId: senderWindowId } : null;
-  const beacons = reachableBeacons({ presenceFile: file });
+  const reach = reachableBeacons({ presenceFile: file });
   const roleName = roleFromTarget(target);
-  if (roleName != null) return resolveRoleRecipient(roleName, beacons);
-  const byKey = beacons.find((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) === target);
-  if (byKey) return recipientOf(byKey, null);
+  if (roleName != null) return resolveRoleRecipient(roleName, reach);
+  // A mailbox key never needs the window check unless no verified or fresh
+  // row answers it: only then is a legacy parked row a candidate.
+  const keyHit = reach.base.find((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) === target);
+  if (keyHit) return recipientOf(keyHit, null);
 
   if (typeof target === 'string' && target.includes('__')) {
     const sid = target.slice(target.lastIndexOf('__') + 2);
-    const sameSession = collapseSameSession(beacons.filter((b) => sanitizeSessionId(b.sessionId) === sid));
+    const ofSession = (list) => collapseSameSession(list.filter((b) => sanitizeSessionId(b.sessionId) === sid));
+    let sameSession = ofSession(reach.base);
+    if (sameSession.length === 0) sameSession = ofSession(reach.full());
     if (sameSession.length === 1) return recipientOf(sameSession[0], null);
     if (sameSession.length > 1) {
       const keys = sameSession.map((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId })).join(', ');
@@ -433,6 +445,7 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
     throw new Error(`no live session for mailbox key '${target}' — its presence beacon is stale or gone`);
   }
 
+  const beacons = reach.full();
   // A numeric target reads only that window, a cached answer allowed (a gone
   // window is never served from cache); a title is matched against a fresh
   // listing of every window.
@@ -476,7 +489,7 @@ const readRoleHolders = () => {
 // session's mailbox key would. No holder, or a holder whose beacon is gone,
 // resolves to the key `role:<name>` with queuedForRole set: the row waits
 // there for the next session to claim the role. That is a queue, not an error.
-const resolveRoleRecipient = (name, beacons) => {
+const resolveRoleRecipient = (name, reach) => {
   validateRoleName(name);
   const key = `${ROLE_PREFIX}${name}`;
   let holder = null;
@@ -485,7 +498,11 @@ const resolveRoleRecipient = (name, beacons) => {
   } catch {
     holder = null;
   }
-  const mine = holder ? beacons.filter((b) => b.sessionId === holder.session_id) : [];
+  // The holder's fresh and verified rows first; a legacy parked row only
+  // when nothing else of the holder's answers.
+  const ofHolder = (list) => (holder ? list.filter((b) => b.sessionId === holder.session_id) : []);
+  let mine = ofHolder(reach.base);
+  if (mine.length === 0) mine = ofHolder(reach.full());
   if (mine.length > 0) {
     // A fresh row beats a parked one. A holder parked past the TTL with its
     // host still there is idle, not gone: it resolves to its own mailbox with

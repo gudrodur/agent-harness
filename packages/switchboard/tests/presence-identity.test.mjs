@@ -274,6 +274,7 @@ test('auto host: the first agent ancestor that is not a server is recorded as th
   proc.add(700, { comm: 'claude', start: 123, ppid: 1 });
   proc.add(800, { comm: 'sh', start: 5, ppid: 700 });
   proc.add(900, { comm: 'node', start: 6, ppid: 800 });
+  sessionRecords({ 700: 's1' });
   P.recordPresence({ sessionId: 's1', cwd: '/r/x', host: 'auto', hostFrom: 900 });
   const [b] = M.readPresenceBeacons();
   assert.equal(b.hostPid, 700);
@@ -340,4 +341,112 @@ test('supersede keeps the verified row, then the newest tick, and never two veri
   const out = P.supersede([r('a', 1, 5, false), r('b', 1, 1, false), r('c', 1, 9, true), r('d', 2, 3, false), r('e', 3, 2, true), r('f', 3, 8, true)]);
   const state = Object.fromEntries(out.map((x) => [x.sessionId, x.state]));
   assert.deepEqual(state, { a: 'superseded', b: 'superseded', c: 'fresh', d: 'fresh', e: 'fresh', f: 'fresh' });
+});
+
+// ---- Review round 1 --------------------------------------------------------
+
+// The probe switch is off for the whole suite; these cases are about what a
+// recorder gets when nothing turns it off.
+const withProbeOn = (fn) => {
+  const saved = process.env.AGENT_SWITCHBOARD_HOST_PROBE;
+  delete process.env.AGENT_SWITCHBOARD_HOST_PROBE;
+  try { return fn(); } finally { if (saved === undefined) delete process.env.AGENT_SWITCHBOARD_HOST_PROBE; else process.env.AGENT_SWITCHBOARD_HOST_PROBE = saved; }
+};
+const sessionRecords = (records) => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'claude-sessions-'));
+  for (const [pid, sessionId] of Object.entries(records)) fs.writeFileSync(path.join(dir, `${pid}.json`), JSON.stringify({ pid: Number(pid), sessionId }));
+  process.env.CLAUDE_SESSIONS_DIR = dir;
+  return dir;
+};
+afterEach(() => { delete process.env.CLAUDE_SESSIONS_DIR; });
+
+test('fix 1: a nested agent that names no host never takes the seat host (no flapping)', () => {
+  proc.add(700, { comm: 'claude', start: 123, ppid: 1 });
+  proc.add(900, { comm: 'codex', start: 9, ppid: 700 });
+  sessionRecords({ 700: 'seat' });
+  withProbeOn(() => {
+    P.recordPresence({ sessionId: 'seat', cwd: '/r/x', windowId: 501, mailbox: true, host: 'auto', hostFrom: 700 });
+    // A recorder started under the seat's claude process, naming no host.
+    P.recordPresence({ sessionId: 'nested', cwd: '/r/y', mailbox: true, hostFrom: 900 });
+    P.recordPresence({ sessionId: 'seat', cwd: '/r/x', windowId: 501, mailbox: true, host: 'auto', hostFrom: 700 });
+    P.recordPresence({ sessionId: 'nested', cwd: '/r/y', mailbox: true, hostFrom: 900 });
+  });
+  const by = Object.fromEntries(M.readPresenceBeacons({ includeStale: true }).map((b) => [b.sessionId, b]));
+  assert.equal(by.seat.hostPid, 700);
+  assert.equal(by.seat.windowId, 501);
+  assert.equal(by.nested.hostPid, undefined);
+});
+
+test('fix 1: an auto host must be a claude process whose session record names this session', () => {
+  proc.add(700, { comm: 'claude', start: 123, ppid: 1 });
+  proc.add(900, { comm: 'node', start: 9, ppid: 700 });
+  sessionRecords({ 700: 'seat' });
+  P.recordPresence({ sessionId: 'other', cwd: '/r/y', host: 'auto', hostFrom: 900 });
+  P.recordPresence({ sessionId: 'seat', cwd: '/r/x', host: 'auto', hostFrom: 900 });
+  const by = Object.fromEntries(M.readPresenceBeacons({ includeStale: true }).map((b) => [b.sessionId, b]));
+  assert.equal(by.other.hostPid, undefined, 'a session the record does not name gets no host');
+  assert.equal(by.seat.hostPid, 700);
+  // No record at all proves nothing either.
+  fs.rmSync(path.join(process.env.CLAUDE_SESSIONS_DIR, '700.json'));
+  P.recordPresence({ sessionId: 'norec', cwd: '/r/z', host: 'auto', hostFrom: 900 });
+  assert.equal(M.readPresenceBeacons({ includeStale: true }).find((b) => b.sessionId === 'norec').hostPid, undefined);
+});
+
+test('fix 2: a modern writer identity is judged before a leftover server pid', () => {
+  const dead = spawnSync('true').pid;
+  const w = proc.add(150, { start: 1500, comm: 'opencode', argv: ['opencode', 'serve'] });
+  const at = new Date(Date.now() - MIN).toISOString();
+  const probe = P.createProbe({ procDir: proc.dir });
+  const row = { sessionId: 's', cwd: '/c', mailbox: true, pid: dead, bootId: 'boot-1', writerPid: w.pid, writerStart: w.start, lastTick: at };
+  assert.equal(P.classifyBeacon(row, { probe }).state, 'fresh');
+  assert.equal(P.classifyBeacon({ ...row, lastTick: new Date(Date.now() - 60 * MIN).toISOString() }, { probe }).state, 'stale');
+  // Through the store: the old pid column survives an update (COALESCE), and the next write must not delete the row.
+  const s = openStore(dbPath);
+  s.run('INSERT INTO presence_beacons (session_id, cwd, pid, first_tick, last_tick) VALUES (?, ?, ?, ?, ?)', 'srv', '/r/x', dead, at, at);
+  s.close();
+  P.recordPresence({ sessionId: 'srv', cwd: '/r/x', mailbox: true, host: null, writer: w });
+  P.recordPresence({ sessionId: 'other', cwd: '/r/y', host: null });
+  assert.ok(rows().some((r) => r.session_id === 'srv'), 'the row with a writer identity is kept');
+  assert.deepEqual(sids(M.readPresenceBeacons()).filter((x) => x === 'srv'), ['srv']);
+});
+
+test('fix 3: sending by mailbox key makes no kitty call, even with a legacy parked row present', () => {
+  const log = path.join(tmp, 'kitty-calls.log');
+  const kitty = path.join(tmp, 'kitty-logging');
+  fs.writeFileSync(kitty, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n[ "$2" = "ls" ] && cat ${JSON.stringify(path.join(tmp, 'ls.json'))}\nexit 0\n`, { mode: 0o755 });
+  process.env.AGENT_MAILBOX_KITTY = kitty;
+  const h = proc.add(100, { start: 1000 });
+  seat('verified', h, { minutes: 53 });
+  seat('legacy', null, { minutes: 60, window: 502, cwd: '/r/y' });
+  proc.add(300, { comm: 'claude', window: 502 });
+  assert.equal(M.resolveRecipient(key('verified')).sessionId, 'verified');
+  assert.equal(M.resolveRecipient(`/old/cwd__verified`.replace(/[^A-Za-z0-9._-]/g, '-')).sessionId, 'verified');
+  assert.equal(fs.existsSync(log), false, 'no kitty call for a key that a verified row answers');
+  // A legacy parked row is still reachable by its own key, and that one does need the window check.
+  assert.equal(M.resolveRecipient(key('legacy', '/r/y')).sessionId, 'legacy');
+  assert.equal(fs.existsSync(log), true);
+});
+
+test('fix 4: no code or doc names a mailbox-idle outcome nothing throws', () => {
+  const root = path.join(path.dirname(new URL(import.meta.url).pathname), '..');
+  for (const f of ['bin/agent-send.mjs', 'lib/agent-mailbox.mjs', 'lib/presence.mjs', 'docs/configuration.md']) {
+    assert.ok(!/mailbox-idle/.test(fs.readFileSync(path.join(root, f), 'utf8')), `${f} still names mailbox-idle`);
+  }
+  assert.ok(/classifyBeacon/.test(fs.readFileSync(path.join(root, 'docs/configuration.md'), 'utf8')), 'configuration.md names classifyBeacon');
+});
+
+test('fix 5: a dead verdict deletes a row only while the row is still what was judged', () => {
+  const h = proc.add(100, { start: 1000 });
+  seat('s1', h, { minutes: 53 });
+  const judged = M.readPresenceBeacons({ includeStale: true }).find((b) => b.sessionId === 's1');
+  // A writer revives the row between the verdict and the delete.
+  const h2 = proc.add(101, { start: 2000 });
+  P.recordPresence({ sessionId: 's1', cwd: '/r/x', mailbox: true, windowId: WIN, host: { pid: h2.pid, start: h2.start } });
+  const s = openStore(dbPath);
+  try {
+    assert.equal(P.deleteBeaconIfUnchanged(s, judged), 0);
+    assert.deepEqual(s.all('SELECT session_id FROM presence_beacons').map((r) => r.session_id), ['s1']);
+    const current = P.presenceRowToBeacon(s.get('SELECT * FROM presence_beacons WHERE session_id = ?', 's1'));
+    assert.equal(P.deleteBeaconIfUnchanged(s, current), 1);
+  } finally { s.close(); }
 });

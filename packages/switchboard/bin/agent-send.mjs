@@ -83,7 +83,7 @@ import {
   resolveRecipient,
   waitForAck,
 } from '../lib/agent-mailbox.mjs';
-import { procStat, switchboardDir } from '../lib/presence.mjs';
+import { claudeSessionsDir, procStat, switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
 import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
@@ -406,10 +406,6 @@ const displacedSeat = (sessionId, liveBeacon) => {
 // for a parked seat held only by the window rule.
 const seatState = (x) =>
   x.idleMinutes == null ? 'live' : `idle ${x.idleMinutes}m${x.verified === true ? '' : ' (unverified)'}`;
-
-// Claude Code's per-process session records (the seam lib/claude-session.sh reads).
-const claudeSessionsDir = () =>
-  process.env.CLAUDE_SESSIONS_DIR || path.join(process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'), 'sessions');
 
 // A Claude Code session record is live when its pid still runs the process that
 // wrote it: the pid's start time in /proc must equal the record's procStart
@@ -1056,7 +1052,7 @@ const main = (argv) => {
       process.exit(1);
     }
     // A poller with no composer has nothing to type into, live or not: queue.
-    if ((e?.code === 'mailbox-idle' || e?.code === 'mailbox-stale') && e.mailboxOnly === true && e.key != null) {
+    if (e?.code === 'mailbox-stale' && e.mailboxOnly === true && e.key != null) {
       const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
       const qrow = appendMessage({ to: e.key, from, priority, text, topic });
       verdict(
@@ -1065,7 +1061,6 @@ const main = (argv) => {
       );
       process.exit(3);
     }
-    if (e?.code === 'mailbox-idle') kittyFallback(`seat idle ${e.idleMinutes}m, typing to wake it`, e.key ?? null);
     if (e?.code === 'mailbox-stale') kittyFallback(`stale mailbox beacon for ${to} (${e.message})`);
     if (e?.code === 'mailbox-self' || e?.code === 'mailbox-no-beacon') kittyFallback(`no mailbox consumer at ${to}`);
     die(e.message);

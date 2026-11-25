@@ -128,18 +128,34 @@ const argvOf = (pid, procDir) => {
 // server's argv carries `serve`; one whose argv cannot be read is skipped
 // too, since taking a server for a host is the mistake this identity exists
 // to prevent. Null when no ancestor qualifies: no host is better than a wrong one.
-export const findHostAncestor = ({ from = process.pid, procDir = defaultProcDir(), names = AGENT_COMM_NAMES } = {}) => {
+// `accept({pid, comm, start})` may refuse the first qualifying ancestor; the
+// walk then ends with no host rather than climbing to a process further up,
+// which would be some other session's.
+export const findHostAncestor = ({ from = process.pid, procDir = defaultProcDir(), names = AGENT_COMM_NAMES, accept = () => true } = {}) => {
   let pid = Number(from);
   for (let hops = 0; Number.isInteger(pid) && pid > 1 && hops < 64; hops += 1) {
     const st = procStat(pid, { procDir });
     if (!st) return null;
     if (names.includes(st.comm)) {
       const argv = argvOf(pid, procDir);
-      if (argv && !argv.includes('serve')) return { pid, start: st.start };
+      if (argv && !argv.includes('serve')) return accept({ pid, comm: st.comm, start: st.start }) ? { pid, start: st.start } : null;
     }
     pid = st.ppid;
   }
   return null;
+};
+
+// Claude Code's per-process session records: <pid>.json holds the session the
+// process runs (the seam lib/claude-session.sh reads).
+export const claudeSessionsDir = () =>
+  process.env.CLAUDE_SESSIONS_DIR || path.join(process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'), 'sessions');
+
+const claudeRecordSession = (pid) => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(claudeSessionsDir(), `${pid}.json`), 'utf8')).sessionId ?? null;
+  } catch {
+    return null;
+  }
 };
 
 // A beacon may carry the pid of a writer from before host identities existed
@@ -203,16 +219,18 @@ export const classifyBeacon = (b, { now = Date.now(), probe = createProbe() } = 
     const state = fresh ? 'fresh' : 'idle-live';
     return out(state, { verified: true, consumer: consumerOf(state) });
   }
+  // A modern writer with no host bound, or whose host moved to another
+  // session: the TTL only, which is honest. This comes before the legacy pid:
+  // a row an old writer left a server pid on keeps that column after a modern
+  // writer takes it over, and the stale pid must not outvote the identity.
+  if (b.bootId != null || b.writerPid != null || b.hostPid != null) {
+    const state = fresh ? 'fresh' : 'stale';
+    return out(state, { consumer: fresh && consumerOf(state) });
+  }
   if (b.pid != null) {
     if (!pidAlive(b.pid)) return out('dead', { legacy: 'pid' });
     const state = fresh ? 'fresh' : 'stale';
     return out(state, { legacy: 'pid', consumer: fresh && consumerOf(state) });
-  }
-  // A modern writer with no host bound, or whose host moved to another
-  // session: the TTL only, which is honest.
-  if (b.bootId != null || b.writerPid != null || b.hostPid != null) {
-    const state = fresh ? 'fresh' : 'stale';
-    return out(state, { consumer: fresh && consumerOf(state) });
   }
   // Written before identities and with no pid (a Claude Code hook): fresh by
   // the TTL, parked past it only while its window runs an agent, which the
@@ -278,21 +296,31 @@ const retainPresence = (beacons, now) => {
   return beacons.filter((b) => classifyBeacon(b, { now, probe }).state !== 'dead');
 };
 
-// The identity a write records. host: 'auto' walks the ancestors of
-// `hostFrom` for the interactive agent; an object {pid, start?} names it;
-// null records none. Undefined means 'auto' unless AGENT_SWITCHBOARD_HOST_PROBE
-// is `off`. Nothing is recorded that could not be read, nor with no boot id
-// to pin it to.
+// The identity a write records. A recorder names its host: 'auto' walks the
+// ancestors of `hostFrom` for the interactive agent that runs THIS session
+// (a claude process only when its session record names `sessionId`); an object
+// {pid, start?} names it; null or nothing records none. 'auto' is opt-in:
+// a recorder that does not own an interactive host (a nested agent, a plain
+// script) must not borrow the nearest agent ancestor, which belongs to another
+// session. AGENT_SWITCHBOARD_HOST_PROBE=off stops an 'auto' that starts from
+// this process (tests); an explicit `hostFrom` is not affected. Nothing is
+// recorded that could not be read, nor with no boot id to pin it to.
 const hostProbeOff = () => process.env.AGENT_SWITCHBOARD_HOST_PROBE === 'off';
-const resolveIdentity = ({ host, hostProof, writer, bootId, hostFrom, procDir = defaultProcDir() }) => {
+const resolveIdentity = ({ host, hostProof, writer, bootId, hostFrom, sessionId, procDir = defaultProcDir() }) => {
   const startOf = (pid, given) => (given != null ? Number(given) : (readStat(pid, procDir).start ?? null));
   const named = (p) => {
     if (!p || !Number.isInteger(Number(p.pid))) return null;
     const start = startOf(Number(p.pid), p.start);
     return start != null && Number.isFinite(start) ? { pid: Number(p.pid), start } : null;
   };
-  let h = host === undefined ? (hostProbeOff() ? null : 'auto') : host;
-  if (h === 'auto') h = findHostAncestor({ from: hostFrom ?? process.pid, procDir });
+  let h = host ?? null;
+  if (h === 'auto') {
+    h = hostProbeOff() && hostFrom == null ? null : findHostAncestor({
+      from: hostFrom ?? process.pid,
+      procDir,
+      accept: ({ pid, comm }) => comm !== 'claude' || sessionId == null || claudeRecordSession(pid) === sessionId,
+    });
+  }
   const hostId = named(h);
   const writerId = named(writer);
   const boot = bootId ?? currentBootId({ procDir });
@@ -341,6 +369,18 @@ export const presenceRowToBeacon = (r) => ({
   lastTick: r.last_tick,
 });
 
+// Delete a row only while it is still the row that was judged dead: a writer
+// that revived it since (a new tick or another host) keeps it. Returns the
+// number of rows deleted.
+export const deleteBeaconIfUnchanged = (store, b) =>
+  store.run(
+    `DELETE FROM presence_beacons
+      WHERE session_id = ? AND cwd = ? AND last_tick = ? AND pid IS ?
+        AND boot_id IS ? AND host_pid IS ? AND host_start IS ? AND writer_pid IS ? AND writer_start IS ?`,
+    b.sessionId, b.cwd, b.lastTick, b.pid ?? null,
+    b.bootId ?? null, b.hostPid ?? null, b.hostStart ?? null, b.writerPid ?? null, b.writerStart ?? null,
+  ).changes ?? 0;
+
 const beaconKey = (b) => `${b.sessionId ?? 'anon'}:${b.cwd}`;
 
 // Refresh this session's presence (call from a UserPromptSubmit hook). Returns
@@ -372,11 +412,12 @@ export const recordPresence = ({
   work = false,
   now = Date.now(),
 } = {}) => {
-  const ident = resolveIdentity({ host, hostProof, writer, bootId, hostFrom });
+  const ident = resolveIdentity({ host, hostProof, writer, bootId, hostFrom, sessionId });
   if (usePresenceDb(file)) {
     return withPresenceDb((store) => {
       const iso = new Date(now).toISOString();
       const sid = sessionId ?? 'anon';
+      const kept = [];
       store.transaction(() => {
         // Read before the prune: the row that last worked may be the one it deletes.
         const inherited = store.get(
@@ -428,19 +469,19 @@ export const recordPresence = ({
         }
         // Work moves the session's latest work tree on every row it owns.
         if (work) store.run('UPDATE presence_beacons SET last_work_cwd = ? WHERE session_id = ?', cwd, sid);
+        // A beacon that is provably gone is deleted here, not only hidden, so
+        // the next reader does not have to probe it again. Judged and deleted
+        // inside this transaction, which holds the write lock, and each delete
+        // still names what was judged. An unreadable /proc proves nothing and
+        // deletes nothing.
+        const probe = createProbe();
+        for (const b of store.all('SELECT * FROM presence_beacons').map(presenceRowToBeacon)) {
+          const verdict = classifyBeacon(b, { now, probe });
+          if (verdict.state === 'dead') deleteBeaconIfUnchanged(store, b);
+          else if (verdict.state === 'fresh') kept.push(b);
+        }
       });
       const mineKey = beaconKey({ sessionId, cwd });
-      const all = store.all('SELECT * FROM presence_beacons').map(presenceRowToBeacon);
-      // A beacon that is provably gone is deleted here, not only hidden, so
-      // the next reader does not have to probe it again. An unreadable /proc
-      // proves nothing and deletes nothing.
-      const probe = createProbe();
-      const kept = [];
-      for (const b of all) {
-        const verdict = classifyBeacon(b, { now, probe });
-        if (verdict.state === 'dead') store.run('DELETE FROM presence_beacons WHERE session_id = ? AND cwd = ?', b.sessionId, b.cwd);
-        else if (verdict.state === 'fresh') kept.push(b);
-      }
       return kept.filter((b) => beaconKey(b) !== mineKey);
     });
   }

@@ -3364,3 +3364,69 @@ test('--queue --deadline to a busy recipient: the gaps between window reads grow
   const reads = fs.readFileSync(stamps, 'utf-8').trim().split('\n').length;
   assert.ok(reads <= gaps.length + 3, `${reads} reads for ${gaps.length} passes`);
 });
+
+// A parked seat whose host identity was verified: what a send does depends on
+// whether anything drains its mailbox out of band. Each case runs agent-send
+// against a store of its own and a fake /proc that holds the seat's host (and,
+// for the second, the server process that drains it).
+const idleLiveFixture = async (name, { writer }) => {
+  const { makeFakeProc } = await import('./helpers/fake-proc.mjs');
+  const { recordPresence } = await import('../lib/presence.mjs');
+  const db = path.join(binDir, `idle-live-${name}.db`);
+  const fp = makeFakeProc({ bootId: 'boot-e2e' });
+  const host = fp.add(100, { start: 1000 });
+  const srv = fp.add(150, { start: 1500, comm: 'opencode', argv: ['opencode', 'serve'] });
+  const saved = { db: process.env.AGENT_SWITCHBOARD_DB, proc: process.env.AGENT_MAILBOX_PROC_DIR };
+  process.env.AGENT_SWITCHBOARD_DB = db;
+  process.env.AGENT_MAILBOX_PROC_DIR = fp.dir;
+  try {
+    recordPresence({
+      sessionId: 'idle-live', cwd: '/repo/b', windowId: 991002, mailbox: true, now: Date.now() - 53 * 60_000,
+      host: { pid: host.pid, start: host.start }, hostProof: 'argv', writer: writer ? { pid: srv.pid, start: srv.start } : null,
+    });
+  } finally {
+    for (const [k, v] of [['AGENT_SWITCHBOARD_DB', saved.db], ['AGENT_MAILBOX_PROC_DIR', saved.proc]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+  const env = handoverEnv(db, { AGENT_MAILBOX_PROC_DIR: fp.dir, CLAUDE_CODE_SESSION_ID: 'sender' });
+  return { db, env, fp, key: recipientKey({ cwd: '/repo/b', sessionId: 'idle-live' }) };
+};
+
+test('a verified idle-live seat with no writer is woken by typing', async () => {
+  const fx = await idleLiveFixture('typed', { writer: false });
+  try {
+    fs.rmSync(fallbackArgv, { force: true });
+    const { code, stderr } = await runSend(['--to', fx.key, '--text', 'wake up'], fx.env);
+    assert.match(stderr, /seat idle 53m, typing to wake it/, stderr);
+    assert.equal(code, 5, stderr); // the kitty-send stub's exit, passed through
+    const argv = fs.readFileSync(fallbackArgv, 'utf-8').split('\n').filter(Boolean);
+    assert.deepEqual(argv.slice(0, 4), ['--to', fx.key, '--text', 'wake up'], `typed through the kitty-send fallback: ${argv}`);
+  } finally { fx.fp.destroy(); }
+});
+
+test('a verified idle-live seat with a live writer is queued, never typed into', async () => {
+  const fx = await idleLiveFixture('queued', { writer: true });
+  const saved = process.env.AGENT_SWITCHBOARD_DB;
+  process.env.AGENT_SWITCHBOARD_DB = fx.db;
+  try {
+    fs.rmSync(fallbackArgv, { force: true });
+    const child = spawn('node', [SEND, '--to', fx.key, '--text', 'drain me', '--deadline', '10'], { env: fx.env });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    const done = new Promise((resolve) => child.on('close', resolve));
+    let row = null;
+    for (const end = Date.now() + 8000; row == null && Date.now() < end;) {
+      await sleep(100);
+      row = readUnacked(fx.key).find((r) => r.text === 'drain me') ?? null;
+    }
+    assert.ok(row, `the row was never queued: ${stderr}`);
+    assert.equal(fs.existsSync(fallbackArgv), false, 'nothing typed while the writer can drain it');
+    ack({ key: fx.key, id: row.id, deliveredAs: 'mcp' }); // the server's drain
+    assert.equal(await done, 0, stderr);
+    assert.equal(fs.existsSync(fallbackArgv), false, stderr);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_SWITCHBOARD_DB; else process.env.AGENT_SWITCHBOARD_DB = saved;
+    fx.fp.destroy();
+  }
+});
