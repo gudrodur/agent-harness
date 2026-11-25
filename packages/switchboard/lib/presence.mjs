@@ -305,8 +305,11 @@ const retainPresence = (beacons, now) => {
 // session. AGENT_SWITCHBOARD_HOST_PROBE=off stops an 'auto' that starts from
 // this process (tests); an explicit `hostFrom` is not affected. Nothing is
 // recorded that could not be read, nor with no boot id to pin it to.
+// `hostNames` narrows which command names 'auto' takes for an agent (default
+// AGENT_COMM_NAMES): a recorder that runs under one kind of agent names it,
+// so the walk never stops at an agent of another kind further up.
 const hostProbeOff = () => process.env.AGENT_SWITCHBOARD_HOST_PROBE === 'off';
-const resolveIdentity = ({ host, hostProof, writer, bootId, hostFrom, sessionId, procDir = defaultProcDir() }) => {
+const resolveIdentity = ({ host, hostProof, writer, bootId, hostFrom, hostNames = AGENT_COMM_NAMES, sessionId, procDir = defaultProcDir() }) => {
   const startOf = (pid, given) => (given != null ? Number(given) : (readStat(pid, procDir).start ?? null));
   const named = (p) => {
     if (!p || !Number.isInteger(Number(p.pid))) return null;
@@ -317,6 +320,7 @@ const resolveIdentity = ({ host, hostProof, writer, bootId, hostFrom, sessionId,
   if (h === 'auto') {
     h = hostProbeOff() && hostFrom == null ? null : findHostAncestor({
       from: hostFrom ?? process.pid,
+      names: hostNames,
       procDir,
       accept: ({ pid, comm }) => comm !== 'claude' || sessionId == null || claudeRecordSession(pid) === sessionId,
     });
@@ -407,12 +411,13 @@ export const recordPresence = ({
   host = undefined,
   hostProof = null,
   hostFrom = undefined,
+  hostNames = undefined,
   writer = null,
   bootId = null,
   work = false,
   now = Date.now(),
 } = {}) => {
-  const ident = resolveIdentity({ host, hostProof, writer, bootId, hostFrom, sessionId });
+  const ident = resolveIdentity({ host, hostProof, writer, bootId, hostFrom, hostNames, sessionId });
   if (usePresenceDb(file)) {
     return withPresenceDb((store) => {
       const iso = new Date(now).toISOString();

@@ -170,7 +170,7 @@ const underFakeClaude = ({ recordedSession }) => {
   return claudePid;
 };
 
-test('the hook binds the claude ancestor whose session record names the session as the host', () => {
+test('the hook binds the claude ancestor whose session record names the session as the host', { skip: !fs.existsSync('/proc/self/cmdline') }, () => {
   fs.rmSync(path.join(switchDir, 'presence.json'), { force: true });
   const claudePid = underFakeClaude({ recordedSession: SID });
   const mine = presenceBeacons().filter((b) => b.cwd === CWD && b.sessionId === SID);
@@ -180,7 +180,7 @@ test('the hook binds the claude ancestor whose session record names the session 
   assert.ok(mine[0].hostStart > 0 && mine[0].bootId);
 });
 
-test('the hook binds no host when the ancestor session record names another session', () => {
+test('the hook binds no host when the ancestor session record names another session', { skip: !fs.existsSync('/proc/self/cmdline') }, () => {
   fs.rmSync(path.join(switchDir, 'presence.json'), { force: true });
   underFakeClaude({ recordedSession: 'someone-else' });
   const mine = presenceBeacons().filter((b) => b.cwd === CWD && b.sessionId === SID);
