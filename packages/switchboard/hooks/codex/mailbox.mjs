@@ -40,7 +40,9 @@ export const handleEvent = (input, {
   }
   if (event !== 'SessionStart' && event !== 'UserPromptSubmit') return '';
 
-  record({ sessionId, cwd, mailbox: true });
+  // The Codex process that runs this hook hosts the session; only a codex
+  // ancestor counts, never an agent of another kind that launched Codex.
+  record({ sessionId, cwd, mailbox: true, host: 'auto', hostNames: ['codex'] });
   if (event === 'SessionStart') return '';
 
   let rows;
