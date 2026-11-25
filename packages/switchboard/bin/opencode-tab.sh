@@ -165,11 +165,39 @@ MSG="Read $BRIEF and carry it out in full. Run the commands rather than reasonin
 # there. The prompt is a positional argument and stdin is closed, as # headless guard requires. It runs in a throwaway directory (its session row
 # names that directory, not $CWD) and always --standalone: it must not touch
 # the shared service the tab may attach to. Exit 0 with a payment error in # last lines still fails, since a run can report a provider error and exit 0.
+#
+# The run leaves a session row in the store, and every session picker on that
+# store lists it ("OK" sessions piled up by the dozen). So whatever the outcome,
+# answered, failed or hung, the top-level sessions in the probe's own throwaway
+# directory are deleted before any verdict: only the probe ever ran there. The
+# delete goes through the launcher (`session delete` removes child sessions
+# too), also --standalone; a delete that fails is reported, never fatal.
+probe_sessions() {
+  [ -r "$DB" ] || return 0
+  node - "$DB" "$1" <<'JS' 2>/dev/null
+process.emitWarning = () => {};
+const { DatabaseSync } = require('node:sqlite');
+const [db, dir] = process.argv.slice(2);
+const d = new DatabaseSync(db, { readOnly: true });
+const tables = d.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_v2','session')").all().map((row) => row.name);
+const ids = new Set();
+for (const t of tables) for (const r of d.prepare(`SELECT id FROM ${t} WHERE directory = ? AND parent_id IS NULL`).all(dir)) ids.add(r.id);
+for (const id of ids) console.log(id);
+JS
+}
+delete_probe_sessions() {
+  local id
+  for id in $(probe_sessions "$1"); do
+    "$LAUNCH" session delete --standalone "$id" </dev/null >/dev/null 2>&1 \
+      || note "could not delete the probe's session $id; delete it with '$LAUNCH session delete $id'"
+  done
+}
 probe_model() {
   local probe_cwd out rc
   probe_cwd="$(mktemp -d "${TMPDIR:-/tmp}/opencode-tab-probe-XXXXXX")"
   out="$(cd "$probe_cwd" && timeout "$PROBE_TIMEOUT" "$LAUNCH" run --standalone -m "$MODEL" \
            "Reply with exactly the word OK and nothing else." </dev/null 2>&1)"; rc=$?
+  delete_probe_sessions "$probe_cwd"
   rm -rf "$probe_cwd"
   if [ "$rc" -eq 124 ]; then
     die "probe of $MODEL hung for $PROBE_TIMEOUT s; nothing launched. A hang is the environment, not the provider. Re-run; if it repeats, run '$LAUNCH run --standalone -m $MODEL' by hand with stdin closed (< /dev/null)."
