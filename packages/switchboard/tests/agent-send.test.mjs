@@ -60,7 +60,10 @@ before(async () => {
     tabs: [{
       title: 'tab-one',
       windows: [
-        { id: 991001, title: 'opencode: example-project review', pid: 111, cwd: '/repo/a' },
+        // This process's pid: a beacon that names this window has a writer
+        // presence can prove alive (it drops a beacon whose pid is gone), so a
+        // fixture built on it does not depend on a literal pid existing here.
+        { id: 991001, title: 'opencode: example-project review', pid: process.pid, cwd: '/repo/a' },
         { id: 991002, title: 'opencode: example-project review docs', pid: 112, cwd: '/repo/b', foreground_processes: [{ pid: 112, cmdline: ['/usr/bin/claude'] }] },
       ],
     }],
@@ -2582,8 +2585,11 @@ test('a stale beacon that names the taker own window records no handover', async
   // A shared cwd can leave the displaced session's beacon carrying the taker's
   // own window and pid. Recording it would name the live taker, and the taker
   // would then be allowed to retire its own window.
+  // The beacon carries this process's pid, alive like the writer it models:
+  // presence drops a beacon whose pid is gone, so a pid the test does not own
+  // would delete the very evidence this case is about on a machine without it.
   const fx = await handoverFixture('own-window');
-  await seatHolder(fx, { windowId: 991001, pid: 111 });
+  await seatHolder(fx, { minutesAgo: 60, windowId: 991001, pid: process.pid });
   const r = await takeOverAs(fx.db, ['--take-over']);
   assert.equal(r.code, 0, r.stderr);
   assert.equal((await handovers(fx.db)).length, 0, 'the displaced window must not be the taker own');
