@@ -466,15 +466,16 @@ test('no /proc: the writer is recorded by pid alone, the host not at all, and th
   }
   const pick = (b) => ({ writerPid: b.writerPid, writerStart: b.writerStart, hostPid: b.hostPid, state: b.state, unknown: b.unknown });
   const db = Object.fromEntries(M.readPresenceBeacons({ includeStale: true }).map((b) => [b.sessionId, b]));
-  // The pid and its start move together: the old start is never left beside the new pid.
-  assert.deepEqual(pick(db.s1), { writerPid: 151, writerStart: undefined, hostPid: undefined, state: 'fresh', unknown: false });
-  assert.deepEqual(pick(db.s2), { writerPid: 152, writerStart: undefined, hostPid: undefined, state: 'fresh', unknown: false });
+  // The pid and its start move together: the old start is never left beside the new pid. With no
+  // boot id the identity could not be checked, so the row says unknown and a reader keeps it.
+  assert.deepEqual(pick(db.s1), { writerPid: 151, writerStart: undefined, hostPid: undefined, state: 'fresh', unknown: true });
+  assert.deepEqual(pick(db.s2), { writerPid: 152, writerStart: undefined, hostPid: undefined, state: 'fresh', unknown: true });
   assert.equal(M.resolveRecipient(key('s2', '/r/y')).hasConsumer, true);
   // Past the TTL the row is stale, never verified and never deleted for a liveness it could not read.
   const aged = M.readPresenceBeacons({ includeStale: true, now: Date.now() + 60 * MIN }).find((b) => b.sessionId === 's2');
   assert.deepEqual([aged.state, aged.verified], ['stale', false]);
   const fromFile = Object.fromEntries(P.readAllPresence({ file }).map((b) => [b.sessionId, b]));
-  assert.deepEqual([fromFile.s1.writerPid, fromFile.s1.writerStart, fromFile.s1.hostPid], [151, undefined, undefined]);
+  assert.deepEqual([fromFile.s1.writerPid, fromFile.s1.writerStart, fromFile.s1.hostPid, fromFile.s1.bootId], [151, undefined, undefined, undefined]);
   assert.deepEqual([fromFile.s2.writerPid, fromFile.s2.bootId], [152, undefined]);
 });
 

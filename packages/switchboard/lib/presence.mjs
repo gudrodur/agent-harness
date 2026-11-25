@@ -225,7 +225,9 @@ export const classifyBeacon = (b, { now = Date.now(), probe = createProbe() } = 
   // writer takes it over, and the stale pid must not outvote the identity.
   if (b.bootId != null || b.writerPid != null || b.hostPid != null) {
     const state = fresh ? 'fresh' : 'stale';
-    return out(state, { consumer: fresh && consumerOf(state) });
+    // With no boot id (a host with no /proc) the identity could not be
+    // checked: report that, so a reader keeps the row rather than refute it.
+    return out(state, { unknown: b.bootId == null, consumer: fresh && consumerOf(state) });
   }
   if (b.pid != null) {
     if (!pidAlive(b.pid)) return out('dead', { legacy: 'pid' });
@@ -443,22 +445,29 @@ export const recordPresence = ({
           ident.bootId, ident.host?.pid ?? null, ident.host?.start ?? null, ident.host?.proof ?? null,
           ident.writer?.pid ?? null, ident.writer?.start ?? null,
         ];
+        const unread = ident.writer && ident.bootId == null ? 1 : 0; // a writer read where no /proc is
         if (me) {
           store.run(
             `UPDATE presence_beacons SET last_tick = ?, branch = ?, cwd = ?,
               home_cwd = COALESCE(?, home_cwd), mailbox = COALESCE(?, mailbox), mailbox_only = COALESCE(?, mailbox_only),
               window_id = COALESCE(?, window_id),
               pid = COALESCE(?, pid), last_work_tick = COALESCE(?, last_work_tick),
-              boot_id = COALESCE(?, boot_id), host_pid = COALESCE(?, host_pid), host_start = COALESCE(?, host_start),
-              host_proof = COALESCE(?, host_proof), writer_pid = COALESCE(?, writer_pid),
+              boot_id = CASE WHEN ? THEN NULL ELSE COALESCE(?, boot_id) END,
+              host_pid = CASE WHEN ? THEN NULL ELSE COALESCE(?, host_pid) END,
+              host_start = CASE WHEN ? THEN NULL ELSE COALESCE(?, host_start) END,
+              host_proof = CASE WHEN ? THEN NULL ELSE COALESCE(?, host_proof) END,
+              writer_pid = COALESCE(?, writer_pid),
               writer_start = CASE WHEN ? IS NULL THEN writer_start ELSE ? END
              WHERE session_id = ? AND cwd = ?`,
             iso, branch, cwd,
             homeCwd, mailbox == null ? null : mailbox ? 1 : 0, mailboxOnly == null ? null : mailboxOnly ? 1 : 0,
             windowId == null ? null : Number(windowId),
             pid == null ? null : Number(pid), work ? iso : null,
+            // A writer read with no boot id clears the boot id and host an earlier write left:
+            // they cannot be checked beside it, and a reader must see the row as unknown.
+            unread, ident.bootId, unread, ident.host?.pid ?? null, unread, ident.host?.start ?? null, unread, ident.host?.proof ?? null,
             // A writer's pid and start move together: a pid named without a start clears the old start.
-            ...idParams.slice(0, 5), ident.writer?.pid ?? null, ident.writer?.start ?? null,
+            ident.writer?.pid ?? null, ident.writer?.pid ?? null, ident.writer?.start ?? null,
             sid, me.cwd,
           );
         } else {
@@ -531,6 +540,7 @@ export const recordPresence = ({
     if (pid !== null) me.pid = pid;
     Object.assign(me, identFields);
     if (ident.writer && ident.writer.start == null) delete me.writerStart; // the pid and its start move together
+    if (ident.writer && ident.bootId == null) for (const k of ['bootId', 'hostPid', 'hostStart', 'hostProof']) delete me[k]; // as the DB backend
     if (work) me.lastWorkTick = iso;
     if (me.lastWorkCwd == null && inherited !== null) me.lastWorkCwd = inherited;
   } else {
