@@ -35,7 +35,10 @@ export const stripIsolatedVars = (env = process.env) => {
 };
 
 // Child-process environment: stripped base plus the test's own pins.
-export const isolatedEnv = (extra = {}) => ({ ...stripIsolatedVars(), ...extra });
+// The host probe is off by default: a test process descends from whatever
+// agent runs the suite, and recording that agent as the host of a test row
+// would tie test rows to the live process table. A test of the probe turns it on.
+export const isolatedEnv = (extra = {}) => ({ ...stripIsolatedVars(), AGENT_SWITCHBOARD_HOST_PROBE: 'off', ...extra });
 
 // In-process scrub: delete the pins from this process before importing the
 // lib (module constants such as MAILBOX_DIR capture env at import time).

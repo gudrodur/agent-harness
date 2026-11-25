@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS presence_beacons (
   mailbox_only INTEGER,
   window_id INTEGER,
   pid INTEGER,
+  boot_id TEXT,
+  host_pid INTEGER,
+  host_start INTEGER,
+  host_proof TEXT,
+  writer_pid INTEGER,
+  writer_start INTEGER,
   last_work_tick TEXT,
   last_work_cwd TEXT,
   first_tick TEXT NOT NULL,
@@ -203,7 +209,11 @@ export const openStore = (dbPath = defaultStorePath()) => {
         (c) => c.name,
       ),
     );
-    for (const [col, type] of [['pid', 'INTEGER'], ['last_work_tick', 'TEXT'], ['last_work_cwd', 'TEXT'], ['mailbox_only', 'INTEGER']]) {
+    for (const [col, type] of [
+      ['pid', 'INTEGER'], ['last_work_tick', 'TEXT'], ['last_work_cwd', 'TEXT'], ['mailbox_only', 'INTEGER'],
+      ['boot_id', 'TEXT'], ['host_pid', 'INTEGER'], ['host_start', 'INTEGER'], ['host_proof', 'TEXT'],
+      ['writer_pid', 'INTEGER'], ['writer_start', 'INTEGER'],
+    ]) {
       if (cols.has(col)) continue;
       try {
         db.exec(`ALTER TABLE presence_beacons ADD COLUMN ${col} ${type};`);

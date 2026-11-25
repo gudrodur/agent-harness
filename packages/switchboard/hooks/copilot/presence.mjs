@@ -6,7 +6,7 @@
 // kitty typing fallback to wake the seat and deliver the next prompt.
 
 import { isMainModule } from '../../lib/cli-entry.mjs';
-import { recordPresence } from '../../lib/presence.mjs';
+import { procStat, recordPresence } from '../../lib/presence.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -48,20 +48,15 @@ export const presenceFromStatus = (input, env = process.env) => {
 export const publishPresence = (input, env = process.env, record = recordPresence) => {
   const identity = presenceFromStatus(input, env);
   if (!identity) return false;
-  record({ ...identity, pid: process.ppid, mailbox: false, mailboxOnly: false });
+  // The status-line command's parent is the Copilot process itself, so it is
+  // the host; no command-name filter, since the name is whatever Copilot runs
+  // as. The bare pid stays for hosts without /proc, where no identity can be read.
+  record({ ...identity, pid: process.ppid, host: { pid: process.ppid }, mailbox: false, mailboxOnly: false });
   return true;
 };
 
-// The parent pid from /proc/<pid>/stat. The command name sits in parentheses
-// and may hold spaces or ')', so the fields are read after the LAST ')'.
-const parentOf = (pid) => {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
-  } catch {
-    return null;
-  }
-};
+// The parent pid from /proc/<pid>/stat (the shared parser in lib/presence.mjs).
+const parentOf = (pid) => procStat(pid)?.ppid ?? null;
 
 // The kitty window's own pid: the ancestor of this hook whose parent is kitty
 // (KITTY_PID, which kitty puts in every window's environment). It is the pid

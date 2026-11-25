@@ -508,7 +508,7 @@ test('--queue to an idle seat: exit 12 re-queues the row and the hint names the 
   const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
   const saved = fs.readFileSync(presFile, 'utf-8');
   try {
-    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }] }));
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, firstTick: old, lastTick: old }] }));
     const { code, killed, stderr } = await queueSend(['--to', '991001', '--queue'], {
       title: 'claude: idle seat',
       extraSessions: NAMED, envExtra: { KITTY_SEND_STUB_EXIT: '12', AGENT_MAILBOX_PROC_DIR: procDir },
@@ -626,7 +626,7 @@ test('the budget spent with kitty down reuses the earlier failed probe: kitty @ 
 
 test('a role whose idle holder cannot be seen because kitty is down: exit 3 queued for the role, with the hint', async () => {
   const fx = await handoverFixture('rc-role');
-  await seatHolder(fx, { minutesAgo: 30, windowId: 991002, pid: process.pid });
+  await seatHolder(fx, { minutesAgo: 30, windowId: 991002 });
   const procDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsend-proc-'));
   fs.mkdirSync(path.join(procDir, '4002'));
   fs.writeFileSync(path.join(procDir, '4002', 'comm'), 'claude\n');
@@ -2233,7 +2233,7 @@ test('a typed wake-up fallback to a busy seat (idle beacon) queues the row inste
   const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
   const saved = fs.readFileSync(presFile, 'utf-8');
   try {
-    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }] }));
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, firstTick: old, lastTick: old }] }));
     const { code, killed, stderr, argv } = await queueSend(['--to', '991001', '--now'], {
       title: '⠇ claude: working', status: 'busy',
       extraSessions: NAMED, envExtra: { AGENT_MAILBOX_PROC_DIR: procDir },
@@ -2260,7 +2260,7 @@ test('the race hold to a seat with a mailbox parks a withdrawable row instead of
   fs.rmSync(calls, { force: true });
   const saved = fs.readFileSync(presFile, 'utf-8');
   try {
-    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }] }));
+    fs.writeFileSync(presFile, JSON.stringify({ beacons: [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, firstTick: old, lastTick: old }] }));
     const { code, killed, stderr } = await queueSend(['--to', '991001'], {
       title: 'claude: idle seat', status: 'idle',
       extraSessions: NAMED, envExtra: { AGENT_MAILBOX_PROC_DIR: procDir, AGENT_SEND_KITTY_SEND: stub },
@@ -2517,7 +2517,7 @@ const seatHolder = async (fx, { minutesAgo = 0, windowId = 991002, pid = undefin
   const prev = process.env.AGENT_SWITCHBOARD_DB;
   process.env.AGENT_SWITCHBOARD_DB = fx.db;
   try {
-    fx.recordPresence({ sessionId: 'old-seat', cwd: '/repo/b', windowId, mailbox: true, pid: pid ?? (minutesAgo ? process.pid : null), now: Date.now() - minutesAgo * 60_000 });
+    fx.recordPresence({ sessionId: 'old-seat', cwd: '/repo/b', windowId, mailbox: true, pid: pid ?? null, now: Date.now() - minutesAgo * 60_000 });
     await withHandoverStore(fx.db, (s) => fx.claimRole(s, { role: 'lead', sessionId: 'old-seat', cwd: '/repo/b', windowId }));
   } finally {
     if (prev === undefined) delete process.env.AGENT_SWITCHBOARD_DB; else process.env.AGENT_SWITCHBOARD_DB = prev;
@@ -2777,7 +2777,7 @@ for (const [st, reason] of [[4, /selection dialog open/], [9, /composer holds un
 // to fall into the kitty fallback and type, then block on the proof.
 const IDLE_BEACON = () => {
   const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-  return [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, pid: process.pid, firstTick: old, lastTick: old }];
+  return [{ sessionId: 's1', cwd: '/repo/a', mailbox: true, windowId: 991001, firstTick: old, lastTick: old }];
 };
 
 test('--no-wait to an idle seat only queues: nothing is typed', async () => {

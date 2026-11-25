@@ -1,7 +1,7 @@
 // Tests for role ownership and idle seats:
 // a live seat never loses a role silently (--claim-role exit 11, --take-over
-// notifies), an idle seat (past the presence TTL, pid alive, kitty window
-// open) stays listed and addressable, and the claim nudge states the
+// notifies), an idle seat (past the presence TTL, no pid, kitty window open
+// running an agent) stays listed and addressable, and the claim nudge states the
 // <repo>-<purpose> convention.
 //
 // Run: node --test tests/role-ownership.test.mjs
@@ -33,7 +33,9 @@ const send = (args, extra = {}) =>
   spawnSync('node', [SEND, ...args], { encoding: 'utf-8', env: childEnv(extra), timeout: 30_000 });
 const beacon = (sessionId, cwd, extra = {}) => recordPresence({ sessionId, cwd, mailbox: true, ...extra });
 const idleBeacon = (sessionId, cwd, minutes, extra = {}) =>
-  beacon(sessionId, cwd, { now: Date.now() - minutes * 60_000, pid: process.pid, ...extra });
+  // A Claude Code row: no pid and no host identity, so its parked state rests
+  // on the window rule (open window running an agent).
+  beacon(sessionId, cwd, { now: Date.now() - minutes * 60_000, ...extra });
 const deadPid = () => spawnSync('node', ['-e', '0']).pid;
 const roles = () => import('../lib/seat-roles.mjs');
 const withDb = async (fn) => {
@@ -82,14 +84,16 @@ after(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test('an idle seat (pid alive, window open) stays listed, marked idle <N>m', () => {
+test('an idle seat (no pid, window open with an agent) stays listed, marked idle <N>m', () => {
   idleBeacon('idle-1', '/r/idle', 45, { windowId: 410 });
   assert.ok(45 * 60_000 > PRESENCE_STALE_MS);
   const seat = who().find((s) => s.sessionId === 'idle-1');
   assert.ok(seat, 'idle seat listed');
   assert.equal(seat.idleMinutes, 45);
   assert.equal(seat.windowId, 410);
-  assert.match(send(['--who']).stdout, /idle-1\b.*idle 45m/);
+  assert.equal(seat.state, 'legacy-idle');
+  assert.equal(seat.verified, false);
+  assert.match(send(['--who']).stdout, /idle-1\b.*idle 45m \(unverified\)/);
 });
 
 test('a dead writer pid or a closed window is not listed', () => {
@@ -100,7 +104,7 @@ test('a dead writer pid or a closed window is not listed', () => {
   assert.ok(!ids.includes('closed-1'), 'closed window');
 });
 
-test('a window running only a shell is not an idle seat, even with pid alive and window open', () => {
+test('a window running only a shell is not an idle seat, even with the window open', () => {
   idleBeacon('shell-1', '/r/deadpid', 45, { windowId: 411 });
   assert.ok(!who().some((s) => s.sessionId === 'shell-1'));
 });

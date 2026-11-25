@@ -83,7 +83,7 @@ import {
   resolveRecipient,
   waitForAck,
 } from '../lib/agent-mailbox.mjs';
-import { switchboardDir } from '../lib/presence.mjs';
+import { procStat, switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
 import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
@@ -365,8 +365,9 @@ const writeNote = (content, id) => {
 // Where a displaced holder lives: its beacon's window id (the live beacon, else
 // the newest one of that session that names a window) and the pid kitty reports
 // for that window now, so a later close can tell a recycled id from the seat.
-// The beacon's own pid is the fallback when kitty cannot answer. Null when no
-// window is known.
+// A recorded host identity (pid and start time still matching a process in the
+// window's foreground) names the seat first; the beacon's own pid is the
+// fallback for rows written before host identities. Null when no window is known.
 const displacedSeat = (sessionId, liveBeacon) => {
   let b = liveBeacon;
   if (b?.windowId == null) {
@@ -394,9 +395,17 @@ const displacedSeat = (sessionId, liveBeacon) => {
       return false;
     }
   });
-  if (!named && !(b.pid != null && b.pid === win.pid)) return null;
+  const hostHolds = b.hostPid != null && b.hostStart != null &&
+    (b.hostPid === win.pid || (win.foreground ?? []).some((p) => p?.pid === b.hostPid)) &&
+    procStat(b.hostPid)?.start === b.hostStart;
+  if (!named && !hostHolds && !(b.pid != null && b.pid === win.pid)) return null;
   return { windowId, pid: win.pid };
 };
+
+// The --who STATE column: live, idle Nm (host verified), or idle Nm (unverified)
+// for a parked seat held only by the window rule.
+const seatState = (x) =>
+  x.idleMinutes == null ? 'live' : `idle ${x.idleMinutes}m${x.verified === true ? '' : ' (unverified)'}`;
 
 // Claude Code's per-process session records (the seam lib/claude-session.sh reads).
 const claudeSessionsDir = () =>
@@ -573,7 +582,7 @@ const main = (argv) => {
     else {
       const rows = seats.map((x) => [
         x.windowId ?? '-', (x.sessionId ?? 'anon').slice(0, 8), x.cwd, x.repo ?? '-', x.branch ?? '-',
-        x.roles.join(',') || '-', x.idleMinutes != null ? `idle ${x.idleMinutes}m` : 'live', x.title ?? '-',
+        x.roles.join(',') || '-', seatState(x), x.title ?? '-',
       ].map(String));
       const head = ['WINDOW', 'SESSION', 'CWD', 'REPO', 'BRANCH', 'ROLES', 'STATE', 'TITLE'];
       const widths = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));

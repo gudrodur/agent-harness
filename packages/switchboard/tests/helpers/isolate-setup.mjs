@@ -6,6 +6,8 @@ import path from 'node:path';
 import { scrubProcessEnv } from './isolate-env.mjs';
 
 scrubProcessEnv();
+// See isolatedEnv: tests do not record the suite runner's ancestors as hosts.
+process.env.AGENT_SWITCHBOARD_HOST_PROBE = 'off';
 
 // Point the store's DEFAULT path at a fresh per-process temp dir: the default
 // store path (lib/store.mjs defaultStorePath, via AGENT_SWITCHBOARD_DIR or
