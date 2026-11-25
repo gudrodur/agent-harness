@@ -38,8 +38,9 @@ before(async () => {
   // model is listed in $state/probe-fail (rc 1, a 402 line, as a drained
   // provider does) or $state/probe-hang (sleeps past the probe timeout via
   // /bin/sleep, bypassing the no-op sleep stub), and records its arguments and
-  // cwd. `output-402` makes it print the 402 line yet exit 0. Anything else
-  // is the tab's own command and exits 0.
+  // cwd. `output-402` makes it print the 402 line yet exit 0. `session` records
+  // its arguments in $state/session-calls. Anything else is the tab's own
+  // command and exits 0.
   await fs.writeFile(
     launcher,
     [
@@ -47,6 +48,9 @@ before(async () => {
       `state=${JSON.stringify(stateDir)}`,
       'if [ "$1" = run ]; then',
       '  printf \'%s | cwd=%s\\n\' "$*" "$PWD" >> "$state/probe-calls"',
+      // Like opencode, the run writes a session row for its cwd, before it answers or hangs.
+      '  node -e \'const { DatabaseSync } = require("node:sqlite"); const d = new DatabaseSync(process.env.OPENCODE_TAB_DB); d.prepare("INSERT INTO session VALUES (?, ?, ?, NULL, ?)").run(process.argv[1], process.cwd(), "{}", Date.now() - 5000);\' "ses_probe_$$"',
+      '  printf \'%s\\n\' "ses_probe_$$" > "$state/probe-session"',
       '  m=""; while [ $# -gt 0 ]; do case "$1" in -m|--model) m="$2"; shift 2 ;; *) shift ;; esac; done',
       '  if [ -f "$state/probe-fail" ] && grep -qxF -- "$m" "$state/probe-fail"; then',
       '    printf \'%s\\n\' "402 Payment Required" >&2; exit 1',
@@ -54,6 +58,13 @@ before(async () => {
       '  if [ -f "$state/probe-hang" ] && grep -qxF -- "$m" "$state/probe-hang"; then exec /bin/sleep 30; fi',
       '  if [ -f "$state/probe-402-rc0" ]; then printf \'%s\\n\' "Error: 402 insufficient credit"; exit 0; fi',
       '  printf \'OK\\n\'; exit 0',
+      'fi',
+      // `session delete` removes the row, as opencode does, unless $state/session-keep says this delete
+      // reports success and leaves the row (as a delete that misses a store table does).
+      'if [ "$1" = session ]; then',
+      '  printf \'%s\\n\' "$*" >> "$state/session-calls"',
+      '  [ -f "$state/session-keep" ] || node -e \'const { DatabaseSync } = require("node:sqlite"); new DatabaseSync(process.env.OPENCODE_TAB_DB).prepare("DELETE FROM session WHERE id = ?").run(process.argv[1]);\' "${@: -1}"',
+      '  exit 0',
       'fi',
       'exit 0',
       '',
@@ -95,7 +106,7 @@ after(async () => {
 // Fresh store and state for each test; `session` rows are what opencode
 // writes when the TUI starts in a directory.
 beforeEach(async () => {
-  for (const f of ['launch-args', 'probe-calls', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'probe-calls', 'probe-session', 'session-calls', 'session-keep', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { force: true });
   }
   await fs.rm(db, { force: true });
@@ -296,6 +307,39 @@ test('an answering probe lets the launch proceed; it runs the asked model in a t
   const calls = await fs.readFile(path.join(stateDir, 'probe-calls'), 'utf8');
   assert.match(calls, /^run --standalone -m opencode\/muse-spark-1\.3-contributor-free /);
   assert.doesNotMatch(calls, new RegExp(`cwd=${cwd}$`, 'm'));
+  assert.equal(await exists('launch-args'), true);
+});
+
+// A probe left its session row behind on every launch, so the store collected
+// dozens of one-word "OK" sessions that every session picker then listed. Each
+// outcome, the failures included, deletes the probe's own session and no other.
+for (const [outcome, setup, env] of [
+  ['an answering probe', async () => { await beacon(WID); addSession('ses_new', MODEL); }, {}],
+  ['a 402 probe', () => fs.writeFile(path.join(stateDir, 'probe-fail'), `${MODEL}\n`), {}],
+  ['a 402 line at exit 0', () => fs.writeFile(path.join(stateDir, 'probe-402-rc0'), ''), {}],
+  ['a hung probe', () => fs.writeFile(path.join(stateDir, 'probe-hang'), `${MODEL}\n`), { OPENCODE_TAB_PROBE_TIMEOUT: '1' }],
+]) {
+  test(`${outcome} deletes the session it created`, async () => {
+    await setup();
+    await tab(full(), env);
+    const id = (await fs.readFile(path.join(stateDir, 'probe-session'), 'utf8')).trim();
+    const calls = await fs.readFile(path.join(stateDir, 'session-calls'), 'utf8').catch(() => '');
+    assert.equal(calls, `session delete --standalone ${id}\n`);
+    const d = new DatabaseSync(db);
+    assert.equal(d.prepare('SELECT id FROM session WHERE id = ?').get(id), undefined, 'the row is gone');
+    d.close();
+  });
+}
+
+// A delete is read back: a row still in the store after a delete that exited 0 is named, not hidden.
+test('a probe session that outlives its delete is reported, and the launch goes on', async () => {
+  await beacon(WID);
+  addSession('ses_new', MODEL);
+  await fs.writeFile(path.join(stateDir, 'session-keep'), '');
+  const r = await tab(full());
+  assert.equal(r.code, 0, r.err);
+  const id = (await fs.readFile(path.join(stateDir, 'probe-session'), 'utf8')).trim();
+  assert.match(r.err, new RegExp(`probe's session ${id} is still in the store`));
   assert.equal(await exists('launch-args'), true);
 });
 
