@@ -107,7 +107,9 @@ try {
   try {
     const rawWin = process.env.KITTY_WINDOW_ID;
     const win = rawWin != null && rawWin !== '' ? Number(rawWin) : null;
-    recordPresence({ cwd, sessionId, mailbox: true, windowId: Number.isFinite(win) ? win : null });
+    // This hook runs under the Claude Code process that owns the session, so it binds that
+    // process as the host; 'auto' checks the ancestor's session record names this session.
+    recordPresence({ cwd, sessionId, mailbox: true, windowId: Number.isFinite(win) ? win : null, host: 'auto' });
   } catch {
     // Best-effort — presence is advisory.
   }

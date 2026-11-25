@@ -135,3 +135,55 @@ test('a row under the pre-move key is delivered when the hook runs from the new 
   assert.match(parsed.hookSpecificOutput.additionalContext, /pre-move hello/);
   assert.deepEqual(readUnacked(KEY, { dir: mboxDir }), []);
 });
+
+// The hook binds the Claude Code process that runs it as the session's host,
+// but only when that process's session record names the session. The test
+// runs the hook under a process whose command name is `claude` (a symlink to
+// bash, since the kernel takes the name from the executed path; node renames
+// its main thread, so it cannot play the part) against the real /proc and a
+// throwaway sessions directory.
+const underFakeClaude = ({ recordedSession }) => {
+  const dir = fs.mkdtempSync(path.join(root, 'fake-claude-'));
+  const sessions = path.join(dir, 'sessions');
+  fs.mkdirSync(sessions);
+  const bin = path.join(dir, 'claude');
+  fs.symlinkSync('/bin/bash', bin);
+  const runner = path.join(dir, 'runner.sh');
+  fs.writeFileSync(runner, [
+    '#!/bin/bash',
+    'printf \'{"sessionId":"%s"}\' "$FAKE_RECORDED" > "$FAKE_SESSIONS/$$.json"',
+    'node "$FAKE_HOOK" <<< "$FAKE_PAYLOAD" > /dev/null',
+    'echo "$$"',
+    '',
+  ].join('\n'));
+  const res = spawnSync(bin, [runner], {
+    encoding: 'utf-8',
+    env: isolatedEnv({
+      HOME: homeDir, AGENT_SWITCHBOARD_DIR: switchDir, AGENT_MAILBOX_DIR: mboxDir,
+      AGENT_SWITCHBOARD_PRESENCE_FILE: path.join(switchDir, 'presence.json'),
+      AGENT_SWITCHBOARD_HOST_PROBE: 'on', CLAUDE_SESSIONS_DIR: sessions,
+      FAKE_SESSIONS: sessions, FAKE_RECORDED: recordedSession, FAKE_HOOK: HOOK, FAKE_PAYLOAD: payload,
+    }),
+  });
+  const claudePid = Number(res.stdout.trim());
+  assert.ok(Number.isInteger(claudePid) && claudePid > 1, `runner printed a pid: ${res.stdout} ${res.stderr}`);
+  return claudePid;
+};
+
+test('the hook binds the claude ancestor whose session record names the session as the host', () => {
+  fs.rmSync(path.join(switchDir, 'presence.json'), { force: true });
+  const claudePid = underFakeClaude({ recordedSession: SID });
+  const mine = presenceBeacons().filter((b) => b.cwd === CWD && b.sessionId === SID);
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0].hostPid, claudePid);
+  assert.equal(mine[0].hostProof, 'self');
+  assert.ok(mine[0].hostStart > 0 && mine[0].bootId);
+});
+
+test('the hook binds no host when the ancestor session record names another session', () => {
+  fs.rmSync(path.join(switchDir, 'presence.json'), { force: true });
+  underFakeClaude({ recordedSession: 'someone-else' });
+  const mine = presenceBeacons().filter((b) => b.cwd === CWD && b.sessionId === SID);
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0].hostPid, undefined);
+});
