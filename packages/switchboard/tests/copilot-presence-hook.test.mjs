@@ -25,6 +25,12 @@ test('publishing presence leaves the seat on kitty fallback, not mailbox deliver
   assert.ok(beacon);
   assert.equal(beacon.windowId, 65);
   assert.equal(beacon.pid, process.ppid);
+  // Where /proc exists the row also carries the host identity (pid, start time, boot id).
+  if (fs.existsSync('/proc/self/stat')) {
+    assert.equal(beacon.hostPid, process.ppid);
+    assert.equal(typeof beacon.hostStart, 'number');
+    assert.equal(typeof beacon.bootId, 'string');
+  }
   assert.notEqual(beacon.mailbox, true);
   assert.notEqual(beacon.mailboxOnly, true);
 });

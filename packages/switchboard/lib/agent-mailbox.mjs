@@ -24,7 +24,9 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { PRESENCE_FILE, isIdleBeacon, isLiveBeacon, presenceRowToBeacon, switchboardDir } from './presence.mjs';
+import { AGENT_COMM_NAMES, PRESENCE_FILE, PRESENCE_STALE_MS, classifyBeacons, presenceRowToBeacon, switchboardDir } from './presence.mjs';
+
+export { AGENT_COMM_NAMES };
 import { kittyLs, kittyKnownDown, kittyDownMessage } from './kitty-ls.mjs';
 import { defaultStorePath, withRetriedStore, pruneRetention } from './store.mjs';
 import {
@@ -146,28 +148,31 @@ export const mailboxPath = (key, { dir } = {}) => {
 export const presenceSource = ({ presenceFile: file } = {}) =>
   (usePresenceDb(file) ? defaultStorePath() : resolvePresenceFile(file));
 
-// Live raw presence beacons (unlike readAllPresence, keeps the `mailbox`
-// consumer flag the hooks set and the sessionId the key needs). With
-// includeStale the unfiltered file comes back too, so a resolver can tell
+// A fresh row, or one that lost its window to a newer occupant but is still
+// inside the TTL: both stay reachable by their own mailbox key.
+const isFreshRow = (b) => b.state === 'fresh' || (b.state === 'superseded' && b.base === 'fresh');
+
+// Presence beacons with the liveness verdict the reader needs on each row
+// (`state`, `verified`, `unknown`, `consumer`; see classifyBeacon in
+// presence.mjs). Raw rows keep the `mailbox` consumer flag the hooks set and
+// the sessionId the key needs. Without includeStale only fresh rows come
+// back; with it every row does, dead ones included, so a resolver can tell
 // "no beacon ever" from "its beacon aged out" (a supervisor idle past the
 // presence window is parked, not gone).
 export const readPresenceBeacons = ({ presenceFile: file, now = Date.now(), includeStale = false } = {}) => {
+  let raw;
   if (usePresenceDb(file)) {
-    return withMailboxDb((store) => {
-      const beacons = store.all('SELECT * FROM presence_beacons').map(presenceRowToBeacon);
-      if (includeStale) return beacons;
-      return beacons.filter((b) => isLiveBeacon(b, now));
-    });
+    raw = withMailboxDb((store) => store.all('SELECT * FROM presence_beacons').map(presenceRowToBeacon));
+  } else {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(resolvePresenceFile(file), 'utf-8'));
+      raw = parsed && Array.isArray(parsed.beacons) ? parsed.beacons : [];
+    } catch {
+      return [];
+    }
   }
-  let beacons = [];
-  try {
-    const parsed = JSON.parse(fs.readFileSync(resolvePresenceFile(file), 'utf-8'));
-    if (parsed && Array.isArray(parsed.beacons)) beacons = parsed.beacons;
-  } catch {
-    return [];
-  }
-  if (includeStale) return beacons;
-  return beacons.filter((b) => isLiveBeacon(b, now));
+  const all = classifyBeacons(raw, { now });
+  return includeStale ? all : all.filter(isFreshRow);
 };
 // .tabs[].windows[] only — tab ids and window ids share one number space
 // (see lib/kitty-ls.mjs), so a whole-JSON grep would match a tab. `match`
@@ -187,13 +192,8 @@ export const kittyWindows = ({ fresh = false, match } = {}) => {
   return wins;
 };
 
-// Idle seats: a beacon past the presence TTL whose writer pid is alive AND
-// whose kitty window still exists is parked, not gone, so it stays listed and
-// addressable. A dead pid, a closed window, or a live beacon of ANOTHER
-// session in that window (its successor) is not an idle seat. Each result
-// carries idleMs. `wins` is injectable; it is read from kitty only when some
-// beacon is a candidate.
-export const AGENT_COMM_NAMES = ['claude', 'pi', 'opencode'];
+// The command names that count as an agent live in presence.mjs (the host
+// probe uses them too).
 
 // ONE /proc scan: the set of kitty window ids that run an agent process (comm
 // is one of AGENT_COMM_NAMES and its environ holds KITTY_WINDOW_ID=<id>).
@@ -223,28 +223,55 @@ export const agentWindowIds = ({ procDir = process.env.AGENT_MAILBOX_PROC_DIR ??
   return ids;
 };
 
-// Idle seats: a beacon past the presence TTL whose writer pid is alive AND
-// whose kitty window still exists AND still runs an agent (a window whose
-// agent exited leaves a bare shell; typing into it is the unsafe direction)
-// is parked, not gone, so it stays listed and addressable. A dead pid, a
-// closed window, a shell-only window, an unreadable /proc, or a live beacon
-// of ANOTHER session in that window (its successor) is not an idle seat. Each
-// result carries idleMs. `wins` and `agentWindows` (Set of window ids, or
-// null for "unreadable") are injectable; each is read only when some beacon
-// is a candidate, and /proc is scanned once per call.
-export const idleBeacons = ({ presenceFile, now = Date.now(), wins = null, agentWindows = undefined } = {}) => {
-  const all = readPresenceBeacons({ presenceFile, now, includeStale: true });
-  const cands = all.filter((b) => b.windowId != null && isIdleBeacon(b, now));
+// Idle seats: a row past the presence TTL that is parked, not gone, so it stays
+// listed and addressable. Two kinds:
+//   idle-live    its host identity matched a live process (verified); no window
+//                or /proc scan is needed, the identity is the proof;
+//   legacy-idle  a row written before host identities, with no pid: kept only
+//                while its kitty window still exists AND still runs an agent (a
+//                window whose agent exited leaves a bare shell; typing into it
+//                is the unsafe direction). A closed window, a shell-only window
+//                or an unreadable /proc is not an idle seat.
+// A row that lost its window to a newer or verified occupant is superseded and
+// never idle. Each result carries idleMs. `wins` and `agentWindows` (Set of
+// window ids, or null for "unreadable") are injectable; each is read only when
+// a legacy row is a candidate, and /proc is scanned once per call.
+const idleOf = (all, { now = Date.now(), wins = null, agentWindows = undefined } = {}) => {
+  const cands = all.filter((b) => b.state === 'idle-live' || (b.state === 'legacy-idle' && b.windowId != null));
   if (cands.length === 0) return [];
-  const running = agentWindows === undefined ? agentWindowIds() : agentWindows;
-  if (running == null) return [];
-  const open = new Set((wins ?? kittyWindows()).map((w) => w.id));
-  const liveWindows = new Map(all.filter((b) => b.windowId != null && isLiveBeacon(b, now)).map((b) => [Number(b.windowId), b.sessionId]));
+  let parked = null;
+  if (cands.some((b) => b.state === 'legacy-idle')) {
+    const running = agentWindows === undefined ? agentWindowIds() : agentWindows;
+    if (running != null) {
+      const open = new Set((wins ?? kittyWindows()).map((w) => w.id));
+      parked = (b) => open.has(Number(b.windowId)) && running.has(Number(b.windowId));
+    }
+  }
   return cands
-    .filter((b) => open.has(Number(b.windowId)) && running.has(Number(b.windowId)) && !(liveWindows.has(Number(b.windowId)) && liveWindows.get(Number(b.windowId)) !== b.sessionId))
+    .filter((b) => b.state === 'idle-live' || (parked != null && parked(b)))
     .map((b) => ({ ...b, idleMs: now - Date.parse(b.lastTick) }));
 };
+export const idleBeacons = ({ presenceFile, now = Date.now(), wins = null, agentWindows = undefined } = {}) =>
+  idleOf(readPresenceBeacons({ presenceFile, now, includeStale: true }), { now, wins, agentWindows });
 const idleMinutes = (b) => Math.max(1, Math.round(b.idleMs / 60_000));
+
+// Every row a sender can reach: the fresh ones (a fresh row that lost its
+// window stays reachable by its own key) and the parked ones, each parked row
+// carrying idleMs. Dead, stale and unparked rows are not reachable. The
+// verified idle-live rows need no window or /proc check, so `base` is free;
+// the legacy parked rows need one (kitty ls plus a /proc scan), so `full()`
+// pays for it only when a target could be one of them, and only once.
+const reachableBeacons = ({ presenceFile, now = Date.now() } = {}) => {
+  const all = readPresenceBeacons({ presenceFile, now, includeStale: true });
+  const base = [...all.filter(isFreshRow), ...idleOf(all.filter((b) => b.state !== 'legacy-idle'), { now })];
+  let full = null;
+  return {
+    base,
+    full: () => (full ??= [...base, ...idleOf(all.filter((b) => b.state === 'legacy-idle'), { now })]),
+  };
+};
+// The rows that hold a window: the superseded lost it to another occupant.
+const seatedBeacons = (beacons) => beacons.filter((b) => b.state !== 'superseded');
 
 // Live beacons sharing a window's cwd — the fallback candidates for a window
 // id or title target when no beacon recorded the window's own id (see
@@ -307,9 +334,13 @@ const recipientOf = (beacon, windowId) => ({
   sessionId: beacon.sessionId ?? null,
   windowId,
   beaconWindowId: beacon.windowId != null ? Number(beacon.windowId) : null,
-  hasConsumer: beacon.mailbox === true,
+  // The classifier's verdict: the mailbox flag AND, where the row names an
+  // out-of-band writer, that writer still being the recorded process.
+  hasConsumer: beacon.consumer ?? beacon.mailbox === true,
   // A poller with no composer: agent-send queues for it and never types.
   mailboxOnly: beacon.mailboxOnly === true,
+  // A parked seat: agent-send says so and types to wake it.
+  ...(beacon.idleMs != null ? { idleMinutes: idleMinutes(beacon) } : {}),
 });
 
 const resErr = (code, msg) => Object.assign(new Error(msg), { code });
@@ -336,23 +367,21 @@ const resolveWindowRecipient = (beacons, win, sender, { presenceFile: file } = {
   }
   const same = beaconsForWindow(beacons, win);
   if (same.length === 0) {
-    // No LIVE beacon. Before giving up, ask whether a beacon aged out: a
-    // supervisor idle past the presence window is parked, not gone, and the
-    // sender should hear that.
+    // No candidate. Before giving up, ask whether a beacon aged out: a seat
+    // past the presence window with no proof of its host is stale, and the
+    // sender should hear that. A row that lost its window to another
+    // occupant is not a candidate; a row whose host is gone is reported the
+    // same way, with its own reason.
     const raw = readPresenceBeacons({ presenceFile: file, includeStale: true });
-    const aged = raw.filter((b) => !isSenderBeacon(b, sender) &&
+    const aged = raw.filter((b) => !isSenderBeacon(b, sender) && b.state !== 'superseded' &&
       (beaconsForWindowId([b], win).length > 0 || beaconsForWindow([b], win).length > 0));
-    const idle = aged.length > 0 ? idleBeacons({ presenceFile: file, wins: [win] }).filter((b) => aged.some((a) => a.sessionId === b.sessionId && a.cwd === b.cwd)) : [];
-    if (idle.length > 0) {
-      const b = idle[0];
-      throw Object.assign(resErr('mailbox-idle', `window ${win.id} is an idle seat (${idleMinutes(b)}m)`), { idleMinutes: idleMinutes(b), sessionId: b.sessionId ?? null, mailboxOnly: b.mailboxOnly === true, key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) });
-    }
     if (aged.length > 0) {
       const tick = Date.parse(aged[0].lastTick);
       const ago = Number.isFinite(tick) ? `${Math.round((Date.now() - tick) / 1000)}s ago` : 'at an unreadable time';
+      const why = Number.isFinite(tick) && Date.now() - tick < PRESENCE_STALE_MS ? 'its host process is gone' : 'past the presence window';
       throw Object.assign(resErr(
         'mailbox-stale',
-        `window ${win.id} has no LIVE presence beacon (last tick ${aged[0].lastTick ?? 'unknown'}, ${ago} — past the presence window); its consumer is parked or gone`,
+        `window ${win.id} has no LIVE presence beacon (last tick ${aged[0].lastTick ?? 'unknown'}, ${ago} — ${why}); its consumer is parked or gone`,
       ), { mailboxOnly: aged[0].mailboxOnly === true, key: recipientKey({ cwd: aged[0].cwd, sessionId: aged[0].sessionId }) });
     }
     throw resErr('mailbox-no-beacon', `window ${win.id} has no live presence beacon`);
@@ -392,15 +421,19 @@ const resolveWindowRecipient = (beacons, win, sender, { presenceFile: file } = {
 // stays ambiguous-or-wrong. senderWindowId is the sender's KITTY_WINDOW_ID.
 export const resolveRecipient = (target, { presenceFile: file, senderSessionId = null, senderCwd = null, senderWindowId = null } = {}) => {
   const sender = senderSessionId != null || senderWindowId != null ? { sessionId: senderSessionId, cwd: senderCwd, windowId: senderWindowId } : null;
-  const beacons = readPresenceBeacons({ presenceFile: file });
+  const reach = reachableBeacons({ presenceFile: file });
   const roleName = roleFromTarget(target);
-  if (roleName != null) return resolveRoleRecipient(roleName, beacons);
-  const byKey = beacons.find((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) === target);
-  if (byKey) return recipientOf(byKey, null);
+  if (roleName != null) return resolveRoleRecipient(roleName, reach);
+  // A mailbox key never needs the window check unless no verified or fresh
+  // row answers it: only then is a legacy parked row a candidate.
+  const keyHit = reach.base.find((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) === target);
+  if (keyHit) return recipientOf(keyHit, null);
 
   if (typeof target === 'string' && target.includes('__')) {
     const sid = target.slice(target.lastIndexOf('__') + 2);
-    const sameSession = collapseSameSession(beacons.filter((b) => sanitizeSessionId(b.sessionId) === sid));
+    const ofSession = (list) => collapseSameSession(list.filter((b) => sanitizeSessionId(b.sessionId) === sid));
+    let sameSession = ofSession(reach.base);
+    if (sameSession.length === 0) sameSession = ofSession(reach.full());
     if (sameSession.length === 1) return recipientOf(sameSession[0], null);
     if (sameSession.length > 1) {
       const keys = sameSession.map((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId })).join(', ');
@@ -412,6 +445,7 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
     throw new Error(`no live session for mailbox key '${target}' — its presence beacon is stale or gone`);
   }
 
+  const beacons = reach.full();
   // A numeric target reads only that window, a cached answer allowed (a gone
   // window is never served from cache); a title is matched against a fresh
   // listing of every window.
@@ -426,7 +460,7 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
     const win = wins.find((w) => w.id === Number(target));
     // The hint names the live seats, so it needs every window, not the one read.
     if (!win) throw new Error(`no kitty window with id ${target}${seatHint(beacons, kittyWindows(), sender)}`);
-    return resolveWindowRecipient(beacons, win, sender, { presenceFile: file });
+    return resolveWindowRecipient(seatedBeacons(beacons), win, sender, { presenceFile: file });
   }
 
   const matches = wins.filter((w) => w.title.includes(target) || w.tabTitle.includes(target));
@@ -435,7 +469,7 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
     const ids = matches.map((w) => w.id).join(', ');
     throw new Error(`ambiguous target '${target}' matches windows ${ids} — pass the window id instead`);
   }
-  return resolveWindowRecipient(beacons, matches[0], sender, { presenceFile: file });
+  return resolveWindowRecipient(seatedBeacons(beacons), matches[0], sender, { presenceFile: file });
 };
 
 // ---- Seat roles -----------------------------------------------------------
@@ -455,7 +489,7 @@ const readRoleHolders = () => {
 // session's mailbox key would. No holder, or a holder whose beacon is gone,
 // resolves to the key `role:<name>` with queuedForRole set: the row waits
 // there for the next session to claim the role. That is a queue, not an error.
-const resolveRoleRecipient = (name, beacons) => {
+const resolveRoleRecipient = (name, reach) => {
   validateRoleName(name);
   const key = `${ROLE_PREFIX}${name}`;
   let holder = null;
@@ -464,19 +498,22 @@ const resolveRoleRecipient = (name, beacons) => {
   } catch {
     holder = null;
   }
-  const mine = holder ? beacons.filter((b) => b.sessionId === holder.session_id) : [];
+  // The holder's fresh and verified rows first; a legacy parked row only
+  // when nothing else of the holder's answers.
+  const ofHolder = (list) => (holder ? list.filter((b) => b.sessionId === holder.session_id) : []);
+  let mine = ofHolder(reach.base);
+  if (mine.length === 0) mine = ofHolder(reach.full());
   if (mine.length > 0) {
+    // A fresh row beats a parked one. A holder parked past the TTL with its
+    // host still there is idle, not gone: it resolves to its own mailbox with
+    // idleMinutes set (a kitty wake, or a drain when its writer still lives)
+    // instead of queueing for a next holder.
+    const fresh = mine.filter((b) => b.idleMs == null);
+    const pool = fresh.length > 0 ? fresh : mine;
     const best =
-      mine.find((b) => b.cwd === holder.cwd) ??
-      [...mine].sort((a, b) => String(b.lastTick).localeCompare(String(a.lastTick)))[0];
+      pool.find((b) => b.cwd === holder.cwd) ??
+      [...pool].sort((a, b) => String(b.lastTick).localeCompare(String(a.lastTick)))[0];
     return { ...recipientOf(best, null), role: name };
-  }
-  // A holder parked past the TTL with its window still open is idle, not
-  // gone: address its window (kitty wake) instead of queueing for a next holder.
-  const idle = holder ? idleBeacons({}).filter((b) => b.sessionId === holder.session_id) : [];
-  if (idle.length > 0) {
-    const best = idle.find((b) => b.cwd === holder.cwd) ?? [...idle].sort((a, b) => a.idleMs - b.idleMs)[0];
-    return { ...recipientOf(best, null), hasConsumer: false, role: name, idleMinutes: idleMinutes(best) };
   }
   return {
     key,
@@ -529,10 +566,16 @@ export const rolesHeldBy = (sessionId) => {
 // beacon and is not `sessionId`, else null. A dead or absent holder reads as
 // free. Shared by claimRoleFromEnv (declines) and agent-send --claim-role
 // (refuses unless --take-over).
-export const liveRoleHolder = (db, role, { sessionId = null, presenceFile } = {}) => {
+// `includeIdle` also counts a parked holder whose host identity was VERIFIED
+// (idle-live); a legacy or unknown row never counts, so a notice is never
+// parked in a role queue on weak evidence. Claim paths keep the default: an
+// idle holder's role can be taken.
+export const liveRoleHolder = (db, role, { sessionId = null, presenceFile, includeIdle = false } = {}) => {
   const held = roleHolder(db, role);
   if (!held || held.session_id === String(sessionId)) return null;
-  const beacons = readPresenceBeacons({ presenceFile }).filter((b) => b.sessionId === held.session_id);
+  const beacons = readPresenceBeacons({ presenceFile, includeStale: includeIdle })
+    .filter((b) => b.sessionId === held.session_id)
+    .filter((b) => isFreshRow(b) || (includeIdle && b.state === 'idle-live' && b.verified === true));
   return beacons.length > 0 ? { ...held, beacon: beacons.find((b) => b.windowId != null) ?? beacons[0] } : null;
 };
 
@@ -661,11 +704,14 @@ const branchOf = (b) => {
 };
 
 // Live seats: one entry per live presence beacon, joined with the roles it
-// holds and its kitty window title (tolerates kitty being absent).
+// holds and its kitty window title (tolerates kitty being absent). Built from
+// the classified rows: dead and superseded rows never appear, and each seat
+// carries `state` (fresh | idle-live | legacy-idle) and `verified`.
 export const listSeats = ({ presenceFile, wins = kittyWindows(), agentWindows = undefined } = {}) => {
+  const all = readPresenceBeacons({ presenceFile, includeStale: true });
   const beacons = [
-    ...readPresenceBeacons({ presenceFile }),
-    ...idleBeacons({ presenceFile, wins, agentWindows }),
+    ...all.filter((b) => b.state === 'fresh'),
+    ...idleOf(all, { wins, agentWindows }),
   ];
   const holders = readRoleHolders();
   // One row per seat: a beacon recorded in a subdirectory of a checkout is the
@@ -708,6 +754,8 @@ export const listSeats = ({ presenceFile, wins = kittyWindows(), agentWindows = 
       roles: holders.filter((h) => h.session_id === b.sessionId).map((h) => h.role),
       title: win ? (win.title || win.tabTitle || '') : null,
       mailbox: group.some((x) => x.mailbox === true),
+      state: group.some((x) => x.state === 'fresh') ? 'fresh' : b.state,
+      verified: group.some((x) => x.verified === true),
       ...(group.every((x) => x.idleMs != null) ? { idleMinutes: idleMinutes({ idleMs: Math.min(...group.map((x) => x.idleMs)) }) } : {}),
       key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }),
     };
@@ -1068,7 +1116,7 @@ export const waitForAck = ({ key, id, deadlineMs = 20_000, pollMs = 200, dir } =
 };
 
 // Remove mailbox files whose recipient has been absent from presence longer
-// than PRESENCE_STALE_MS, or whose writer pid is dead (isLiveBeacon, imported). A moved session's
+// than PRESENCE_STALE_MS unless its host is verified live (idle-live), or whose host is dead. A moved session's
 // pre-move key is kept while the session itself is live under ANY cwd: the
 // reader scans by session id, so the file is still reachable, and pruning it
 // would lose rows a sender addressed to the pre-move key. Returns removed keys.
@@ -1080,7 +1128,8 @@ export const pruneStale = ({ now = Date.now(), dir, presenceFile: file } = {}) =
     withMailboxDb((store) => pruneRetention(store, { now }));
     return [];
   }
-  const beacons = readPresenceBeacons({ presenceFile: file, now });
+  const beacons = readPresenceBeacons({ presenceFile: file, now, includeStale: true })
+    .filter((b) => isFreshRow(b) || b.state === 'idle-live');
   const live = new Set(beacons.map((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId })));
   const liveSessions = new Set(beacons.map((b) => sanitizeSessionId(b.sessionId)));
   const dirPath = resolveMailboxDir(dir);
