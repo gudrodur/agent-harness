@@ -611,8 +611,15 @@ const main = (argv) => {
       // whose beacon aged out but whose window may still be open.
       if (takeOver && before && before.session_id !== sessionId) {
         const seat = displacedSeat(before.session_id, live?.beacon ?? null);
-        if (!seat) process.stderr.write(`agent-send: no handover recorded: the window of ${before.session_id} is not proven to still hold it, so it will not be retired\n`);
-        if (seat) recordHandover(db, { role: claimRoleName, displacedSession: before.session_id, displacedWindow: seat.windowId, displacedPid: seat.pid, takerSession: sessionId });
+        // A stale beacon can carry the taker's own window and pid (a shared
+        // cwd where the new process's first tick still resolved the previous
+        // session, or a window map that outlived it). Such a row would name the
+        // live taker and let it "retire" its own window; the displaced window
+        // must be one this seat does not hold.
+        const ownWindow = seat != null && wid != null && seat.windowId === Number(wid);
+        if (ownWindow) process.stderr.write(`agent-send: no handover recorded: the beacon of ${before.session_id} names this seat's window ${wid}, not the displaced one\n`);
+        else if (!seat) process.stderr.write(`agent-send: no handover recorded: the window of ${before.session_id} is not proven to still hold it, so it will not be retired\n`);
+        else recordHandover(db, { role: claimRoleName, displacedSession: before.session_id, displacedWindow: seat.windowId, displacedPid: seat.pid, takerSession: sessionId });
       }
       return { prev: before?.session_id ?? null, displaced: live };
     });

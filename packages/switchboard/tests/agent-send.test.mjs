@@ -2578,6 +2578,18 @@ test('a stale beacon whose window id now holds another session records no handov
   assert.match(r.stderr, /no handover recorded/);
 });
 
+test('a stale beacon that names the taker own window records no handover', async () => {
+  // A shared cwd can leave the displaced session's beacon carrying the taker's
+  // own window and pid. Recording it would name the live taker, and the taker
+  // would then be allowed to retire its own window.
+  const fx = await handoverFixture('own-window');
+  await seatHolder(fx, { windowId: 991001, pid: 111 });
+  const r = await takeOverAs(fx.db, ['--take-over']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal((await handovers(fx.db)).length, 0, 'the displaced window must not be the taker own');
+  assert.match(r.stderr, /this seat's window/);
+});
+
 test('a window with no session record and no matching beacon pid records no handover', async () => {
   fs.rmSync(path.join(binDir, 'claude-sessions'), { recursive: true, force: true });
   const fx = await handoverFixture('norecord');
