@@ -187,9 +187,19 @@ JS
 }
 delete_probe_sessions() {
   local id
+  # Only ever a probe's own mktemp directory: a refactor that passed $CWD would delete the user's sessions.
+  case "$1" in
+    "${TMPDIR:-/tmp}"/opencode-tab-probe-*) ;;
+    *) note "not deleting sessions in $1: not a probe directory"; return 0 ;;
+  esac
   for id in $(probe_sessions "$1"); do
     "$LAUNCH" session delete --standalone "$id" </dev/null >/dev/null 2>&1 \
       || note "could not delete the probe's session $id; delete it with '$LAUNCH session delete $id'"
+  done
+  # Read back: a delete can exit 0 and leave the row (one store table missed), and a silent leftover is
+  # how the rows piled up in the first place.
+  for id in $(probe_sessions "$1"); do
+    note "the probe's session $id is still in the store after its delete; delete it with '$LAUNCH session delete $id'"
   done
 }
 probe_model() {

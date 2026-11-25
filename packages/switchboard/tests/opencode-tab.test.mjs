@@ -59,7 +59,13 @@ before(async () => {
       '  if [ -f "$state/probe-402-rc0" ]; then printf \'%s\\n\' "Error: 402 insufficient credit"; exit 0; fi',
       '  printf \'OK\\n\'; exit 0',
       'fi',
-      'if [ "$1" = session ]; then printf \'%s\\n\' "$*" >> "$state/session-calls"; exit 0; fi',
+      // `session delete` removes the row, as opencode does, unless $state/session-keep says this delete
+      // reports success and leaves the row (as a delete that misses a store table does).
+      'if [ "$1" = session ]; then',
+      '  printf \'%s\\n\' "$*" >> "$state/session-calls"',
+      '  [ -f "$state/session-keep" ] || node -e \'const { DatabaseSync } = require("node:sqlite"); new DatabaseSync(process.env.OPENCODE_TAB_DB).prepare("DELETE FROM session WHERE id = ?").run(process.argv[1]);\' "${@: -1}"',
+      '  exit 0',
+      'fi',
       'exit 0',
       '',
     ].join('\n'),
@@ -100,7 +106,7 @@ after(async () => {
 // Fresh store and state for each test; `session` rows are what opencode
 // writes when the TUI starts in a directory.
 beforeEach(async () => {
-  for (const f of ['launch-args', 'probe-calls', 'probe-session', 'session-calls', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'probe-calls', 'probe-session', 'session-calls', 'session-keep', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { force: true });
   }
   await fs.rm(db, { force: true });
@@ -319,8 +325,23 @@ for (const [outcome, setup, env] of [
     const id = (await fs.readFile(path.join(stateDir, 'probe-session'), 'utf8')).trim();
     const calls = await fs.readFile(path.join(stateDir, 'session-calls'), 'utf8').catch(() => '');
     assert.equal(calls, `session delete --standalone ${id}\n`);
+    const d = new DatabaseSync(db);
+    assert.equal(d.prepare('SELECT id FROM session WHERE id = ?').get(id), undefined, 'the row is gone');
+    d.close();
   });
 }
+
+// A delete is read back: a row still in the store after a delete that exited 0 is named, not hidden.
+test('a probe session that outlives its delete is reported, and the launch goes on', async () => {
+  await beacon(WID);
+  addSession('ses_new', MODEL);
+  await fs.writeFile(path.join(stateDir, 'session-keep'), '');
+  const r = await tab(full());
+  assert.equal(r.code, 0, r.err);
+  const id = (await fs.readFile(path.join(stateDir, 'probe-session'), 'utf8')).trim();
+  assert.match(r.err, new RegExp(`probe's session ${id} is still in the store`));
+  assert.equal(await exists('launch-args'), true);
+});
 
 test('--no-probe skips the probe', async () => {
   await beacon(WID);
