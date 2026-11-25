@@ -197,6 +197,34 @@ test('resolveRecipient refuses a title that matches two windows', () => {
   assert.throws(() => resolveRecipient('review', { presenceFile: presFile }), /ambiguous/);
 });
 
+test('a slot name matches the whole wN: token, so w1 is not w10 (#2831)', () => {
+  const saved = fs.readFileSync(kittyLs, 'utf8');
+  fs.writeFileSync(kittyLs, JSON.stringify([{
+    tabs: [{
+      title: 'slots',
+      windows: [
+        { id: 991003, title: 'w1: overseer', pid: 113, cwd: '/repo/c', foreground_processes: [{ pid: 113, cmdline: ['/usr/bin/claude'] }] },
+        { id: 991004, title: 'w10: sonnet · is-ci-queue', pid: 114, cwd: '/repo/d', foreground_processes: [{ pid: 114, cmdline: ['/usr/bin/claude'] }] },
+      ],
+    }],
+  }]));
+  writePresence([
+    { sessionId: 'sc', cwd: '/repo/c', mailbox: true },
+    { sessionId: 'sd', cwd: '/repo/d', mailbox: true },
+  ]);
+  try {
+    assert.equal(resolveRecipient('w1', { presenceFile: presFile }).windowId, 991003);
+    assert.equal(resolveRecipient('w10', { presenceFile: presFile }).windowId, 991004);
+  } finally {
+    fs.writeFileSync(kittyLs, saved);
+    writePresence([
+      { sessionId: 's1', cwd: '/repo/a', mailbox: true },
+      { sessionId: 's2', cwd: '/repo/a' },
+      { sessionId: 's3', cwd: '/repo/b' },
+    ]);
+  }
+});
+
 test('resolveRecipient throws on an unknown window id', () => {
   assert.throws(() => resolveRecipient('123456', { presenceFile: presFile }), /no kitty window/);
 });
