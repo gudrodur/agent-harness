@@ -304,7 +304,8 @@ const retainPresence = (beacons, now) => {
 // script) must not borrow the nearest agent ancestor, which belongs to another
 // session. AGENT_SWITCHBOARD_HOST_PROBE=off stops an 'auto' that starts from
 // this process (tests); an explicit `hostFrom` is not affected. Nothing is
-// recorded that could not be read, nor with no boot id to pin it to.
+// recorded that could not be read, nor with no boot id to pin it to, but for
+// a writer's bare pid where /proc cannot be read (see below).
 // `hostNames` narrows which command names 'auto' takes for an agent (default
 // AGENT_COMM_NAMES): a recorder that runs under one kind of agent names it,
 // so the walk never stops at an agent of another kind further up.
@@ -325,10 +326,17 @@ const resolveIdentity = ({ host, hostProof, writer, bootId, hostFrom, hostNames 
       accept: ({ pid, comm }) => comm !== 'claude' || sessionId == null || claudeRecordSession(pid) === sessionId,
     });
   }
-  const hostId = named(h);
-  const writerId = named(writer);
   const boot = bootId ?? currentBootId({ procDir });
-  if (boot == null || (!hostId && !writerId)) return { bootId: null, host: null, writer: null };
+  // With no boot id, /proc is not there to read (a kernel without one, such as darwin's): a pid's stat then
+  // reads as missing, which proves nothing. The writer is still named, by pid alone with no start, so the
+  // process that writes a row can tell the row is its own; nothing can judge its liveness, so readers keep
+  // the row by the TTL only. A host is never recorded so: it would claim a verified identity it lacks.
+  const writerPid = writer && Number.isInteger(Number(writer.pid)) ? Number(writer.pid) : null;
+  if (boot == null) return { bootId: null, host: null, writer: writerPid == null ? null : { pid: writerPid, start: null } };
+  const hostId = named(h);
+  // A readable /proc that holds no such pid records no writer; one that cannot read the pid's stat keeps its pid.
+  const writerId = named(writer) ?? (writerPid != null && readStat(writerPid, procDir).status === 'unreadable' ? { pid: writerPid, start: null } : null);
+  if (!hostId && !writerId) return { bootId: null, host: null, writer: null };
   return {
     bootId: boot,
     host: hostId ? { ...hostId, proof: hostProof ?? h.proof ?? 'self' } : null,
@@ -442,13 +450,15 @@ export const recordPresence = ({
               window_id = COALESCE(?, window_id),
               pid = COALESCE(?, pid), last_work_tick = COALESCE(?, last_work_tick),
               boot_id = COALESCE(?, boot_id), host_pid = COALESCE(?, host_pid), host_start = COALESCE(?, host_start),
-              host_proof = COALESCE(?, host_proof), writer_pid = COALESCE(?, writer_pid), writer_start = COALESCE(?, writer_start)
+              host_proof = COALESCE(?, host_proof), writer_pid = COALESCE(?, writer_pid),
+              writer_start = CASE WHEN ? IS NULL THEN writer_start ELSE ? END
              WHERE session_id = ? AND cwd = ?`,
             iso, branch, cwd,
             homeCwd, mailbox == null ? null : mailbox ? 1 : 0, mailboxOnly == null ? null : mailboxOnly ? 1 : 0,
             windowId == null ? null : Number(windowId),
             pid == null ? null : Number(pid), work ? iso : null,
-            ...idParams,
+            // A writer's pid and start move together: a pid named without a start clears the old start.
+            ...idParams.slice(0, 5), ident.writer?.pid ?? null, ident.writer?.start ?? null,
             sid, me.cwd,
           );
         } else {
@@ -501,7 +511,7 @@ export const recordPresence = ({
   const identFields = {
     ...(ident.bootId != null ? { bootId: ident.bootId } : {}),
     ...(ident.host ? { hostPid: ident.host.pid, hostStart: ident.host.start, hostProof: ident.host.proof } : {}),
-    ...(ident.writer ? { writerPid: ident.writer.pid, writerStart: ident.writer.start } : {}),
+    ...(ident.writer ? { writerPid: ident.writer.pid, ...(ident.writer.start != null ? { writerStart: ident.writer.start } : {}) } : {}),
   };
   if (me) {
     me.lastTick = iso;
@@ -520,6 +530,7 @@ export const recordPresence = ({
     if (windowId !== null) me.windowId = windowId;
     if (pid !== null) me.pid = pid;
     Object.assign(me, identFields);
+    if (ident.writer && ident.writer.start == null) delete me.writerStart; // the pid and its start move together
     if (work) me.lastWorkTick = iso;
     if (me.lastWorkCwd == null && inherited !== null) me.lastWorkCwd = inherited;
   } else {
