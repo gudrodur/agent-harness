@@ -450,3 +450,36 @@ test('fix 5: a dead verdict deletes a row only while the row is still what was j
     assert.equal(P.deleteBeaconIfUnchanged(s, current), 1);
   } finally { s.close(); }
 });
+
+// A kernel with no /proc (darwin): no start time and no boot id can be read. The writer is still
+// recorded, by pid alone, so the process that writes a row can tell the row is its own; its liveness
+// is unknown, so the row is judged by the TTL only. A host is never recorded without its identity.
+test('no /proc: the writer is recorded by pid alone, the host not at all, and the row lives by the TTL', () => {
+  const file = path.join(tmp, 'presence.json');
+  // A start and a boot id read while /proc was there; then the writer restarts on a kernel without one.
+  const before = proc.add(150, { start: 1500 });
+  for (const f of [undefined, file]) P.recordPresence({ file: f, sessionId: 's1', cwd: '/r/x', mailbox: true, writer: before });
+  proc.destroy();
+  for (const f of [undefined, file]) {
+    P.recordPresence({ file: f, sessionId: 's1', cwd: '/r/x', mailbox: true, host: { pid: 100 }, hostProof: 'argv', writer: { pid: 151 } });
+    P.recordPresence({ file: f, sessionId: 's2', cwd: '/r/y', mailbox: true, writer: { pid: 152 } });
+  }
+  const pick = (b) => ({ writerPid: b.writerPid, writerStart: b.writerStart, hostPid: b.hostPid, state: b.state, unknown: b.unknown });
+  const db = Object.fromEntries(M.readPresenceBeacons({ includeStale: true }).map((b) => [b.sessionId, b]));
+  // The pid and its start move together: the old start is never left beside the new pid. With no
+  // boot id the identity could not be checked, so the row says unknown and a reader keeps it.
+  assert.deepEqual(pick(db.s1), { writerPid: 151, writerStart: undefined, hostPid: undefined, state: 'fresh', unknown: true });
+  assert.deepEqual(pick(db.s2), { writerPid: 152, writerStart: undefined, hostPid: undefined, state: 'fresh', unknown: true });
+  assert.equal(M.resolveRecipient(key('s2', '/r/y')).hasConsumer, true);
+  // Past the TTL the row is stale, never verified and never deleted for a liveness it could not read.
+  const aged = M.readPresenceBeacons({ includeStale: true, now: Date.now() + 60 * MIN }).find((b) => b.sessionId === 's2');
+  assert.deepEqual([aged.state, aged.verified], ['stale', false]);
+  const fromFile = Object.fromEntries(P.readAllPresence({ file }).map((b) => [b.sessionId, b]));
+  assert.deepEqual([fromFile.s1.writerPid, fromFile.s1.writerStart, fromFile.s1.hostPid, fromFile.s1.bootId], [151, undefined, undefined, undefined]);
+  assert.deepEqual([fromFile.s2.writerPid, fromFile.s2.bootId], [152, undefined]);
+});
+
+test('a readable /proc that has no such writer records none: a gone pid is not a writer', () => {
+  P.recordPresence({ sessionId: 's1', cwd: '/r/x', mailbox: true, writer: { pid: 4242 } });
+  assert.deepEqual(rows().map((r) => [r.session_id, r.writer_pid, r.boot_id]), [['s1', null, null]]);
+});
