@@ -205,6 +205,23 @@ test('beacon + a new session on the asked model: exit 0, SESSION printed, state 
   assert.equal(await exists('closed'), false);
 });
 
+test("the launcher's numeric KITTY_WINDOW_ID goes in as AGENT_DISPATCHED_BY, so its dispatcher is known", async () => {
+  await beacon(WID);
+  addSession('ses_new', MODEL);
+  const r = await tab(full(), { KITTY_WINDOW_ID: '25' });
+  assert.equal(r.code, 0, r.err);
+  const args = await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8');
+  assert.match(args, /^--env\nAGENT_DISPATCHED_BY=25$/m);
+});
+
+test('no AGENT_DISPATCHED_BY when the launcher has no numeric KITTY_WINDOW_ID', async () => {
+  await beacon(WID);
+  addSession('ses_new', MODEL);
+  const r = await tab(full(), { KITTY_WINDOW_ID: 'x25' });
+  assert.equal(r.code, 0, r.err);
+  assert.doesNotMatch(await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8'), /AGENT_DISPATCHED_BY/);
+});
+
 test('reads session_v2 when present (opencode v2.0.29+, #47) and falls back to session when absent', async () => {
   await beacon(WID);
   const d = new DatabaseSync(db);
