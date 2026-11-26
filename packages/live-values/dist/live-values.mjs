@@ -1003,6 +1003,13 @@ var collectFiles = (root) => {
         files.push(join(docs, e.name));
     }
   }
+  const seats = join(root, "seats");
+  if (existsSync(seats)) {
+    for (const e of readdirSync(seats, { withFileTypes: true })) {
+      if (e.isFile() && e.name.endsWith(".md"))
+        files.push(join(seats, e.name));
+    }
+  }
   const skills = join(root, "skills");
   if (existsSync(skills)) {
     for (const e of readdirSync(skills, { withFileTypes: true })) {

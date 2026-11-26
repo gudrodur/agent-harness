@@ -8,7 +8,11 @@
 //    auth. The first-word gate passed a `gh` hidden behind a pipe.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { autogenMask, checkLocal, checkQuerySegments, runCommand } from "../../engine/lib/doc-scope.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { autogenMask, checkLocal, checkQuerySegments, collectFiles, runCommand } from "../../engine/lib/doc-scope.mjs";
+import { trackTemp } from "./test-env.mjs";
 
 const mask = (text) => autogenMask(text.split("\n"));
 
@@ -240,4 +244,23 @@ test("runCommand deadStages: exit 2+ on an earlier stage is dead; exit 1 and SIG
   assert.equal(runCommand("yes | head -1 | wc -l", opts).ok, true, "SIGPIPE 141");
   assert.equal(runCommand("printf 'a b' | wc -w", opts).stdout.trim(), "2");
   assert.equal(runCommand("sh -c 'exit 2' | wc -w", { root: ".", timeoutMs: 5000 }).ok, true, "off unless asked");
+});
+
+// A seat's standing brief is prose read before the work and carries the same
+// kind of claim as a doc (a lane's floor, a runner path), so it is in scope;
+// only the top level counts, the way docs/ is read, and a repo without seats/
+// sweeps exactly what it did before.
+test("collectFiles reads seats/*.md beside docs/*.md, and a repo without seats/ is unchanged", () => {
+  const dir = trackTemp(fs.mkdtempSync(path.join(os.tmpdir(), "doc-scope-seats-")));
+  fs.mkdirSync(path.join(dir, "docs"));
+  fs.writeFileSync(path.join(dir, "docs", "a.md"), "x");
+  fs.mkdirSync(path.join(dir, "seats"));
+  fs.writeFileSync(path.join(dir, "seats", "compute-watch.md"), "x");
+  fs.writeFileSync(path.join(dir, "seats", "notes.txt"), "x");
+  fs.mkdirSync(path.join(dir, "seats", "nested"));
+  fs.writeFileSync(path.join(dir, "seats", "nested", "b.md"), "x");
+  const rel = () => collectFiles(dir).map((f) => path.relative(dir, f));
+  assert.deepEqual(rel(), ["docs/a.md", "seats/compute-watch.md"]);
+  fs.rmSync(path.join(dir, "seats"), { recursive: true });
+  assert.deepEqual(rel(), ["docs/a.md"], "no seats/ directory is no seats/ file");
 });
