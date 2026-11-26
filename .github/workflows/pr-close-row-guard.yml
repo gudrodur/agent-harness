@@ -27,8 +27,8 @@ permissions:
 
 jobs:
   guard:
-    # A public repo never runs on self-hosted runners (fork code).
-    runs-on: ubuntu-latest
+    # Unset GUARD_RUNNER_LABELS means hosted. This repo is public: point the variable only at a lane that may run fork code.
+    runs-on: ${{ fromJSON(vars.GUARD_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/setup-node@v7
         with:
