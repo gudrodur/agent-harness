@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `collectFiles` reads `seats/*.md` beside `docs/*.md`: a seat's standing brief
+  carries the same kind of claim as a doc (a lane's credit floor, a runner path)
+  and is now swept without naming the file. A repo without `seats/` is unchanged.
+
 ### Changed
 
 - Resynced `engine/lib/doc-scope.mjs` and `engine/lib/shell-command.mjs` with the

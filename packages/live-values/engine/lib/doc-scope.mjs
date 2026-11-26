@@ -54,12 +54,15 @@ export const liveScope = (root) => {
 // The local lane of a proof-annotation reader: tools that need no network, auth or machine path.
 export const LOCAL_TOOLS = new Set(["ls", "test", "grep", "node", "jq", "git", "cat", "wc"]);
 
-// Files in scope: the always-read entry docs plus the docs directory and
-// skills that carry factual claims. INDEX.md is generated, so it is never in
-// scope. AGENTS.md and CLAUDE.md are both listed; a repo keeps whichever
-// entry doc it uses (the other name simply matches nothing). The four
+// Files in scope: the always-read entry docs plus the docs directory, the seats
+// directory and skills that carry factual claims. INDEX.md is generated, so it
+// is never in scope. AGENTS.md and CLAUDE.md are both listed; a repo keeps
+// whichever entry doc it uses (the other name simply matches nothing). The four
 // *-ORGANIZATION.md names come from the setup this engine was extracted from;
-// a repo without them loses nothing.
+// a repo without them loses nothing. seats/ holds one standing brief per seat,
+// written to be read before the work and carrying the same kind of claim (a
+// lane's floor, a runner path); a repo without it sweeps exactly what it did
+// before.
 export const collectFiles = (root) => {
   const files = [];
   for (const name of ["AGENTS.md", "CLAUDE.md", "MCP-ORGANIZATION.md", "HOOKS-ORGANIZATION.md", "SKILLS-ORGANIZATION.md", "SCRIPTS-ORGANIZATION.md"]) {
@@ -69,6 +72,12 @@ export const collectFiles = (root) => {
   if (existsSync(docs)) {
     for (const e of readdirSync(docs, { withFileTypes: true })) {
       if (e.isFile() && e.name.endsWith(".md")) files.push(join(docs, e.name));
+    }
+  }
+  const seats = join(root, "seats");
+  if (existsSync(seats)) {
+    for (const e of readdirSync(seats, { withFileTypes: true })) {
+      if (e.isFile() && e.name.endsWith(".md")) files.push(join(seats, e.name));
     }
   }
   const skills = join(root, "skills");
