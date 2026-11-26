@@ -305,11 +305,18 @@ const isSenderBeacon = (b, sender) =>
 // writes a second beacon under its own cwd with the parent's sessionId, which
 // is still ONE recipient: every consumer drains by session id
 // (readUnackedBySession), so a row addressed to any of that session's keys is
-// delivered and acked. The kept beacon is one flagged `mailbox: true` (its
-// hasConsumer decides queue vs kitty fallback), then the newest lastTick.
+// delivered and acked. The kept beacon is one with a live consumer (the
+// classifier's verdict: the flag and, for an out-of-band writer, that writer
+// still running; its hasConsumer decides queue vs kitty fallback), then the
+// newest lastTick.
 // Beacons with no session id never collapse: 'anon' is not an identity. Two
 // DIFFERENT session ids stay separate candidates and stay ambiguous.
-const beaconRank = (b) => [b.mailbox === true ? 1 : 0, String(b.lastTick ?? '')];
+const liveConsumer = (b) => (b.consumer ?? b.mailbox === true) === true;
+const beaconRank = (b) => [liveConsumer(b) ? 1 : 0, String(b.lastTick ?? '')];
+// Every consumer drains by session id, so one row with a live consumer makes
+// each of that session's keys reachable, whichever row a pick landed on.
+const sessionHasConsumer = (beacon, pool) =>
+  liveConsumer(beacon) || (beacon.sessionId != null && pool.some((b) => b.sessionId === beacon.sessionId && liveConsumer(b)));
 const outranks = (a, b) => {
   const [ma, ta] = beaconRank(a);
   const [mb, tb] = beaconRank(b);
@@ -336,7 +343,7 @@ const recipientOf = (beacon, windowId) => ({
   beaconWindowId: beacon.windowId != null ? Number(beacon.windowId) : null,
   // The classifier's verdict: the mailbox flag AND, where the row names an
   // out-of-band writer, that writer still being the recorded process.
-  hasConsumer: beacon.consumer ?? beacon.mailbox === true,
+  hasConsumer: liveConsumer(beacon),
   // A poller with no composer: agent-send queues for it and never types.
   mailboxOnly: beacon.mailboxOnly === true,
   // A parked seat: agent-send says so and types to wake it.
@@ -427,7 +434,7 @@ export const resolveRecipient = (target, { presenceFile: file, senderSessionId =
   // A mailbox key never needs the window check unless no verified or fresh
   // row answers it: only then is a legacy parked row a candidate.
   const keyHit = reach.base.find((b) => recipientKey({ cwd: b.cwd, sessionId: b.sessionId }) === target);
-  if (keyHit) return recipientOf(keyHit, null);
+  if (keyHit) return { ...recipientOf(keyHit, null), hasConsumer: sessionHasConsumer(keyHit, reach.base) };
 
   if (typeof target === 'string' && target.includes('__')) {
     const sid = target.slice(target.lastIndexOf('__') + 2);
@@ -516,9 +523,14 @@ const resolveRoleRecipient = (name, reach) => {
     // instead of queueing for a next holder.
     const fresh = mine.filter((b) => b.idleMs == null);
     const pool = fresh.length > 0 ? fresh : mine;
+    // A row with a live consumer first (the claimed cwd's, else the newest):
+    // a plugin seat's tool hooks write a newer row per tree without one, and
+    // picking that one bounced every send while the seat drained fine.
+    const newest = (list) => [...list].sort((a, b) => String(b.lastTick).localeCompare(String(a.lastTick)))[0];
+    const live = pool.filter(liveConsumer);
     const best =
-      pool.find((b) => b.cwd === holder.cwd) ??
-      [...pool].sort((a, b) => String(b.lastTick).localeCompare(String(a.lastTick)))[0];
+      live.find((b) => b.cwd === holder.cwd) ?? newest(live) ??
+      pool.find((b) => b.cwd === holder.cwd) ?? newest(pool);
     return { ...recipientOf(best, null), role: name };
   }
   return {
