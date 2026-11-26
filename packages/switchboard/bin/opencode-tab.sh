@@ -42,6 +42,9 @@
 #     a row, not a status bar read off the screen.
 #   * The Cloudflare MCP tokens come from the companion configuration repo's opencode launcher,
 #     which this execs rather than the bare binary.
+#   * A tab launched from a kitty window carries that window's id as AGENT_DISPATCHED_BY, as
+#     claude-tab.sh does. It lands in the tab's launch env, where the watchdog reads it to see
+#     that a dispatched builder is covered by its dispatcher's own ci-inbox-watch.
 #
 # Shared with claude-tab.sh through lib/tab-ledger.sh, on purpose: the state
 # file and its row format (`WID PID @LAUNCHER TITLE`), so `--list` shows both
@@ -222,8 +225,17 @@ probe_model() {
 [ "$PROBE" = 1 ] && probe_model
 
 if [ -n "$SERVER" ]; then ATTACH=(--server "$SERVER"); else ATTACH=(--standalone); fi
+# The seat that dispatched this tab, exactly as claude-tab.sh records it. It rides in the
+# window's launch env so a watchdog can read it from outside the tab's process (`kitty @ ls`
+# lists each window's env) and treat the tab as covered by its dispatcher's ci-inbox-watch.
+# A non-numeric or unset KITTY_WINDOW_ID names no window, so nothing is passed.
+ENV_ARGS=()
+case "${KITTY_WINDOW_ID:-}" in
+  ""|*[!0-9]*) ;;
+  *) ENV_ARGS+=(--env "AGENT_DISPATCHED_BY=$KITTY_WINDOW_ID") ;;
+esac
 START_MS=$(( $(date +%s) * 1000 ))
-WID=$(kitty @ launch --type=tab --tab-title "$TITLE" --cwd "$CWD" \
+WID=$(kitty @ launch --type=tab --tab-title "$TITLE" --cwd "$CWD" "${ENV_ARGS[@]}" \
         "$LAUNCH" mini "${ATTACH[@]}" --model "$MODEL" --prompt "$MSG" 2>/dev/null)
 case "$WID" in *[!0-9]*|"") die "kitty @ launch did not return a plain window id, got: '$WID'" ;; esac
 # The window's pid, read fresh and retried while kitty does not answer; every

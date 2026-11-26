@@ -205,6 +205,28 @@ test('beacon + a new session on the asked model: exit 0, SESSION printed, state 
   assert.equal(await exists('closed'), false);
 });
 
+// The tab's dispatcher must be readable from outside its process: the watchdog reads the kitty
+// window's launch env. Same numeric gate as claude-tab.sh: a non-numeric id names no window.
+test("the launcher's numeric KITTY_WINDOW_ID goes in as AGENT_DISPATCHED_BY", async () => {
+  await beacon(WID);
+  addSession('ses_new', MODEL);
+  const r = await tab(full(), { KITTY_WINDOW_ID: '25' });
+  assert.equal(r.code, 0, r.err);
+  const args = await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8');
+  assert.match(args, /^--env\nAGENT_DISPATCHED_BY=25$/m);
+});
+
+test('no AGENT_DISPATCHED_BY when the launcher has no numeric KITTY_WINDOW_ID', async () => {
+  await beacon(WID);
+  addSession('ses_new', MODEL);
+  for (const env of [{}, { KITTY_WINDOW_ID: 'x1' }]) {
+    await fs.rm(path.join(stateDir, 'launch-args'), { force: true });
+    const r = await tab(full(), env);
+    assert.equal(r.code, 0, r.err);
+    assert.doesNotMatch(await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8'), /AGENT_DISPATCHED_BY/);
+  }
+});
+
 test('reads session_v2 when present (opencode v2.0.29+, #47) and falls back to session when absent', async () => {
   await beacon(WID);
   const d = new DatabaseSync(db);
