@@ -211,6 +211,62 @@ test('a trailing opencode idle row reports idle tool=- jobs=0 source=opencode-db
 });
 
 
+test('a trailing opencode shell row after an idle turn is background work, not a turn', async () => {
+  // 2026-11-27: every seat arms the CI inbox watch, which writes a `shell` row
+  // after the turn's `idle`. Reading the newest row as decisive made every such
+  // seat busy for ever, and a queued send waited 3,860 s on two empty composers.
+  await clearLinks();
+  const t = nowMs();
+  const { dir, file } = await writeOpenCodeDb([
+    ocUser('carry it out', 4, t - 9000), ocAssistant(11, t - 5000, 'shell'), ocIdle(12, t - 4000),
+    { type: 'shell', seq: 13, ts: t - 1000, data: { time: { created: t - 1000 }, command: 'ci-inbox-watch' } },
+  ], { timeIdle: t - 4000, idleOutcome: 'succeeded' });
+  try {
+    const r = await runScript([WID], { OPENCODE_TAB_DB: file });
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.match(r.out, /state=idle/, 'a background shell does not keep the seat busy');
+    const j = JSON.parse((await runScript([WID, '--json'], { OPENCODE_TAB_DB: file })).out);
+    assert.equal(j.state, 'idle');
+    assert.equal(j.source, 'opencode-db');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an opencode window is read off the session its client names, not the newest in the directory', async () => {
+  // 2026-11-27: every seat in one checkout shares a directory, so the newest
+  // session there was another window's, and two idle seats were read as busy.
+  await clearLinks();
+  const t = nowMs();
+  const { dir, file } = await writeOpenCodeDb([
+    ocUser('carry it out', 4, t - 9000), ocIdle(12, t - 8000),
+  ], { timeCreated: t - 60_000, timeIdle: t - 8000, idleOutcome: 'succeeded' });
+  // A newer session in the same directory, mid-turn: what the directory rule picks.
+  const db = new DatabaseSync(file);
+  db.prepare('INSERT INTO session_v2 (id, directory, model, parent_id, time_created, time_updated, time_idle, idle_outcome) VALUES (?,?,?,?,?,?,?,?)')
+    .run('ses_newer00000000000other', WCWD, '{"id":"m"}', null, t - 1000, t - 1000, null, null);
+  db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)')
+    .run('m-other-1', 'ses_newer00000000000other', 'assistant', 3, t - 500, t - 500, JSON.stringify({ content: [{ type: 'tool', name: 'bash' }] }));
+  db.close();
+  // The window's client names its own session in argv.
+  const procDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tabstate-proc-'));
+  await fs.mkdir(path.join(procDir, String(process.pid)), { recursive: true });
+  await fs.writeFile(path.join(procDir, String(process.pid), 'cmdline'), `/home/x/opencode\0--session\0${OC_SID}\0`);
+  try {
+    const r = await runScript([WID], { OPENCODE_TAB_DB: file, TAB_STATE_PROC_DIR: procDir });
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.match(r.out, /state=idle/, 'the named session is idle even though the newest in the directory is busy');
+    assert.match(r.out, new RegExp(`session=opencode:${OC_SID}`));
+    // Without the client's argv the directory rule still applies.
+    await fs.rm(path.join(procDir, String(process.pid)), { recursive: true, force: true });
+    const fallback = await runScript([WID], { OPENCODE_TAB_DB: file, TAB_STATE_PROC_DIR: procDir });
+    assert.match(fallback.out, /state=busy/, 'the fallback reads the newest session in the directory');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(procDir, { recursive: true, force: true });
+  }
+});
+
 test('--watch reports an opencode tab\'s transitions from opencode.db', async () => {
   // The watch loop has its own call site (resolve_candidates runs each tick, so
   // a tab that starts as a non-tab must be re-identified), and it is the mode a
