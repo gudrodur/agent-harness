@@ -228,27 +228,44 @@ export const agentWindowIds = ({ procDir = process.env.AGENT_MAILBOX_PROC_DIR ??
 //   idle-live    its host identity matched a live process (verified); no window
 //                or /proc scan is needed, the identity is the proof;
 //   legacy-idle  a row written before host identities, with no pid: kept only
-//                while its kitty window still exists AND still runs an agent (a
-//                window whose agent exited leaves a bare shell; typing into it
-//                is the unsafe direction). A closed window, a shell-only window
-//                or an unreadable /proc is not an idle seat.
+//                while its kitty window still exists, still runs an agent, and
+//                names the same cwd (a window whose agent exited leaves a bare
+//                shell; typing into it is the unsafe direction). A closed
+//                window, a shell-only window, an unreadable /proc or a window
+//                on another tree is not an idle seat.
 // A row that lost its window to a newer or verified occupant is superseded and
 // never idle. Each result carries idleMs. `wins` and `agentWindows` (Set of
 // window ids, or null for "unreadable") are injectable; each is read only when
 // a legacy row is a candidate, and /proc is scanned once per call.
 const idleOf = (all, { now = Date.now(), wins = null, agentWindows = undefined } = {}) => {
-  const cands = all.filter((b) => b.state === 'idle-live' || (b.state === 'legacy-idle' && b.windowId != null));
+  const cands = all.filter((b) =>
+    b.state === 'idle-live' ||
+    (b.state === 'legacy-idle' && b.windowId != null) ||
+    // A modern writer with no host bound: the row is past the freshness TTL,
+    // but the process that drains its mailbox still runs. Its key must reach
+    // it (#3476). It has no verifiable window, so seatedBeacons keeps it out
+    // of window resolution.
+    (b.state === 'stale' && b.writerLive === true));
   if (cands.length === 0) return [];
   let parked = null;
   if (cands.some((b) => b.state === 'legacy-idle')) {
     const running = agentWindows === undefined ? agentWindowIds() : agentWindows;
     if (running != null) {
-      const open = new Set((wins ?? kittyWindows()).map((w) => w.id));
-      parked = (b) => open.has(Number(b.windowId)) && running.has(Number(b.windowId));
+      const byId = new Map((wins ?? kittyWindows()).map((w) => [w.id, w.cwd ?? null]));
+      // A legacy-idle row names no host identity, so its window claim is the
+      // only evidence it has; the window must at least agree on the tree. A
+      // row whose cwd is not the window's cwd is another tab's seat, or a row
+      // whose window an older writer froze, and never this window's (#3476:
+      // four rows from 2026-11-23 answered window 28 that way, with a session
+      // id no harness mints).
+      parked = (b) =>
+        byId.has(Number(b.windowId)) &&
+        running.has(Number(b.windowId)) &&
+        byId.get(Number(b.windowId)) === b.cwd;
     }
   }
   return cands
-    .filter((b) => b.state === 'idle-live' || (parked != null && parked(b)))
+    .filter((b) => b.state === 'idle-live' || b.state === 'stale' || (parked != null && parked(b)))
     .map((b) => ({ ...b, idleMs: now - Date.parse(b.lastTick) }));
 };
 export const idleBeacons = ({ presenceFile, now = Date.now(), wins = null, agentWindows = undefined } = {}) =>
@@ -270,8 +287,9 @@ const reachableBeacons = ({ presenceFile, now = Date.now() } = {}) => {
     full: () => (full ??= [...base, ...idleOf(all.filter((b) => b.state === 'legacy-idle'), { now })]),
   };
 };
-// The rows that hold a window: the superseded lost it to another occupant.
-const seatedBeacons = (beacons) => beacons.filter((b) => b.state !== 'superseded');
+// The rows that hold a window: the superseded lost it to another occupant,
+// and a stale row has no verifiable claim left (only its mailbox key answers).
+const seatedBeacons = (beacons) => beacons.filter((b) => b.state !== 'superseded' && b.state !== 'stale');
 
 // Live beacons sharing a window's cwd — the fallback candidates for a window
 // id or title target when no beacon recorded the window's own id (see

@@ -202,11 +202,12 @@ export const classifyBeacon = (b, { now = Date.now(), probe = createProbe() } = 
   // still the one recorded; a restarted server leaves the host live and the
   // consumer gone. An idle seat has no composer loop of its own, so it counts
   // as drained only through such a writer.
-  const consumerOf = (state) => {
-    if (b.mailbox !== true) return false;
+  const drainOf = (state) => {
+    if (b.mailbox !== true) return { consumer: false, writerLive: false };
     let writerOk = true;
     if (b.writerStart != null && b.writerPid != null) writerOk = processVerdict(b, b.writerPid, b.writerStart, probe) !== 'no';
-    return state === 'fresh' ? writerOk : writerOk && b.writerStart != null;
+    const writerLive = writerOk && b.writerStart != null;
+    return { consumer: state === 'fresh' ? writerOk : writerLive, writerLive };
   };
 
   if (hasHost(b)) {
@@ -214,10 +215,10 @@ export const classifyBeacon = (b, { now = Date.now(), probe = createProbe() } = 
     if (v === 'no') return out('dead');
     if (v === 'unknown') {
       const state = fresh ? 'fresh' : 'legacy-idle';
-      return out(state, { unknown: true, consumer: consumerOf(state) });
+      return out(state, { unknown: true, ...drainOf(state) });
     }
     const state = fresh ? 'fresh' : 'idle-live';
-    return out(state, { verified: true, consumer: consumerOf(state) });
+    return out(state, { verified: true, ...drainOf(state) });
   }
   // A modern writer with no host bound, or whose host moved to another
   // session: the TTL only, which is honest. This comes before the legacy pid:
@@ -227,18 +228,21 @@ export const classifyBeacon = (b, { now = Date.now(), probe = createProbe() } = 
     const state = fresh ? 'fresh' : 'stale';
     // With no boot id (a host with no /proc) the identity could not be
     // checked: report that, so a reader keeps the row rather than refute it.
-    return out(state, { unknown: b.bootId == null, consumer: fresh && consumerOf(state) });
+    const d = drainOf(state);
+    return out(state, { unknown: b.bootId == null, ...d });
   }
   if (b.pid != null) {
     if (!pidAlive(b.pid)) return out('dead', { legacy: 'pid' });
     const state = fresh ? 'fresh' : 'stale';
-    return out(state, { legacy: 'pid', consumer: fresh && consumerOf(state) });
+    const d = drainOf(state);
+    return out(state, { legacy: 'pid', ...d, consumer: fresh && d.consumer });
   }
   // Written before identities and with no pid (a Claude Code hook): fresh by
   // the TTL, parked past it only while its window runs an agent, which the
   // reader checks (it owns the window list).
   const state = fresh ? 'fresh' : 'legacy-idle';
-  return out(state, { legacy: 'null', consumer: fresh && consumerOf(state) });
+  const d = drainOf(state);
+  return out(state, { legacy: 'null', ...d, consumer: fresh && d.consumer });
 };
 
 const SEAT_STATES = new Set(['fresh', 'idle-live', 'legacy-idle']);
@@ -417,6 +421,11 @@ export const recordPresence = ({
   mailbox = null,
   mailboxOnly = null,
   windowId = null,
+  // `windowKnown: true` says the caller measured the window and there is none
+  // (a serve daemon whose session has no client yet), so a window an earlier
+  // tick recorded is cleared. Omitting it keeps the merge-only rule: a caller
+  // that did not measure the window never clears one (see #3476).
+  windowKnown = false,
   pid = null,
   host = undefined,
   hostProof = null,
@@ -450,7 +459,7 @@ export const recordPresence = ({
           store.run(
             `UPDATE presence_beacons SET last_tick = ?, branch = ?, cwd = ?,
               home_cwd = COALESCE(?, home_cwd), mailbox = COALESCE(?, mailbox), mailbox_only = COALESCE(?, mailbox_only),
-              window_id = COALESCE(?, window_id),
+              window_id = CASE WHEN ? THEN ? ELSE COALESCE(?, window_id) END,
               pid = COALESCE(?, pid), last_work_tick = COALESCE(?, last_work_tick),
               boot_id = CASE WHEN ? THEN NULL ELSE COALESCE(?, boot_id) END,
               host_pid = CASE WHEN ? THEN NULL ELSE COALESCE(?, host_pid) END,
@@ -461,7 +470,7 @@ export const recordPresence = ({
              WHERE session_id = ? AND cwd = ?`,
             iso, branch, cwd,
             homeCwd, mailbox == null ? null : mailbox ? 1 : 0, mailboxOnly == null ? null : mailboxOnly ? 1 : 0,
-            windowId == null ? null : Number(windowId),
+            windowKnown ? 1 : 0, windowId == null ? null : Number(windowId), windowId == null ? null : Number(windowId),
             pid == null ? null : Number(pid), work ? iso : null,
             // A writer read with no boot id clears the boot id and host an earlier write left:
             // they cannot be checked beside it, and a reader must see the row as unknown.
@@ -535,8 +544,10 @@ export const recordPresence = ({
     if (mailboxOnly !== null) me.mailboxOnly = mailboxOnly;
     // Kitty window id (the mailbox hook sets it from KITTY_WINDOW_ID) so a
     // window id resolves to the session living in that window, not to
-    // whoever shares its cwd. Same merge-only rule: never clear once set.
+    // whoever shares its cwd. Merge-only unless the caller measured the
+    // window: a known-none window clears a frozen one (#3476).
     if (windowId !== null) me.windowId = windowId;
+    else if (windowKnown) delete me.windowId;
     if (pid !== null) me.pid = pid;
     Object.assign(me, identFields);
     if (ident.writer && ident.writer.start == null) delete me.writerStart; // the pid and its start move together
