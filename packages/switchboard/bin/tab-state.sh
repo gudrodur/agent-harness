@@ -47,6 +47,9 @@ die()  { printf '%s\n' "tab-state: $1" >&2; exit "${2:-1}"; }
 note() { printf '%s\n' "tab-state: $*" >&2; }
 
 OPENCODE_TAB_DB="${OPENCODE_TAB_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+# Test seam only: where the window's client argv is read, to find the session a
+# `--session <id>` window runs.
+TAB_STATE_PROC_DIR="${TAB_STATE_PROC_DIR:-/proc}"
 SDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # A Claude Code tab's session record and transcript readers, shared with
 # kitty-send.sh (it also fixes the CLAUDE_SESSIONS_DIR/CLAUDE_PROJECTS_DIR seams).
@@ -194,19 +197,43 @@ read_claude_state() {
 # window's pid — are reused by the OS.
 # Which state: the newest decisive `session_message` for that session, in the
 # same sense as a decisive transcript row. `idle` is opencode saying the turn
-# finished; anything else it wrote while working (user, assistant, shell) is
-# busy, and the tool name comes from the last tool in the newest assistant
-# row's content. `lines` is MAX(seq), the counter a send proof grows past.
+# finished; a `user` or `assistant` row while it works is busy, and the tool name
+# comes from the last tool in the newest assistant row's content. A `shell` row
+# is background work, not a turn, so it never decides on its own: a seat that
+# arms a long shell writes one after its `idle` and stays idle. `lines` is
+# MAX(seq), the counter a send proof grows past.
 read_opencode_state() {
   [ -n "${OPENCODE_TAB_DB:-}" ] && [ -r "$OPENCODE_TAB_DB" ] || return 1
   command -v node >/dev/null 2>&1 || return 1
   SINCE=$(( WCREATED_NS / 1000000 - 5000 ))
-  OC=$(node - "$OPENCODE_TAB_DB" "$WCWD" "$SINCE" <<'JS' 2>/dev/null
+  OC=$(node - "$OPENCODE_TAB_DB" "$WCWD" "$SINCE" "${WPID:-0}" "${TAB_STATE_PROC_DIR:-/proc}" <<'JS' 2>/dev/null
 process.emitWarning = () => {};
 const { DatabaseSync } = require('node:sqlite');
-const [db, cwd, since] = process.argv.slice(2);
+const { readFileSync } = require('node:fs');
+const [db, cwd, since, wpid, procDir] = process.argv.slice(2);
 const d = new DatabaseSync(db, { readOnly: true });
-const s = d
+// The session this window runs, when its client says so: a client started with
+// `--session <id>` (or `-s <id>`) is that session's host, and the id is better
+// evidence than a directory, where every seat in one checkout shares the newest
+// row (2026-11-27: windows 10 and 14 were read off window 31's session, which
+// was mid-turn, so both looked busy with empty composers).
+const named = () => {
+  if (!/^\d+$/.test(wpid) || wpid === '0') return null;
+  try {
+    const argv = readFileSync(`${procDir}/${wpid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+    const inline = argv.find((a) => a.startsWith('--session='));
+    const i = argv.findIndex((a) => a === '--session' || a === '-s');
+    const id = inline ? inline.slice('--session='.length) : i >= 0 ? argv[i + 1] : null;
+    return typeof id === 'string' && id.startsWith('ses_') ? id : null;
+  } catch {
+    return null;
+  }
+};
+const namedId = named();
+const byId = namedId
+  ? d.prepare('SELECT id, time_idle FROM session_v2 WHERE id = ? AND parent_id IS NULL').get(namedId)
+  : undefined;
+const s = byId || d
   .prepare('SELECT id, time_idle FROM session_v2 WHERE directory = ? AND parent_id IS NULL AND time_created >= ? ORDER BY time_created DESC LIMIT 1')
   .get(cwd, Number(since));
 if (!s) process.exit(1);
@@ -214,7 +241,7 @@ const rows = d
   .prepare('SELECT type, seq, time_created, data FROM session_message WHERE session_id = ? ORDER BY seq DESC, time_created DESC LIMIT 20')
   .all(s.id);
 const lines = d.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM session_message WHERE session_id = ?').get(s.id).m;
-const decisive = rows.find((r) => ['idle', 'user', 'assistant', 'shell'].includes(r.type));
+const decisive = rows.find((r) => ['idle', 'user', 'assistant'].includes(r.type));
 let state = 'idle';
 let tool = '-';
 let ts = Number(s.time_idle || 0);
@@ -223,6 +250,13 @@ if (decisive) {
   state = decisive.type === 'idle' ? 'idle' : 'busy';
 } else if (!s.time_idle) {
   state = 'busy';
+} else if (rows.length) {
+  // Only `shell` rows, and the turn is over: background work is not a turn. A
+  // seat arms a long-running shell (the CI inbox watch) and then finishes its
+  // turn, so its newest row is `shell` while its composer sits empty; reading
+  // that as busy kept the seat busy for ever (2026-11-27: kitty-send waited
+  // 3,860 s on two such windows).
+  ts = Number(rows[0].time_created) || ts;
 }
 if (state === 'busy') {
   const a = rows.find((r) => r.type === 'assistant');
