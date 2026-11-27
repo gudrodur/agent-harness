@@ -112,7 +112,7 @@ test('a window running only a shell is not an idle seat, even with the window op
 test('agentWindowIds: agent windows found in one scan; unreadable procDir is null; idleBeacons treats null as not idle', () => {
   assert.deepEqual([...agentWindowIds({ procDir })].sort(), [410, 420, 430]);
   assert.equal(agentWindowIds({ procDir: path.join(tmp, 'no-such-proc') }), null);
-  const wins = [{ id: 410 }, { id: 411 }];
+  const wins = [{ id: 410, cwd: '/r/idle' }, { id: 411, cwd: '/r/deadpid' }];
   assert.ok(idleBeacons({ wins, agentWindows: new Set([410]) }).some((b) => b.sessionId === 'idle-1'));
   assert.deepEqual(idleBeacons({ wins, agentWindows: null }), []);
   assert.ok(!idleBeacons({ wins, agentWindows: new Set([420]) }).some((b) => b.sessionId === 'idle-1'));
