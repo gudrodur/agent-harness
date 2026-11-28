@@ -53,9 +53,15 @@ const readJson = (file) => {
 
 // {url, password, source} for the local server, or {url: null, why}.
 // The port comes from the first registry that names a usable one; the password
-// from the first that carries it. A missing password is not "no auth": the
-// server requires one, so a call without it cannot succeed and saying so now
-// is better than a 401 from a server the caller thought was reachable.
+// from the first that carries it. That is the order the launcher reads, so the
+// two can never disagree about which server is meant — but it does mean a
+// stale config file can pair its old port with a password only the live state
+// file carries. Keeping the launcher's order is deliberate (a mismatch would be
+// worse than a stale port), and the caller sees the pairing fail as an
+// `unreachable` answer rather than a wrong-server write.
+// A missing password is not "no auth": the server requires one, so a call
+// without it cannot succeed and saying so now is better than a 401 from a
+// server the caller thought was reachable.
 export const resolveService = ({ files = null } = {}) => {
   const candidates = files ?? (pinnedRegistry() != null ? [pinnedRegistry()] : serviceRegistryFiles());
   let port = null;
@@ -146,10 +152,47 @@ export const activeSessionIds = async ({ service = resolveService(), timeoutMs =
   return { ok: true, ids: new Set(Object.keys(map)) };
 };
 
+// Read a prompt entry's stdout as a stream, because a caller may kill it: the
+// final answer if one arrived, and the accepted marker the entry prints the
+// moment the server took the prompt. The marker is what keeps a killed
+// read-back from being read as "nothing was sent" and delivered again.
+// A line that is not JSON (a stray warning, a truncated tail) is ignored.
+export const parsePromptStream = (text) => {
+  const lines = String(text ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  let final = null;
+  let accepted = null;
+  for (const line of lines) {
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== 'object') continue;
+    if (obj.phase === 'accepted') {
+      if (accepted == null && typeof obj.messageId === 'string' && obj.messageId !== '') accepted = obj;
+    } else {
+      final = obj;
+    }
+  }
+  return { final, accepted };
+};
+
 // Put the text in the session's inbox and prove it by reading the message
 // back. `delivery` is the server's own vocabulary: `steer` reaches the agent
 // before its next model call (and starts a run when the session is idle),
 // `queue` waits until the current work finishes.
+//
+// `timeoutMs` is the TOTAL budget for both requests, not one each: a caller
+// that bounds this call (agent-send kills its helper at budget + margin) must
+// have an answer inside it, or a prompt the server accepted would be called
+// undelivered and sent a second time. The POST gets the larger share, the
+// read-back whatever is left; too little left is itself `unproven`.
+//
+// `onAccepted` is called with `{messageId}` the moment the POST answers and
+// before the read-back starts: a caller whose process is killed mid-proof can
+// then see that the text is already in, and record it as unproven instead of
+// delivering it again.
 //
 // Answers: {ok: true, messageId, delivery, directory} on proof;
 // {ok: false, code: 'unproven', messageId, why} when the prompt was accepted
@@ -162,26 +205,40 @@ export const deliverPrompt = async ({
   directory = null,
   service = resolveService(),
   timeoutMs = 5000,
+  onAccepted = null,
 } = {}) => {
   if (!isOpencodeSessionId(sessionId)) return { ok: false, code: 'not-opencode', why: 'not an OpenCode session id' };
   if (delivery !== 'steer' && delivery !== 'queue') return { ok: false, code: 'refused', why: `delivery must be steer or queue, got ${delivery}` };
+  const startedAt = Date.now();
+  const postBudget = Math.max(500, Math.min(timeoutMs, Math.floor(timeoutMs * 0.6)));
   const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
   const sent = await requestJson({
     service,
     apiPath: `/api/session/${encodeURIComponent(sessionId)}/prompt${query}`,
     method: 'POST',
     body: { text, delivery },
-    timeoutMs,
+    timeoutMs: postBudget,
   });
   if (!sent.ok) return sent;
   const messageId = sent.data?.data?.id ?? null;
   if (typeof messageId !== 'string' || messageId === '') {
     return { ok: false, code: 'unproven', messageId: null, why: 'the server accepted the prompt but named no message id to read back' };
   }
+  if (typeof onAccepted === 'function') {
+    try {
+      onAccepted({ messageId });
+    } catch {
+      // A caller's own reporting failure must not change the delivery verdict.
+    }
+  }
+  const remaining = timeoutMs - (Date.now() - startedAt);
+  if (remaining < 100) {
+    return { ok: false, code: 'unproven', messageId, why: `no time was left in the ${timeoutMs} ms budget to read message ${messageId} back` };
+  }
   const back = await requestJson({
     service,
     apiPath: `/api/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
-    timeoutMs,
+    timeoutMs: remaining,
   });
   if (!back.ok) {
     return { ok: false, code: 'unproven', messageId, why: `the prompt's message ${messageId} could not be read back: ${back.why}` };

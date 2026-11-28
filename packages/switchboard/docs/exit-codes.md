@@ -7,7 +7,7 @@
 | 0 | Acked, or proven by the terminal fallback, or delivered to an OpenCode seat through its server and read back by message id. |
 | 2 | A refused flag pair: `--no-wait` with `--now`, `--stop`, `--idle-when` or `--deadline`. Nothing was written or sent. |
 | 3 | Not delivered yet (queued, or no proof): do not resend; `--status --id <id>` asks later (when an ack wait ended without an ack the sender prints that command). `--status` itself exits 3 for a pending row. Queued for a role with no live holder also exits 3, and `--no-wait` exits 3 as soon as the row is written. An OpenCode server that accepted the prompt but could not be read back is also 3, and the row is closed as `apiUnproven`: the text may be there, so it is not resent. |
-| 10 | Typed but not proven submitted: look at the window before resending. `--status` also exits 10 for a typed send whose delivery was unproven (kitty-send exit 3, or killed by a signal). |
+| 10 | Typed but not proven submitted: look at the window before resending. Also the OpenCode-server counterpart: the server took the prompt but its message could not be read back, so look at the session. `--status` also exits 10 for either kind of unproven send. |
 | 11 | `--claim-role`: a live seat holds the role; the claim changed nothing (`--take-over` takes it). |
 | 12 | `--release-role`: another session holds the role. |
 | 13 | `--cancel`: the row was already delivered or withdrawn. `--status`: the row was withdrawn. |

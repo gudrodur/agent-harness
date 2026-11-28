@@ -22,7 +22,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { startStubServer, writeRegistry } from './helpers/opencode-stub.mjs';
-import { isOpencodeSessionId, resolveService, deliverPrompt } from '../lib/opencode-server.mjs';
+import { isOpencodeSessionId, resolveService, deliverPrompt, parsePromptStream } from '../lib/opencode-server.mjs';
 import { listSeats, readRows, resetOpencodeLivenessCache } from '../lib/agent-mailbox.mjs';
 import { procStat, currentBootId } from '../lib/presence.mjs';
 
@@ -359,6 +359,12 @@ test('agent-send reports an unproven prompt as exit 3 and does not let it arrive
     const msg = rows.find((x) => x && x.id && x.text === 'one copy only');
     const acked = rows.find((x) => x && x.ack === msg.id);
     assert.equal(acked?.deliveredAs, 'apiUnproven');
+    // --status reads that marker back as "unproven, do not resend", not as a
+    // delivery: the text may be in the session, and a resend could double it.
+    const st = await runSend(['--status', '--id', msg.id], agentEnv(reg));
+    assert.equal(st.code, 10, `${st.out}${st.err}`);
+    assert.match(st.out, /delivery unproven/);
+    assert.match(st.out, /look at the session/);
   } finally {
     await stub.close();
   }
@@ -376,8 +382,7 @@ test('agent-send falls back to the mailbox when no server answers', async () => 
   assert.doesNotMatch(r.err, /through its OpenCode server/);
 });
 
-test('a sender report names the file, never the registry password', async () => {
-  const secret = 'never-print-me-7c1d';
+test('a sender report names the file, never the registry password', async () => {  const secret = 'never-print-me-7c1d';
   const stub = await startStubServer({ password: secret });
   const reg = writeRegistry(dir, stub.port, secret, { file: path.join(dir, 'reg-15.json') });
   writeBeacon();
@@ -435,6 +440,71 @@ test('a seat its server reports running is listed live, not idle', async () => {
   } finally {
     process.env.AGENT_SWITCHBOARD_OPENCODE_SERVICE = path.join(dir, 'no-such-registry.json');
     resetOpencodeLivenessCache();
+    await stub.close();
+  }
+});
+// ---- a slow server must never cause a second delivery ----------------------
+//
+// The hazard is structural: the helper makes two requests (POST, then the
+// read-back) and a caller bounds the whole helper process. If the parent's
+// kill lands after the POST was accepted but before the read-back answers, a
+// caller that reads "no final JSON" as "nothing was sent" delivers the text a
+// second time through the mailbox or kitty. Two rules close it: `--timeout` is
+// ONE budget for both requests, and the helper prints an `accepted` line the
+// moment the server takes the prompt, so a cut-off call is unproven, not absent.
+
+test('the prompt entry splits one budget across both requests, not one each', async () => {
+  const stub = await startStubServer({ readBackDelayMs: 3000 });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-17.json') });
+  try {
+    const started = Date.now();
+    const r = await runEntry(['send', '--session', SID, '--text', 'one budget', '--timeout', '700'], {
+      AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg,
+    });
+    const took = Date.now() - started;
+    assert.equal(r.code, 3, `${r.out}${r.err}`);
+    assert.equal(r.answer?.code, 'unproven');
+    // The POST landed: the server has the text, so this is "do not resend".
+    assert.equal(stub.state.prompts.length, 1);
+    assert.ok(took < 2600, `the whole call must stay inside its budget, took ${took} ms`);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('a stream cut off after the accepted line is read as unproven, not as nothing sent', () => {
+  const cut = `${JSON.stringify({ ok: true, phase: 'accepted', messageId: 'msg_cut' })}\n`;
+  const parsed = parsePromptStream(cut);
+  assert.equal(parsed.final, null);
+  assert.equal(parsed.accepted?.messageId, 'msg_cut');
+  // A truncated final line is not JSON and must not erase the marker either.
+  const torn = `${cut}{"ok":true,"messageId":"msg_c`;
+  assert.equal(parsePromptStream(torn).accepted?.messageId, 'msg_cut');
+  // No marker and no final answer is genuinely "nothing was sent".
+  assert.deepEqual(parsePromptStream(''), { final: null, accepted: null });
+});
+
+test('agent-send treats a helper killed after the POST as unproven: one copy, no fallback', async () => {
+  const stub = await startStubServer({ readBackDelayMs: 5000 });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-18.json') });
+  writeBeacon();
+  try {
+    // The helper would wait for the slow read-back; the parent kills it first.
+    const r = await runSend(['--to', KEY, '--text', 'exactly one copy'], agentEnv(reg, {
+      AGENT_SEND_OPENCODE_TIMEOUT_MS: '4000',
+      AGENT_SEND_OPENCODE_SPAWN_TIMEOUT_MS: '1200',
+    }));
+    assert.equal(r.code, 3, `${r.out}${r.err}`);
+    assert.match(r.err, /do not resend/);
+    // The server has the prompt once, and nothing was typed or queued after it.
+    assert.equal(stub.state.prompts.length, 1);
+    assert.equal(fs.existsSync(kittyLog), false);
+    const rows = readRows(KEY, { dir: mboxDir });
+    const msg = rows.find((x) => x && x.id && x.text === 'exactly one copy');
+    const acked = rows.find((x) => x && x.ack === msg.id);
+    assert.equal(acked?.deliveredAs, 'apiUnproven');
+    assert.equal(msg.messageId, stub.state.prompts[0].messageId);
+  } finally {
     await stub.close();
   }
 });

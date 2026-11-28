@@ -21,8 +21,13 @@
 //   12  no server configured, or it did not answer.
 //   2   usage error.
 //
-// Output on stdout is a single JSON object:
-//   send      {"ok":true,"messageId":"...","delivery":"steer","session":"..."}
+// Output on stdout is one JSON object per line:
+//   send      {"ok":true,"phase":"accepted","messageId":"...","delivery":"steer"}
+//             printed the moment the server takes the prompt, before the
+//             read-back starts, so a caller that kills this process mid-proof
+//             can still see the text is in and must not send it again;
+//             then the final line:
+//             {"ok":true,"messageId":"...","delivery":"steer","session":"..."}
 //             {"ok":false,"code":"unproven","messageId":"...","why":"..."}
 //             {"ok":false,"code":"not-found","why":"..."}
 //   active    {"ok":true,"running":["ses_..."]}
@@ -47,7 +52,9 @@ const die = (msg, code = 2) => {
   process.exit(code);
 };
 
-const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+// Synchronous on purpose: the accepted marker must be on the pipe before the
+// read-back starts, or a caller's timeout can lose it and resend the text.
+const out = (obj) => fs.writeSync(1, `${JSON.stringify(obj)}\n`);
 const readStdin = () => {
   try {
     return fs.readFileSync(0, 'utf8');
@@ -108,7 +115,10 @@ const main = async (argv) => {
   const body = text ?? readStdin();
   if (body === '') die('send needs --text or text on stdin');
 
-  const r = await deliverPrompt({ sessionId: session, text: body, delivery, directory, timeoutMs });
+  const r = await deliverPrompt({
+    sessionId: session, text: body, delivery, directory, timeoutMs,
+    onAccepted: ({ messageId }) => out({ ok: true, phase: 'accepted', messageId, delivery, session }),
+  });
   if (r.ok) {
     out({ ok: true, messageId: r.messageId, delivery: r.delivery, session });
     process.stderr.write(`opencode-prompt: delivered to ${session} (message ${r.messageId}, ${r.delivery})\n`);

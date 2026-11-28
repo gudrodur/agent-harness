@@ -24,6 +24,7 @@ export const startStubServer = async ({
   active = [],
   sessions = null,
   delayMs = 0,
+  readBackDelayMs = 0,
 } = {}) => {
   const state = {
     requests: [],
@@ -89,12 +90,16 @@ export const startStubServer = async ({
     const read = /^\/api\/session\/([^/]+)\/message\/([^/]+)$/.exec(p);
     if (read) {
       state.reads.push({ sessionId: read[1], messageId: read[2] });
-      if (state.readBack === 'missing') {
-        json(res, 404, { _tag: 'NotFoundError', message: 'no such message' });
-        return;
-      }
-      const id = state.readBack === 'different' ? `${read[2]}-other` : read[2];
-      json(res, 200, { data: { id, sessionID: read[1], type: 'user' } });
+      const answer = () => {
+        if (state.readBack === 'missing') {
+          json(res, 404, { _tag: 'NotFoundError', message: 'no such message' });
+          return;
+        }
+        const id = state.readBack === 'different' ? `${read[2]}-other` : read[2];
+        json(res, 200, { data: { id, sessionID: read[1], type: 'user' } });
+      };
+      if (readBackDelayMs) setTimeout(answer, readBackDelayMs);
+      else answer();
       return;
     }
     json(res, 404, { _tag: 'NotFoundError', message: `no route ${p}` });

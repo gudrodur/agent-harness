@@ -759,24 +759,28 @@ OPENCODE_PROMPT_JS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/opencode-promp
 # Exit 0 delivered; 3 the server took it but the read-back failed (never
 # resend blind); 1 nothing was sent through the server, so type instead.
 opencode_api_send() { # $1 = session id, $2 = steer|queue
-  local out rc why mid api_ms
+  local out rc why mid acc api_ms
   case "$TIMEOUT" in ''|*[!0-9]*) api_ms=15000 ;; *) api_ms=$(( TIMEOUT * 1000 )) ;; esac
   [ "$api_ms" -ge 1000 ] || api_ms=1000
   rc=0
   out=$(printf '%s' "$TEXT" | node "$OPENCODE_PROMPT_JS" send --session "$1" --delivery "$2" --timeout "$api_ms" 2>/dev/null) || rc=$?
-  why=$(printf '%s' "$out" | jq -r '.why // empty' 2>/dev/null)
-  mid=$(printf '%s' "$out" | jq -r '.messageId // empty' 2>/dev/null)
+  why=$(printf '%s' "$out" | jq -r 'select(.phase != "accepted") | .why // empty' 2>/dev/null | tail -1)
+  mid=$(printf '%s' "$out" | jq -r 'select(.phase != "accepted") | .messageId // empty' 2>/dev/null | tail -1)
+  # The entry prints an `accepted` line the moment the server takes the prompt,
+  # before the read-back. Seeing it with no final answer means the proof was cut
+  # off, not that nothing was sent: typing now would deliver the text twice.
+  acc=$(printf '%s' "$out" | jq -r 'select(.phase == "accepted") | .messageId // empty' 2>/dev/null | tail -1)
   case "$rc" in
     0)
       note "delivered to session $1 through its OpenCode server (message ${mid:-?}, delivery $2); nothing was typed into the tab"
       exit 0 ;;
-    3)
-      note "the OpenCode server took the prompt for session $1 as message ${mid:-?}, but its message could not be read back (${why:-no reason given})."
-      die "not proven delivered — do NOT send it again blind; look at the session first" 3 ;;
-    *)
-      note "session $1 did not take the prompt through its OpenCode server (${why:-no answer}); typing it into window $WID instead"
-      return 1 ;;
   esac
+  if [ "$rc" = 3 ] || [ -n "$acc" ]; then
+    note "the OpenCode server took the prompt for session $1 as message ${acc:-${mid:-?}}, but its message could not be read back (${why:-the call was stopped before the read-back answered})."
+    die "not proven delivered — do NOT send it again blind; look at the session first" 3
+  fi
+  note "session $1 did not take the prompt through its OpenCode server (${why:-no answer}); typing it into window $WID instead"
+  return 1
 }
 
 # --cancel: the waiter is what is being stopped, so a dead window is not an
