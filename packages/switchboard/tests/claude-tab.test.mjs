@@ -765,11 +765,15 @@ test('--reseat end to end: the prompt claims then retires, the launcher verifies
   await oldHolder();
   await newSeatTranscript();
   await seatActs();
-  const r = await tab(reseatArgs());
+  const r = await tab(reseatArgs(), { AGENT_CONFIG_HOME: stateDir });
   assert.equal(r.code, 0, r.err);
   const args = await fs.readFile(path.join(stateDir, 'launch-args'), 'utf8');
   assert.match(args, /--claim-role lead --take-over/);
   assert.match(args, new RegExp(`--retire ${OTHER_WID}`));
+  assert.ok(
+    args.includes(path.join(stateDir, 'skills', 'seat-refresh-restart', 'references', 'reseat-one-seat.md')),
+    'the reseat brief names the operator seat-reseat rules, under the config root',
+  );
   assert.doesNotMatch(args, /AGENT_SEAT_ROLE/, 'the explicit takeover replaces the env claim');
   assert.match(r.err, /reseat verified: role lead claimed, window \d+ retired/);
   assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${OTHER_WID}`));
@@ -1197,4 +1201,17 @@ test('a row with an unknown pid holds the slot while its window is live', async 
   const r = await tab(full());
   assert.equal(r.code, 1, r.err);
   assert.match(r.err, /holds the package-tab slot/);
+});
+
+// The slot read is the gate: a listing kitty did not give must stop the launch,
+// not come back empty and free a slot another seat may hold. The probe answers
+// (read 1); the slot's own fresh read (read 2) gets no answer.
+test('a slot read that gets no answer stops the launch (exit 2), rather than freeing the slot', async () => {
+  await fs.writeFile(path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid), `${OTHER_WID} ? @other-seat opencode: other\n`);
+  await session('claude-opus-5-5');
+  await fs.writeFile(path.join(stateDir, 'ls-fail-after'), '1');
+  const r = await tab(full());
+  assert.equal(r.code, 2, r.err);
+  assert.match(r.err, /cannot tell who holds the slot/);
+  assert.equal(await exists('launch-args'), false);
 });

@@ -80,6 +80,8 @@ before(async () => {
       'case "$1/$2" in',
       '  @/ls) [ -f "$state/nokitty" ] && exit 1',
       '        if [ -f "$state/ls-fail" ]; then echo "Error: dial unix ${KITTY_LISTEN_ON#unix:}: connect: no such file or directory" >&2; exit 1; fi',
+      // ls-fail-after N: the first N reads answer, every later one gets no answer.
+      '        if [ -f "$state/ls-fail-after" ]; then n=$(cat "$state/ls-count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$state/ls-count"; [ "$n" -gt "$(cat "$state/ls-fail-after")" ] && { echo "Error: Failed to connect: Connection refused" >&2; exit 1; }; fi',
       // ls-fail-after-launch: every read after the launch gets no answer.
       '        if [ -f "$state/ls-fail-after-launch" ] && [ -f "$state/launched" ]; then echo "Error: Failed to connect: Connection refused" >&2; exit 1; fi',
       '        if [ -f "$state/gone" ]; then echo "[]"; else printf \'%s\\n\' ' + JSON.stringify(lsJson) + '; fi ;;',
@@ -106,7 +108,7 @@ after(async () => {
 // Fresh store and state for each test; `session` rows are what opencode
 // writes when the TUI starts in a directory.
 beforeEach(async () => {
-  for (const f of ['launch-args', 'probe-calls', 'probe-session', 'session-calls', 'session-keep', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
+  for (const f of ['launch-args', 'probe-calls', 'probe-session', 'session-calls', 'session-keep', 'probe-fail', 'probe-hang', 'probe-402-rc0', 'closed', 'nokitty', 'gone', 'ls-fail', 'ls-fail-after', 'ls-count', 'claim-calls', 'claim-rc', 'presence.json', 'ls-fail-after-launch', 'launched', 'opencode-tab-launched.' + os.userInfo().uid]) {
     await fs.rm(path.join(stateDir, f), { force: true });
   }
   await fs.rm(db, { force: true });
@@ -393,6 +395,29 @@ test('--server takes a http(s) URL: a bare word is refused', async () => {
   const r = await tab([...full(), '--server', 'shared']);
   assert.equal(r.code, 1);
   assert.match(r.err, /--server takes a http\(s\) URL/);
+  assert.equal(await exists('launch-args'), false);
+});
+
+// The one-slot gate reads kitty fresh and treats "no answer" as a refusal.
+const holdSlot = () =>
+  fs.writeFile(path.join(stateDir, 'opencode-tab-launched.' + os.userInfo().uid), `${WID} ? @other-seat opencode: other\n`);
+
+test('a package tab is refused while another seat holds the slot', async () => {
+  await holdSlot();
+  const r = await tab(full());
+  assert.equal(r.code, 1, r.err);
+  assert.match(r.err, /holds the package-tab slot/);
+  assert.equal(await exists('launch-args'), false);
+});
+
+// The probe answers (read 1); the slot's own fresh read (read 2) gets no answer.
+// An empty answer must stop the launch, not come back as "the slot is free".
+test('a slot read that gets no answer stops the launch (exit 2), rather than freeing the slot', async () => {
+  await holdSlot();
+  await fs.writeFile(path.join(stateDir, 'ls-fail-after'), '1');
+  const r = await tab(full());
+  assert.equal(r.code, 2, r.err);
+  assert.match(r.err, /cannot tell who holds the slot/);
   assert.equal(await exists('launch-args'), false);
 });
 
