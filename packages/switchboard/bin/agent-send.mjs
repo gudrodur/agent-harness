@@ -699,7 +699,7 @@ const main = (argv) => {
       process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
       return exitAfterStdout(10);
     }
-    // The server took the prompt but the read-back did not find its message:
+    // The server took the prompt but the read-back did not find its item:
     // it may well be there, so this is the same do-not-resend verdict as a
     // typed send, pointed at the session instead of the window.
     if (found.state === 'delivered' && found.deliveredAs === 'apiUnproven') {
@@ -1176,9 +1176,12 @@ const main = (argv) => {
   // under load it does not answer at all while the session keeps running. The
   // server takes the text into the session's inbox (steer: before the agent's
   // next model call, and it starts a run on an idle session; queue: after the
-  // current work) and answers with the message it created, which the helper
-  // reads back as the proof. The mailbox row is written and closed at once, so
-  // the recipient's own drain cannot deliver the text a second time.
+  // current work) and answers with the item it created, which the helper reads
+  // back — from that inbox, then the message log it becomes once consumed. The
+  // beacon's pid is passed too, so a `--standalone` tab's own server is asked
+  // before the shared registry's, which only has the session's record. The
+  // mailbox row is written and closed at once, so the recipient's own drain
+  // cannot deliver the text a second time.
   //
   // A server that is not there is not an error: this falls through to the
   // mailbox and the kitty fallback exactly as before, and --verbose says which
@@ -1191,6 +1194,7 @@ const main = (argv) => {
     const budget = opencodeBudgetMs();
     const args = [opencodePrompt(), 'send', '--session', recipient.sessionId, '--delivery', delivery, '--timeout', String(budget)];
     if (recipient.cwd) args.push('--directory', recipient.cwd);
+    if (recipient.pid != null) args.push('--pid', String(recipient.pid));
     const r = spawnSync(process.execPath, args, { input: text, encoding: 'utf8', timeout: opencodeSpawnTimeoutMs(budget) });
     // The output is a stream: the entry prints an `accepted` line the moment
     // the server takes the prompt, then its final answer. If this process is
@@ -1234,7 +1238,7 @@ const main = (argv) => {
       to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery: (priority === 'queue' || priority === 'idle' ? 'queue' : 'steer'),
       messageId: messageId ?? null, unproven: true,
     });
-    process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as message ${messageId ?? '(no id)'} but reading it back failed (${why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
+    process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as item ${messageId ?? '(no id)'} but it could not be read back from the inbox or message log (${why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
     process.exit(3);
   };
   // Delivered, or exited with its own verdict; returns false to fall through.

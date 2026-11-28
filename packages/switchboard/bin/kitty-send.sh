@@ -747,6 +747,17 @@ opencode_tab_session() { # $1 = window id
   sid=$(printf '%s' "$js" | jq -r '.session // ""' 2>/dev/null)
   case "$sid" in opencode:?*) printf '%s' "$sid" ;; *) return 1 ;; esac
 }
+# The tab's own process, when its state names one: a `--standalone` client runs
+# a private server on the loopback, and that server is the one that holds the
+# session (see opencode_api_send). An unknown pid is simply no candidate.
+opencode_tab_pid() { # $1 = window id
+  local js pid
+  js=$(tab_state_json "$1" "${WREC:-}") || return 1
+  pid=$(printf '%s' "$js" | jq -r '.pid // 0' 2>/dev/null)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 0 ] || return 1
+  printf '%s' "$pid"
+}
 # The OpenCode prompt entry: the one place here that talks to a server.
 OPENCODE_PROMPT_JS="${AGENT_SWITCHBOARD_OPENCODE_PROMPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/opencode-prompt.mjs}"
 # Read the entry's JSON stream one line at a time. `-R` keeps a torn last line
@@ -759,19 +770,27 @@ stream_field() { # $1 = raw stream, $2 = jq filter over the parsed objects
 }
 # An OpenCode tab is reached through its own server first. The prompt enters the
 # session's inbox (`delivery=queue` after the current work, `steer` before the
-# next model call) and the server answers with the message it created, which the
-# entry reads back: that proof does not depend on the tab redrawing at all, and
-# a loaded machine that starves kitty cannot swallow the message. A machine with
-# no server configured, or one that does not answer, falls through to the typed
-# path, whose receipt is a new row in the tab's own store.
+# next model call) and the server answers with the item it created, which the
+# entry reads back from the inbox: that proof does not depend on the tab
+# redrawing at all, and a loaded machine that starves kitty cannot swallow the
+# message. A `--standalone` tab runs its own server, so the tab's own process is
+# named too and its loopback server is asked before the shared registry's. A
+# machine with no server configured, or one that does not answer, falls through
+# to the typed path, whose receipt is a new row in the tab's own store.
 # Exit 0 delivered; 3 the server took it but the read-back failed (never
 # resend blind); 1 nothing was sent through the server, so type instead.
 opencode_api_send() { # $1 = session id, $2 = steer|queue
   local out rc why mid acc api_ms
+  local args=(send --session "$1" --delivery "$2")
+  case "${OPENCODE_TAB_PID:-}" in
+    ''|*[!0-9]*) : ;;
+    *) args+=(--pid "$OPENCODE_TAB_PID") ;;
+  esac
   case "$TIMEOUT" in ''|*[!0-9]*) api_ms=15000 ;; *) api_ms=$(( TIMEOUT * 1000 )) ;; esac
   [ "$api_ms" -ge 1000 ] || api_ms=1000
+  args+=(--timeout "$api_ms")
   rc=0
-  out=$(printf '%s' "$TEXT" | node "$OPENCODE_PROMPT_JS" send --session "$1" --delivery "$2" --timeout "$api_ms" 2>/dev/null) || rc=$?
+  out=$(printf '%s' "$TEXT" | node "$OPENCODE_PROMPT_JS" "${args[@]}" 2>/dev/null) || rc=$?
   why=$(stream_field "$out" 'map(select(.phase != "accepted")) | last | .why // empty')
   mid=$(stream_field "$out" 'map(select(.phase != "accepted")) | last | .messageId // empty')
   # The entry prints an `accepted` line the moment the server takes the prompt,
@@ -787,11 +806,11 @@ opencode_api_send() { # $1 = session id, $2 = steer|queue
   # stream still carries the marker: the server took the prompt and only its id
   # is lost. That is the same do-not-resend case, never a fall-through to typing.
   if [ -z "$acc" ] && grep -q '"phase"[[:space:]]*:[[:space:]]*"accepted"' <<<"$out"; then
-    note "the OpenCode server took the prompt for session $1, but the accepted marker was torn and its message id is unreadable (${why:-the call was stopped before the read-back answered})."
+    note "the OpenCode server took the prompt for session $1, but the accepted marker was torn and its item id is unreadable (${why:-the call was stopped before the read-back answered})."
     die "not proven delivered — do NOT send it again blind; look at the session first" 3
   fi
   if [ "$rc" = 3 ] || [ -n "$acc" ]; then
-    note "the OpenCode server took the prompt for session $1 as message ${acc:-${mid:-?}}, but its message could not be read back (${why:-the call was stopped before the read-back answered})."
+    note "the OpenCode server took the prompt for session $1 as item ${acc:-${mid:-?}}, but it could not be read back from the session's inbox or message log (${why:-the call was stopped before the read-back answered})."
     die "not proven delivered — do NOT send it again blind; look at the session first" 3
   fi
   note "session $1 did not take the prompt through its OpenCode server (${why:-no answer}); typing it into window $WID instead"
@@ -854,6 +873,7 @@ fi
 # instead of a detached waiter polling a screen that may never redraw (a loaded
 # machine made those wait the whole 15 minutes and deliver nothing).
 if [ "$QUEUE" = 1 ] && oc=$(opencode_tab_session "$WID"); then
+  OPENCODE_TAB_PID=$(opencode_tab_pid "$WID" 2>/dev/null) || OPENCODE_TAB_PID=""
   opencode_api_send "${oc#opencode:}" queue || true
 fi
 
@@ -1048,7 +1068,7 @@ fi
 # proof below is skipped. Unknown (no link) keeps the echo proof, which is
 # the weaker proof — its verdict says so.
 TAB_SESSION=""; TAB_LINES=0; STATE_KNOWN=0
-OPENCODE_TAB=0; OPENCODE_SID=""; OPENCODE_HEAD=""
+OPENCODE_TAB=0; OPENCODE_SID=""; OPENCODE_TAB_PID=""; OPENCODE_HEAD=""
 # A Claude Code tab (see CLAUDE CODE TABS above) is asked first: tab-state
 # reports its status too, but the send proof below needs CLAUDE_TAB, which the
 # state branch does not set. Its transcript may not exist yet in a fresh
@@ -1074,6 +1094,8 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID" "$pre_rec"); then
         # file to look for. `lines` is the store's MAX(seq) before this send;
         # the proof below is a NEW type:user row past it.
         OPENCODE_TAB=1; OPENCODE_SID="${TAB_SESSION#opencode:}"; STATE_KNOWN=1
+        OPENCODE_TAB_PID=$(printf '%s' "$state_json" | jq -r '.pid // 0' 2>/dev/null)
+        case "$OPENCODE_TAB_PID" in ''|*[!0-9]*) OPENCODE_TAB_PID="" ;; esac
         OPENCODE_HEAD=$(printf '%s' "$TEXT" | cut -c1-40 | tr -d '[:space:]')
         # Its server first (see opencode_api_send): a prompt that needs no
         # screen read. Typing with the store-row proof is the fallback.

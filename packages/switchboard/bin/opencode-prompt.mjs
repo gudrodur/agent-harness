@@ -8,10 +8,19 @@
 // Usage:
 //   opencode-prompt.mjs send --session <id> [--directory <dir>]
 //                            [--delivery steer|queue] [--text <line>]
+//                            [--server <url>]... [--pid <pid>]
 //                            [--timeout <ms>]        (text may come on stdin)
 //   opencode-prompt.mjs active [--timeout <ms>]
 //   opencode-prompt.mjs sessions [--timeout <ms>]
 //   opencode-prompt.mjs --help
+//
+// A tab started with `--standalone` runs its own server and holds the session
+// there, while the shared registry's server only has the session's record.
+// `--server` names such a server (repeatable, tried in order) and `--pid` names
+// the tab's process, whose loopback listeners are tried first. Both are tried
+// before the registry, and the server that takes the prompt also answers the
+// read-back. A server that answers "no such session" hands the text to the
+// next one, so a stale candidate is not a failed delivery.
 //
 // Exit codes:
 //   0   send: delivered and read back. active/sessions: the answer is on stdout.
@@ -27,7 +36,8 @@
 //             read-back starts, so a caller that kills this process mid-proof
 //             can still see the text is in and must not send it again;
 //             then the final line:
-//             {"ok":true,"messageId":"...","delivery":"steer","session":"..."}
+//             {"ok":true,"messageId":"...","delivery":"steer","session":"...",
+//              "server":"http://127.0.0.1:<port>","proof":"inbox"|"message"}
 //             {"ok":false,"code":"unproven","messageId":"...","why":"..."}
 //             {"ok":false,"code":"not-found","why":"..."}
 //   active    {"ok":true,"running":["ses_..."]}
@@ -37,11 +47,12 @@
 // lib/opencode-server.mjs).
 
 import fs from 'node:fs';
-import { deliverPrompt, activeSessionIds, listSessions, isOpencodeSessionId } from '../lib/opencode-server.mjs';
+import { deliverPrompt, activeSessionIds, listSessions, isOpencodeSessionId, discoverServerUrls } from '../lib/opencode-server.mjs';
 
 const USAGE = `Usage:
   opencode-prompt.mjs send --session <id> [--directory <dir>]
                            [--delivery steer|queue] [--text <line>]
+                           [--server <url>]... [--pid <pid>]
                            [--timeout <ms>]
   opencode-prompt.mjs active [--timeout <ms>]
   opencode-prompt.mjs sessions [--timeout <ms>]
@@ -79,6 +90,8 @@ const main = async (argv) => {
   let delivery = 'steer';
   let text = null;
   let timeoutMs = 5000;
+  const servers = [];
+  let tabPid = null;
   while (rest.length > 0) {
     const a = rest.shift();
     const need = (name) => {
@@ -91,7 +104,15 @@ const main = async (argv) => {
     else if (a === '--delivery') delivery = need('--delivery');
     else if (a === '--text') text = need('--text');
     else if (a === '--timeout') timeoutMs = Number(need('--timeout'));
-    else die(`unknown argument: ${a}`);
+    else if (a === '--server') {
+      const url = need('--server').replace(/\/$/, '');
+      if (!/^https?:\/\/[^/]/.test(url)) die(`--server takes an http(s) URL, got: ${url}`);
+      servers.push(url);
+    } else if (a === '--pid') {
+      const pid = Number(need('--pid'));
+      if (!Number.isInteger(pid) || pid <= 0) die('--pid takes a positive process id');
+      tabPid = pid;
+    } else die(`unknown argument: ${a}`);
   }
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) die('--timeout must be a positive number of milliseconds');
 
@@ -115,18 +136,35 @@ const main = async (argv) => {
   const body = text ?? readStdin();
   if (body === '') die('send needs --text or text on stdin');
 
+  // The tab's own server first: it is the one that holds a standalone client's
+  // session. `--server` names are tried in the order given, after the ones
+  // found from the process tree (an explicit name is the caller's own belief,
+  // the loopback listener is what the tab actually holds). Discovery never
+  // throws: an unreadable /proc is simply no candidate, and the registry is
+  // used as before.
+  const candidates = [...servers];
+  if (tabPid != null) {
+    let found = [];
+    try {
+      found = discoverServerUrls(tabPid);
+    } catch {
+      found = [];
+    }
+    for (const url of found) if (!candidates.includes(url)) candidates.push(url);
+  }
+
   const r = await deliverPrompt({
-    sessionId: session, text: body, delivery, directory, timeoutMs,
+    sessionId: session, text: body, delivery, directory, timeoutMs, servers: candidates,
     onAccepted: ({ messageId }) => out({ ok: true, phase: 'accepted', messageId, delivery, session }),
   });
   if (r.ok) {
-    out({ ok: true, messageId: r.messageId, delivery: r.delivery, session });
-    process.stderr.write(`opencode-prompt: delivered to ${session} (message ${r.messageId}, ${r.delivery})\n`);
+    out({ ok: true, messageId: r.messageId, delivery: r.delivery, session, server: r.server ?? null, proof: r.proof ?? null });
+    process.stderr.write(`opencode-prompt: delivered to ${session} (item ${r.messageId}, ${r.delivery}, ${r.proof === 'inbox' ? 'in its inbox' : 'in its message log'}, ${r.server ?? 'the registry server'})\n`);
     return;
   }
   if (r.code === 'unproven') {
     out({ ok: false, code: 'unproven', messageId: r.messageId ?? null, why: r.why });
-    process.stderr.write(`opencode-prompt: the prompt reached ${session} but its message could not be read back (${r.why}); do not resend, look at the session\n`);
+    process.stderr.write(`opencode-prompt: the prompt reached ${session} but it could not be read back from the inbox or message log (${r.why}); do not resend, look at the session\n`);
     process.exit(3);
   }
   out({ ok: false, code: r.code ?? 'refused', why: r.why ?? 'the server refused the prompt' });

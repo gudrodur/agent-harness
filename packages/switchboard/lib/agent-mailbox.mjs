@@ -367,6 +367,11 @@ const recipientOf = (beacon, windowId) => ({
   sessionId: beacon.sessionId ?? null,
   windowId,
   beaconWindowId: beacon.windowId != null ? Number(beacon.windowId) : null,
+  // The seat's own client process when its beacon names one: a `--standalone`
+  // tab runs a private server, and this is where that server's port is found
+  // from (lib/opencode-server.mjs discoverServerUrls). The host identity is
+  // the client an OpenCode seat records; a legacy row may name only `pid`.
+  pid: [beacon.hostPid, beacon.pid].map(Number).find((p) => Number.isInteger(p) && p > 0) ?? null,
   // The classifier's verdict: the mailbox flag AND, where the row names an
   // out-of-band writer, that writer still being the recorded process.
   hasConsumer: liveConsumer(beacon),
