@@ -77,6 +77,7 @@ import {
   kittyWindows,
   recipientKey,
   findRecentTopicDelivery,
+  recordApiDelivery,
   recordTypedDelivery,
   supersedesNote,
   TOPIC_RE,
@@ -85,6 +86,7 @@ import {
 } from '../lib/agent-mailbox.mjs';
 import { claudeSessionsDir, procStat, switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
+import { isOpencodeSessionId, parsePromptStream } from '../lib/opencode-server.mjs';
 import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
@@ -258,6 +260,21 @@ const usage = () => `Usage:
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_SWITCHBOARD_SEND ?? path.join(HERE, 'kitty-send.sh');
+// The OpenCode prompt entry (`send` / `active`), the one place that talks to
+// an OpenCode server. A test seam, like AGENT_SEND_KITTY_SEND.
+const opencodePrompt = () => process.env.AGENT_SEND_OPENCODE_PROMPT ?? path.join(HERE, 'opencode-prompt.mjs');
+// The helper's TOTAL budget for the POST plus the read-back (never one each:
+// two bounds inside one parent kill is how a prompt gets sent twice), and the
+// bound on the helper process itself, which must sit above the budget so the
+// helper usually answers first. Either is overridable for a slow server.
+const opencodeBudgetMs = () => {
+  const v = Number(process.env.AGENT_SEND_OPENCODE_TIMEOUT_MS ?? 15000);
+  return Number.isFinite(v) && v >= 500 ? Math.floor(v) : 15000;
+};
+const opencodeSpawnTimeoutMs = (budget) => {
+  const v = Number(process.env.AGENT_SEND_OPENCODE_SPAWN_TIMEOUT_MS ?? NaN);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : budget + 5000;
+};
 // kitty-send.sh exit codes that mean NOTHING WAS SENT (its header's table):
 // 1 usage or precondition, 4 a dialog was open, 5 the idle wait ran out, 6 a
 // send is already queued, 7 mid-turn without --now/--queue/--wait-idle, 9
@@ -664,6 +681,13 @@ const main = (argv) => {
     }
     if (found.state === 'delivered' && found.deliveredAs === 'typedUnproven') {
       process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
+      return exitAfterStdout(10);
+    }
+    // The server took the prompt but the read-back did not find its message:
+    // it may well be there, so this is the same do-not-resend verdict as a
+    // typed send, pointed at the session instead of the window.
+    if (found.state === 'delivered' && found.deliveredAs === 'apiUnproven') {
+      process.stdout.write(`sent to the OpenCode server, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the session\n`);
       return exitAfterStdout(10);
     }
     if (found.state === 'delivered') {
@@ -1115,6 +1139,74 @@ const main = (argv) => {
     warnNoLiveSeats();
     process.exit(3);
   }
+  // An OpenCode seat is reached through its own server, the way its phone
+  // client reaches it, never through kitty: kitty needs the tab to redraw, and
+  // under load it does not answer at all while the session keeps running. The
+  // server takes the text into the session's inbox (steer: before the agent's
+  // next model call, and it starts a run on an idle session; queue: after the
+  // current work) and answers with the message it created, which the helper
+  // reads back as the proof. The mailbox row is written and closed at once, so
+  // the recipient's own drain cannot deliver the text a second time.
+  //
+  // A server that is not there is not an error: this falls through to the
+  // mailbox and the kitty fallback exactly as before, and --verbose says which
+  // of the two answered and why. --no-wait keeps its promise (one durable row,
+  // no call), and --read/--who/--status never come here.
+  const deliverThroughServer = () => {
+    if (noWait) return false;
+    if (!isOpencodeSessionId(recipient.sessionId)) return false;
+    const delivery = priority === 'queue' || priority === 'idle' ? 'queue' : 'steer';
+    const budget = opencodeBudgetMs();
+    const args = [opencodePrompt(), 'send', '--session', recipient.sessionId, '--delivery', delivery, '--timeout', String(budget)];
+    if (recipient.cwd) args.push('--directory', recipient.cwd);
+    const r = spawnSync(process.execPath, args, { input: text, encoding: 'utf8', timeout: opencodeSpawnTimeoutMs(budget) });
+    // The output is a stream: the entry prints an `accepted` line the moment
+    // the server takes the prompt, then its final answer. If this process is
+    // killed between them (a slow read-back against a fixed spawn bound), the
+    // accepted line is still there, and the text must NOT be delivered again.
+    const { final: answer, accepted } = parsePromptStream(r.stdout);
+    if (answer == null || answer.phase === 'accepted') {
+      if (accepted != null) {
+        recordUnproven(accepted.messageId, 'the server took the prompt but the read-back did not answer before the call was stopped');
+        return true; // not reached: recordUnproven exits
+      }
+      trace(`agent-send: ${recipient.sessionId} is an OpenCode session but its server answered nothing usable; falling back to the mailbox\n`);
+      return false;
+    }
+    // The server knows the session and took the prompt: it is delivered, or it
+    // is there and could not be read back. Either way the mailbox stays closed.
+    if (answer.ok === true && typeof answer.messageId === 'string') {
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const row = recordApiDelivery({
+        to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery, messageId: answer.messageId,
+      });
+      verdict(
+        `agent-send: delivered to ${to} through its OpenCode server (message ${answer.messageId}, ${delivery}; id ${row.id}; exit 0)\n`,
+        `agent-send: delivered to ${to}: POST /api/session/${recipient.sessionId}/prompt with delivery ${delivery} in ${recipient.cwd ?? '(no directory)'}, message ${answer.messageId} read back from the server; row ${row.id} in ${mailboxPath(recipient.key)} is closed as api (exit 0)\n`,
+      );
+      process.exit(0);
+    }
+    if (answer.code === 'unproven') {
+      recordUnproven(answer.messageId ?? accepted?.messageId ?? null, answer.why);
+      return true; // not reached: recordUnproven exits
+    }
+    trace(`agent-send: ${recipient.sessionId} was not delivered through its OpenCode server (${answer.code}: ${answer.why}); falling back to the mailbox\n`);
+    return false;
+  };
+  // A prompt the server accepted but could not be proven was delivered. The
+  // row is closed anyway: a resend could put the same text in the session
+  // twice, which is worse than an unproven line the reader can check.
+  const recordUnproven = (messageId, why) => {
+    const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+    const row = recordApiDelivery({
+      to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery: (priority === 'queue' || priority === 'idle' ? 'queue' : 'steer'),
+      messageId: messageId ?? null, unproven: true,
+    });
+    process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as message ${messageId ?? '(no id)'} but reading it back failed (${why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
+    process.exit(3);
+  };
+  // Delivered, or exited with its own verdict; returns false to fall through.
+  deliverThroughServer();
   if (!recipient.hasConsumer && recipient.mailboxOnly !== true) {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);

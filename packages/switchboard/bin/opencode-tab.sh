@@ -22,8 +22,9 @@
 #                  seconds, default 60). It costs a few tokens and a few seconds.
 #
 # Exit codes, the same table as claude-tab.sh:
-#   0  launched AND proven: presence beacon for the window, a new opencode
-#      session in --cwd, and that session's model is --model
+#   0  launched AND proven: a new opencode session in --cwd on --model, and a
+#      presence beacon for the window (the session's own if one appeared, else
+#      one this launcher records: session, window, client pid)
 #   1  precondition failed (bad args, relative path, missing file, slot held,
 #      the model's probe failed or hung)
 #   2  kitty remote control unavailable — CALLER MUST FALL BACK TO HEADLESS AND SAY SO
@@ -78,6 +79,30 @@ presence_json() {
     const { readAllPresence } = await import(process.argv[1]);
     console.log(JSON.stringify({ beacons: readAllPresence() }));
   ' "$PRESENCE_LIB"
+}
+# The tab's own presence beacon. A session on a shared server has no plugin of
+# its own in the client (the plugin runs in the server, which cannot see this
+# window), so before this the launcher's tabs were invisible to `agent-send
+# --who` and to every "another live session works here" warning, and the start
+# proof below waited for a beacon that never came. The launcher knows the three
+# facts a seat needs — the session, the window, the client process running in
+# it — so it records the row itself; a later tick from the session's writer
+# merges onto it and keeps the window (recordPresence's merge-only rule).
+# `host` is the client, not this script and not the server: it is what keeps a
+# parked row reachable.
+record_launch_beacon() { # $1 session id, $2 window id, $3 client pid
+  [ -n "$1" ] && [ -n "$3" ] || return 1
+  node --input-type=module -e '
+    const { recordPresence } = await import(process.argv[1]);
+    recordPresence({
+      cwd: process.argv[2],
+      sessionId: process.argv[3],
+      mailbox: true,
+      windowId: Number(process.argv[4]),
+      host: { pid: Number(process.argv[5]) },
+      hostProof: "launch",
+    });
+  ' "$PRESENCE_LIB" "$CWD" "$1" "$2" "$3" 2>/dev/null
 }
 PROBE_TIMEOUT="${OPENCODE_TAB_PROBE_TIMEOUT:-60}"
 
@@ -291,12 +316,25 @@ for _ in $(seq 1 45); do
     sed -i "/^$WID /d" "$STATE" 2>/dev/null || true
     die "window $WID exited before it was proven started — run $LAUNCH mini ${ATTACH[*]} --model $MODEL by hand to see why" 3
   fi
-  if [ "$beacon" = 0 ] && presence_json 2>/dev/null | jq -e --argjson w "$WID" '.beacons[] | select(.windowId == $w)' >/dev/null 2>&1; then
+  beacons=$(presence_json 2>/dev/null || true)
+  if [ "$beacon" = 0 ] && printf '%s' "$beacons" | jq -e --argjson w "$WID" '.beacons[] | select(.windowId == $w)' >/dev/null 2>&1; then
     beacon=1
   fi
   line=$(new_session)
-  if [ -n "$line" ]; then SESSION=${line%%$'\t'*}; GOT=${line#*$'\t'}; fi
-  [ "$beacon" = 1 ] && [ -n "$SESSION" ] && break
+  if [ -n "$line" ]; then
+    # A session another window's beacon already names is that tab's session,
+    # not this one's: two tabs opened in one cwd within a couple of seconds
+    # both see the same newest row.
+    cand=${line%%$'\t'*}
+    if printf '%s' "$beacons" | jq -e --arg s "$cand" --argjson w "$WID" \
+         '[.beacons[] | select(.sessionId == $s and .windowId != null and .windowId != $w)] | length == 0' >/dev/null 2>&1; then
+      SESSION=$cand; GOT=${line#*$'\t'}
+    fi
+  fi
+  # The session row is the proof of start; waiting for someone else's beacon
+  # for the full 90 s is what made a new tab look unstarted (and made the
+  # launch take 90 s) when nothing was ever going to write one.
+  [ -n "$SESSION" ] && break
 done
 
 printf 'WINDOW_ID=%s\n' "$WID"
@@ -306,12 +344,18 @@ if [ -n "$SESSION" ] && [ "$GOT" != "$WANT" ]; then
   close_it
   die "session $SESSION is on model $GOT but was launched as $MODEL — the window was closed at once." 3
 fi
-if [ "$beacon" = 1 ] && [ -n "$SESSION" ]; then
-  note "confirmed: presence beacon for window $WID, session $SESSION on $GOT"
+if [ -n "$SESSION" ]; then
+  if [ "$beacon" = 1 ]; then
+    note "confirmed: presence beacon for window $WID, session $SESSION on $GOT"
+  else
+    record_launch_beacon "$SESSION" "$WID" "$WPID" \
+      || note "could not record a presence beacon for session $SESSION; --who will not list this tab until the session writes one itself"
+    note "confirmed: session $SESSION on $GOT in window $WID (no beacon was there, so this launcher recorded one: session, window and client pid $WPID)"
+  fi
   printf 'SESSION=%s\n' "$SESSION"
   [ -n "$OUT" ] && printf 'OUT=%s\n' "$OUT"
   printf 'CLOSE_WITH=%s --close %s\n' "$0" "$WID"
   exit 0
 fi
-note "not proven within 90 s (beacon=$beacon session=${SESSION:-none}) — go look at window $WID before assuming it is working"
+note "not proven within 90 s (beacon=$beacon session=none) — go look at window $WID before assuming it is working"
 exit 3
