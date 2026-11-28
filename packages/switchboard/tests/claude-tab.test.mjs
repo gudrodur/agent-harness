@@ -953,7 +953,7 @@ test('--close --after-loka: free text saying "loka done" is not proof, the overs
   assert.equal(await exists('closed'), false);
 });
 
-test('--close --after-loka refuses a seat that holds a role, however finished it looks', async () => {
+test('--close --after-loka refuses a seat that claimed a role after its marker, however finished it looks', async () => {
   const { claimRole } = await import('../lib/seat-roles.mjs');
   await finishedSeat();
   await withStore((db) => claimRole(db, { role: 'overseer', sessionId: OLD_SESSION, cwd, windowId: OTHER_WID }));
@@ -961,6 +961,44 @@ test('--close --after-loka refuses a seat that holds a role, however finished it
   assert.equal(r.code, 24);
   assert.match(r.err, /holds a seat role/);
   assert.equal(await exists('closed'), false);
+});
+
+test('--close --after-loka releases the role the seat held when it sent its marker', async () => {
+  // The marker ends the claims it held (issue #91): a role claimed before it
+  // is not a reason to refuse, and the close leaves no finished holder behind.
+  const { claimRole, rolesForSession, seatClosed } = await import('../lib/seat-roles.mjs');
+  await windows();
+  await seatTranscript();
+  await withStore((db) => claimRole(db, { role: 'overseer', sessionId: OLD_SESSION, cwd, windowId: OTHER_WID, now: Date.now() - 30_000 }));
+  await lokaDone();
+  const r = await closeFinished();
+  assert.equal(r.code, 0, r.err);
+  const state = await withStore((db) => ({ held: rolesForSession(db, OLD_SESSION), closed: seatClosed(db, OLD_SESSION) }));
+  assert.deepEqual(state.held, []);
+  assert.ok(state.closed);
+});
+
+test('--close --after-loka is not refused by a role-store notice newer than the marker', async () => {
+  // A takeover notice is delivered mail, but it is bookkeeping: it does not
+  // make the finished seat "working again".
+  const { appendMessage, recipientKey } = await import('../lib/agent-mailbox.mjs');
+  await finishedSeat();
+  // The parent writes through the default store: pin it to the launcher's store
+  // for this row, as the other store fixtures in this file do.
+  process.env.AGENT_SWITCHBOARD_DB = dbFile();
+  try {
+    await appendMessage({
+      to: recipientKey({ cwd, sessionId: OLD_SESSION }),
+      from: 'role:lead',
+      priority: 'now',
+      roleEvent: true,
+      text: 'role lead was taken over by window 7 (session other)',
+    });
+  } finally {
+    delete process.env.AGENT_SWITCHBOARD_DB;
+  }
+  const r = await closeFinished();
+  assert.equal(r.code, 0, r.err);
 });
 
 test('--close --after-loka refuses a seat that holds a live resource lease (25), and closes once it is released or expired', async () => {
