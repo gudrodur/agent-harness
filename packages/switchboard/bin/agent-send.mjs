@@ -16,7 +16,9 @@
 // when kitty-send sends nothing the message goes back in the mailbox; both
 // exit 3. A recipient with no registered consumer
 // (beacon mailbox flag, set by the consumer hook each turn) falls through to
-// kitty-send.sh (resolved relative to this file) and says so on stderr; so does a window id or title with no
+// kitty-send.sh (resolved relative to this file) and says so on stderr; when the
+// recipient is a role, whose holder's mailbox key is known, a failed typing
+// attempt parks the row there instead (exit 3, pending). So does a window id or title with no
 // mailbox consumer behind it at all (a plain shell — the
 // supervisor steer path), while an ambiguous window stays a fatal error.
 // --stop is an alias of --now there; only a window that is not busy is typed
@@ -77,6 +79,7 @@ import {
   kittyWindows,
   recipientKey,
   findRecentTopicDelivery,
+  recordApiDelivery,
   recordTypedDelivery,
   supersedesNote,
   TOPIC_RE,
@@ -85,6 +88,7 @@ import {
 } from '../lib/agent-mailbox.mjs';
 import { claudeSessionsDir, procStat, switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
+import { isOpencodeSessionId, parsePromptStream } from '../lib/opencode-server.mjs';
 import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, SEAT_CLOSED, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
@@ -261,6 +265,21 @@ const usage = () => `Usage:
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_SWITCHBOARD_SEND ?? path.join(HERE, 'kitty-send.sh');
+// The OpenCode prompt entry (`send` / `active`), the one place that talks to
+// an OpenCode server. A test seam, like AGENT_SEND_KITTY_SEND.
+const opencodePrompt = () => process.env.AGENT_SEND_OPENCODE_PROMPT ?? path.join(HERE, 'opencode-prompt.mjs');
+// The helper's TOTAL budget for the POST plus the read-back (never one each:
+// two bounds inside one parent kill is how a prompt gets sent twice), and the
+// bound on the helper process itself, which must sit above the budget so the
+// helper usually answers first. Either is overridable for a slow server.
+const opencodeBudgetMs = () => {
+  const v = Number(process.env.AGENT_SEND_OPENCODE_TIMEOUT_MS ?? 15000);
+  return Number.isFinite(v) && v >= 500 ? Math.floor(v) : 15000;
+};
+const opencodeSpawnTimeoutMs = (budget) => {
+  const v = Number(process.env.AGENT_SEND_OPENCODE_SPAWN_TIMEOUT_MS ?? NaN);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : budget + 5000;
+};
 // kitty-send.sh exit codes that mean NOTHING WAS SENT (its header's table):
 // 1 usage or precondition, 4 a dialog was open, 5 the idle wait ran out, 6 a
 // send is already queued, 7 mid-turn without --now/--queue/--wait-idle, 9
@@ -680,6 +699,13 @@ const main = (argv) => {
       process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
       return exitAfterStdout(10);
     }
+    // The server took the prompt but the read-back did not find its message:
+    // it may well be there, so this is the same do-not-resend verdict as a
+    // typed send, pointed at the session instead of the window.
+    if (found.state === 'delivered' && found.deliveredAs === 'apiUnproven') {
+      process.stdout.write(`sent to the OpenCode server, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the session\n`);
+      return exitAfterStdout(10);
+    }
     if (found.state === 'delivered') {
       process.stdout.write(`delivered (at ${found.ackTs}, ${found.deliveredAs}${via})\n`);
       return exitAfterStdout(0);
@@ -948,10 +974,12 @@ const main = (argv) => {
   //
   // A --queue send types into the window, so it gets the same proof as the
   // mailbox path (typingVerdict, one function): without proof nothing is typed.
-  // With a mailbox key (`queueKey`, an idle seat) the text is queued there for
-  // the seat's own drain and the exit is 3; without one nothing is queued and
-  // the exit is 1, so the sender knows the message did not go.
-  const kittyFallback = (why, queueKey = null) => {
+  // With a mailbox key (`queueKey`, an idle seat or a role holder whose beacon
+  // has no consumer flag) the text is queued there for the seat's own drain and
+  // the exit is 3: for a --queue send always, for a role holder's row also when
+  // kitty-send sends nothing (`requeueOnNothing`, #77). Without a key nothing is
+  // queued and the exit is 1, so the sender knows the message did not go.
+  const kittyFallback = (why, queueKey = null, { requeueOnNothing = false } = {}) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     refuseEnding(t);
     // --no-wait only writes a mailbox row: never type, never wait on a proof.
@@ -964,7 +992,6 @@ const main = (argv) => {
       );
       process.exit(3);
     }
-    if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
     const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null, when = 'at its next prompt') => {
       if (queueKey == null) return false;
@@ -978,6 +1005,14 @@ const main = (argv) => {
       process.exit(3);
     };
     const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
+    // No window to type into is not a lost message when the seat's mailbox key
+    // is known: park it there and report it pending. Without a key there is
+    // nowhere to put it, so say so.
+    if (t == null) {
+      const noWindow = `${why}, and ${recipient?.role != null ? `role ${recipient.role}` : to} has no kitty window to fall back to`;
+      requeueForSeat(noWindow);
+      die(noWindow);
+    }
     // A typed fallback never lands on a busy seat: typing mid-turn discards the
     // tool result in flight. The busy marker is read from the window now, and a
     // busy seat gets the row in its mailbox, where its tool-boundary drain
@@ -1024,13 +1059,20 @@ const main = (argv) => {
     // (the proof just passed, so the seat is idle now): its verdict is the
     // sender's. A detached --queue waiter would answer exit 3 "do not resend"
     // and then, if its own late proof refused, lose the message with nobody told.
-    const st = runKittySend(why, t, text, null, { requeue: priority === 'queue', midTurnHeld: mode == null });
-    if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
+    const st = runKittySend(why, t, text, null, { requeue: (queueKey != null && (priority === 'queue' || requeueOnNothing)) || priority === 'queue', midTurnHeld: mode == null });
+    // A role holder's failed typing attempt loses nothing: its mailbox key is
+    // known, so the row parks there and the sender sees exit 3 (#77). Other
+    // sends keep kitty-send's verdict. The mid-turn case below has its own line.
+    const parksOnNothing = queueKey != null && (priority === 'queue' || requeueOnNothing);
+    if (KITTY_SENT_NOTHING.has(st) && !(st === 7 && mode == null)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
-      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st, `not typed: ${reason}`);
-      process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
-      if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
-      process.exit(exitOfKittySend(st));
+      if (parksOnNothing) requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st, `not typed: ${reason}`);
+      // requeue was true, so kitty-send's own line was held: print the verdict.
+      if (priority === 'queue') {
+        process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
+        if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
+        process.exit(exitOfKittySend(st));
+      }
     }
     // A bare send that kitty-send found mid-turn (exit 7, nothing sent) must not
     // be dropped and must not go with --now (the in-flight tool result would be
@@ -1129,9 +1171,81 @@ const main = (argv) => {
     warnNoLiveSeats();
     process.exit(3);
   }
+  // An OpenCode seat is reached through its own server, the way its phone
+  // client reaches it, never through kitty: kitty needs the tab to redraw, and
+  // under load it does not answer at all while the session keeps running. The
+  // server takes the text into the session's inbox (steer: before the agent's
+  // next model call, and it starts a run on an idle session; queue: after the
+  // current work) and answers with the message it created, which the helper
+  // reads back as the proof. The mailbox row is written and closed at once, so
+  // the recipient's own drain cannot deliver the text a second time.
+  //
+  // A server that is not there is not an error: this falls through to the
+  // mailbox and the kitty fallback exactly as before, and --verbose says which
+  // of the two answered and why. --no-wait keeps its promise (one durable row,
+  // no call), and --read/--who/--status never come here.
+  const deliverThroughServer = () => {
+    if (noWait) return false;
+    if (!isOpencodeSessionId(recipient.sessionId)) return false;
+    const delivery = priority === 'queue' || priority === 'idle' ? 'queue' : 'steer';
+    const budget = opencodeBudgetMs();
+    const args = [opencodePrompt(), 'send', '--session', recipient.sessionId, '--delivery', delivery, '--timeout', String(budget)];
+    if (recipient.cwd) args.push('--directory', recipient.cwd);
+    const r = spawnSync(process.execPath, args, { input: text, encoding: 'utf8', timeout: opencodeSpawnTimeoutMs(budget) });
+    // The output is a stream: the entry prints an `accepted` line the moment
+    // the server takes the prompt, then its final answer. If this process is
+    // killed between them (a slow read-back against a fixed spawn bound), the
+    // accepted line is still there, and the text must NOT be delivered again.
+    const { final: answer, accepted } = parsePromptStream(r.stdout);
+    if (answer == null || answer.phase === 'accepted') {
+      if (accepted != null) {
+        recordUnproven(accepted.messageId, 'the server took the prompt but the read-back did not answer before the call was stopped');
+        return true; // not reached: recordUnproven exits
+      }
+      trace(`agent-send: ${recipient.sessionId} is an OpenCode session but its server answered nothing usable; falling back to the mailbox\n`);
+      return false;
+    }
+    // The server knows the session and took the prompt: it is delivered, or it
+    // is there and could not be read back. Either way the mailbox stays closed.
+    if (answer.ok === true && typeof answer.messageId === 'string') {
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const row = recordApiDelivery({
+        to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery, messageId: answer.messageId,
+      });
+      verdict(
+        `agent-send: delivered to ${to} through its OpenCode server (message ${answer.messageId}, ${delivery}; id ${row.id}; exit 0)\n`,
+        `agent-send: delivered to ${to}: POST /api/session/${recipient.sessionId}/prompt with delivery ${delivery} in ${recipient.cwd ?? '(no directory)'}, message ${answer.messageId} read back from the server; row ${row.id} in ${mailboxPath(recipient.key)} is closed as api (exit 0)\n`,
+      );
+      process.exit(0);
+    }
+    if (answer.code === 'unproven') {
+      recordUnproven(answer.messageId ?? accepted?.messageId ?? null, answer.why);
+      return true; // not reached: recordUnproven exits
+    }
+    trace(`agent-send: ${recipient.sessionId} was not delivered through its OpenCode server (${answer.code}: ${answer.why}); falling back to the mailbox\n`);
+    return false;
+  };
+  // A prompt the server accepted but could not be proven was delivered. The
+  // row is closed anyway: a resend could put the same text in the session
+  // twice, which is worse than an unproven line the reader can check.
+  const recordUnproven = (messageId, why) => {
+    const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+    const row = recordApiDelivery({
+      to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery: (priority === 'queue' || priority === 'idle' ? 'queue' : 'steer'),
+      messageId: messageId ?? null, unproven: true,
+    });
+    process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as message ${messageId ?? '(no id)'} but reading it back failed (${why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
+    process.exit(3);
+  };
+  // Delivered, or exited with its own verdict; returns false to fall through.
+  deliverThroughServer();
   if (!recipient.hasConsumer && recipient.mailboxOnly !== true) {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
-    kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
+    // A role's holder is addressed through its mailbox, and the key is known
+    // even when its beacon says no consumer: park there rather than report a
+    // message that did not go (#77). A window target keeps its older contract,
+    // where a flag-off window means the text was not sent.
+    kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`, recipient.role != null ? recipient.key ?? null : null, { requeueOnNothing: recipient.role != null });
   }
   // Where the row would be typed if nobody drains it.
   const target = recipient.windowId ?? recipient.beaconWindowId ?? (/__/.test(to) || recipient.role != null ? null : to);

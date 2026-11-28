@@ -219,6 +219,41 @@ test('a send to a role whose holder is idle wakes the holder window instead of q
   assert.equal(readUnacked('role:idle-role', {}).length, 0);
 });
 
+// A role holder whose beacon says no mailbox consumer: a session whose mailbox
+// library did not load writes exactly this shape. Its mailbox key is known, so
+// a message that cannot be typed is parked there, never reported as not sent.
+const kittySendDown = () => {
+  const stub = path.join(tmp, 'kitty-send-down');
+  fs.writeFileSync(stub, '#!/usr/bin/env bash\nexit 12\n', { mode: 0o755 });
+  return stub;
+};
+test('a role holder with a window and no mailbox flag parks the row in its own mailbox (exit 3)', async () => {
+  const { claimRole } = await roles();
+  beacon('flagoff-1', '/r/flagoff', { windowId: 420, mailbox: false });
+  await withDb((db) => claimRole(db, { role: 'flagoff-window', sessionId: 'flagoff-1', cwd: '/r/flagoff', windowId: 420 }));
+  const key = recipientKey({ cwd: '/r/flagoff', sessionId: 'flagoff-1' });
+  const r = send(['--to', 'role:flagoff-window', '--text', 'flag off hello'], { AGENT_SEND_KITTY_SEND: kittySendDown() });
+  assert.equal(r.status, 3, r.stderr);
+  const rows = readUnacked(key, {});
+  assert.equal(rows.length, 1, `one row for the holder's key: ${r.stderr}`);
+  assert.equal(rows[0].text, 'flag off hello');
+  assert.doesNotMatch(r.stderr, /nothing is queued/);
+});
+
+test('a role holder with no mailbox flag and no window at all also parks the row (exit 3)', async () => {
+  // No window: the old code died at "has no kitty window to fall back to".
+  const { claimRole } = await roles();
+  beacon('flagoff-2', '/r/flagoff2', { mailbox: false });
+  await withDb((db) => claimRole(db, { role: 'flagoff-nowindow', sessionId: 'flagoff-2', cwd: '/r/flagoff2' }));
+  const key = recipientKey({ cwd: '/r/flagoff2', sessionId: 'flagoff-2' });
+  const r = send(['--to', 'role:flagoff-nowindow', '--text', 'nowhere to type'], { AGENT_SEND_KITTY_SEND: kittySendDown() });
+  assert.equal(r.status, 3, r.stderr);
+  const rows = readUnacked(key, {});
+  assert.equal(rows.length, 1, `one row for the holder's key: ${r.stderr}`);
+  assert.equal(rows[0].text, 'nowhere to type');
+  assert.match(r.stderr, /no kitty window to fall back to/);
+});
+
 test('--claim-role refuses a live holder: exit 11, names the window, holder unchanged', async () => {
   const holderWindow = 420;
   const claimerWindow = 430;

@@ -285,6 +285,12 @@ test('--watch reports an opencode tab\'s transitions from opencode.db', async ()
   try {
     await new Promise((r) => setTimeout(r, 2500));
     const db = new DatabaseSync(file);
+    // The watch child reads this same file every second. Without a busy
+    // timeout a commit that meets its read lock throws SQLITE_BUSY ("database
+    // is locked") instead of waiting, which made this test flake under CI load
+    // (observed on a9d4881, not reproducible locally): the transition it is
+    // asserting never got written.
+    db.exec('PRAGMA busy_timeout = 10000');
     db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)')
       .run('m-99', OC_SID, 'assistant', 20, Date.now(), Date.now(), JSON.stringify(ocAssistant(20, Date.now(), 'shell').data));
     db.close();

@@ -22,3 +22,7 @@ process.env.XDG_STATE_HOME = path.join(isolateDir, 'xdg');
 // the next read to see it. A test of the cache sets its own TTL.
 process.env.AGENT_KITTY_LS_DIR = path.join(isolateDir, 'kitty-ls');
 process.env.AGENT_KITTY_LS_TTL_MS = '0';
+// The OpenCode server registry is pinned at a path that does not exist, so no
+// test can reach the machine's live server through its real config registry: a
+// test of the API route points this at its own registry beside its stub server.
+process.env.AGENT_SWITCHBOARD_OPENCODE_SERVICE = path.join(isolateDir, 'no-opencode-service.json');

@@ -28,6 +28,7 @@ import { AGENT_COMM_NAMES, PRESENCE_FILE, PRESENCE_STALE_MS, classifyBeacons, pr
 
 export { AGENT_COMM_NAMES };
 import { kittyLs, kittyKnownDown, kittyDownMessage } from './kitty-ls.mjs';
+import { isOpencodeSessionId } from './opencode-server.mjs';
 import { defaultStorePath, withRetriedStore, pruneRetention } from './store.mjs';
 import { markerSessionFor } from './loka-marker.mjs';
 import { sanitizeSessionId } from './session-id.mjs';
@@ -57,11 +58,12 @@ export const PRIORITIES = ['now', 'stop', 'idle', 'queue'];
 
 // Delivery labels consumers write in the ack row's deliveredAs. Closed set:
 // prompt (mailbox-inject hook), tool (mailbox-tool hook), stop (mailbox-stop hook), mcp (read_inbox), typed (kitty fallback),
-// steer / followUp / nextTurn (kept for rows written by earlier consumers;
-// no remaining consumer writes them). ack() stays fail-open: an unknown
-// label is still written, so a new consumer can never lose a message by
+// api (the sender's own call to an OpenCode server, proven by reading the
+// message back), steer / followUp / nextTurn (kept for rows written by earlier
+// consumers; no remaining consumer writes them). ack() stays fail-open: an
+// unknown label is still written, so a new consumer can never lose a message by
 // naming a label this list does not know yet.
-export const DELIVERED_AS = Object.freeze(['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed', 'typedUnproven']);
+export const DELIVERED_AS = Object.freeze(['prompt', 'tool', 'stop', 'mcp', 'steer', 'followUp', 'nextTurn', 'typed', 'typedUnproven', 'api', 'apiUnproven']);
 
 // SQLite backend (steps 1-2): an explicit {dir} override always means JSONL
 // files (the path every existing test exercises). Without one, an explicit
@@ -745,10 +747,42 @@ const branchOf = (b) => {
   }
 };
 
+// The sessions an OpenCode server is running right now, asked at most once per
+// few seconds per process (a listing names a seat once, but a hook may list
+// twice in a turn). Empty when there is no server to ask: the beacon and the
+// window stay the only word then.
+const OPENCODE_ACTIVE_TTL_MS = 5000;
+let opencodeActive = { at: 0, ids: new Set() };
+export const resetOpencodeLivenessCache = () => { opencodeActive = { at: 0, ids: new Set() }; };
+const opencodeRunningIds = () => {
+  if (Date.now() - opencodeActive.at < OPENCODE_ACTIVE_TTL_MS) return opencodeActive.ids;
+  const ids = new Set();
+  let at = Date.now();
+  try {
+    const helper = fileURLToPath(new URL('../bin/opencode-prompt.mjs', import.meta.url));
+    const text = execFileSync(process.execPath, [helper, 'active'], {
+      encoding: 'utf8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const parsed = JSON.parse(text);
+    if (parsed?.ok === true && Array.isArray(parsed.running)) for (const id of parsed.running) ids.add(id);
+  } catch {
+    // No server (or it did not answer): nothing to add, and the answer is
+    // cached for the TTL too, so a call per seat does not become a call storm.
+    at = Date.now();
+  }
+  opencodeActive = { at, ids };
+  return ids;
+};
+
 // Live seats: one entry per live presence beacon, joined with the roles it
 // holds and its kitty window title (tolerates kitty being absent). Built from
 // the classified rows: dead and superseded rows never appear, and each seat
 // carries `state` (fresh | idle-live | legacy-idle) and `verified`.
+//
+// An OpenCode seat's liveness is its server's word, not its window's or its
+// beacon's: a session the server reports running is alive and is listed as
+// live, however stale the beacon is or however long its client has been
+// unable to redraw. Its `serverRunning` flag says the server answered.
 export const listSeats = ({ presenceFile, wins = kittyWindows(), agentWindows = undefined } = {}) => {
   const all = readPresenceBeacons({ presenceFile, includeStale: true });
   const beacons = [
@@ -756,6 +790,12 @@ export const listSeats = ({ presenceFile, wins = kittyWindows(), agentWindows = 
     ...idleOf(all, { wins, agentWindows }),
   ];
   const holders = readRoleHolders();
+  let opencodeIds = null;
+  const serverRunning = (sessionId) => {
+    if (!isOpencodeSessionId(sessionId)) return false;
+    if (opencodeIds == null) opencodeIds = opencodeRunningIds();
+    return opencodeIds.has(sessionId);
+  };
   // One row per seat: a beacon recorded in a subdirectory of a checkout is the
   // same seat as one at its root, so rows with the same session id and git
   // toplevel collapse into one, keeping the freshest fields.
@@ -787,6 +827,7 @@ export const listSeats = ({ presenceFile, wins = kittyWindows(), agentWindows = 
       const sha = gitOut(root, ['rev-parse', '--short', 'HEAD']);
       if (sha) branch = `HEAD@${sha}`;
     }
+    const running = serverRunning(b.sessionId);
     return {
       windowId: winId != null ? Number(winId) : null,
       sessionId: b.sessionId ?? null,
@@ -796,9 +837,10 @@ export const listSeats = ({ presenceFile, wins = kittyWindows(), agentWindows = 
       roles: holders.filter((h) => h.session_id === b.sessionId).map((h) => h.role),
       title: win ? (win.title || win.tabTitle || '') : null,
       mailbox: group.some((x) => x.mailbox === true),
-      state: group.some((x) => x.state === 'fresh') ? 'fresh' : b.state,
+      state: running ? 'fresh' : group.some((x) => x.state === 'fresh') ? 'fresh' : b.state,
       verified: group.some((x) => x.verified === true),
-      ...(group.every((x) => x.idleMs != null) ? { idleMinutes: idleMinutes({ idleMs: Math.min(...group.map((x) => x.idleMs)) }) } : {}),
+      ...(running ? { serverRunning: true } : {}),
+      ...(!running && group.every((x) => x.idleMs != null) ? { idleMinutes: idleMinutes({ idleMs: Math.min(...group.map((x) => x.idleMs)) }) } : {}),
       key: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }),
     };
   });
@@ -859,7 +901,7 @@ export const formatInboxLines = (found) =>
 
 export const TOPIC_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-export const appendMessage = ({ to, from, priority, text, topic, via, id, replaces, roleEvent, now = Date.now(), dir } = {}) => {
+export const appendMessage = ({ to, from, priority, text, topic, via, id, replaces, roleEvent, now = Date.now(), dir, extra = null } = {}) => {
   if (!PRIORITIES.includes(priority)) throw new Error(`priority must be one of ${PRIORITIES.join('|')}, got '${priority}'`);
   if (topic != null && !TOPIC_RE.test(topic)) throw new Error(`topic must match ${TOPIC_RE}, got '${topic}'`);
   const row = {
@@ -875,6 +917,9 @@ export const appendMessage = ({ to, from, priority, text, topic, via, id, replac
   // event, not mail: it is delivered, but it is not the recipient "working
   // again" after its LOKA-DONE marker (bin/seat-finished.mjs).
   if (roleEvent === true) row.roleEvent = true;
+  // Sender-specific facts a reader may want (the delivery mode and message id
+  // of an API send). Not interpreted by the store.
+  if (extra != null && typeof extra === 'object') Object.assign(row, extra);
   // The row this one stands in for after the sender withdrew it (a re-queue or
   // the typed fallback), so --status on the old id can follow to the live row.
   if (replaces != null) row.replaces = replaces;
@@ -930,7 +975,9 @@ const appendRow = (key, kind, row, dir) => {
   fs.appendFileSync(mailboxPath(key, { dir }), `${JSON.stringify(row)}\n`);
 };
 
-const readRows = (key, { dir } = {}) => {
+// Every row for a mailbox key, message rows and acks in the order written: the
+// read view a status or a test needs (the store's own name for it).
+export const readRows = (key, { dir } = {}) => {
   if (useMailboxDb(dir)) return withMailboxDb((store) => dbReadRows(store, key));
   let text;
   try {
@@ -1141,6 +1188,22 @@ export const recordTypedDelivery = ({ to, from, priority, text, topic, id, repla
   // all the same (a mailbox copy would deliver it twice); the marker keeps
   // --status from calling it delivered.
   ack({ key: to, id: row.id, deliveredAs: unproven ? 'typedUnproven' : 'typed', now, dir });
+  return row;
+};
+
+// A delivery the sender made itself through an OpenCode server's API. Same
+// shape and the same reason as recordTypedDelivery: the row is closed at once
+// so the recipient's mailbox drain does not deliver the text a second time,
+// while --status and the same-topic check still see that this delivery
+// happened. `unproven` means the server took the prompt but the read-back did
+// not find its message: the row is closed anyway (a resend risks a duplicate)
+// and the marker keeps --status from calling it delivered.
+export const recordApiDelivery = ({ to, from, priority, text, topic, id, replaces, unproven = false, delivery = null, messageId = null, now = Date.now(), dir } = {}) => {
+  const extra = {};
+  if (delivery != null) extra.delivery = delivery;
+  if (messageId != null) extra.messageId = messageId;
+  const row = appendMessage({ to, from, priority, text, topic, via: 'api', id, replaces, now, dir, extra });
+  ack({ key: to, id: row.id, deliveredAs: unproven ? 'apiUnproven' : 'api', now, dir });
   return row;
 };
 
