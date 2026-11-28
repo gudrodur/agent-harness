@@ -230,17 +230,21 @@ test('a torn stream after the accepted line is exit 3, not 5, and nothing is typ
   assert.equal(await typed(), false, 'a torn stream must never fall through to typing');
 });
 
-test('a torn accepted line is a fall-through, never jq\'s exit status as the script\'s', async () => {
-  // The id is unreadable, so nothing can be proven and the typed path is right.
+test('a torn accepted marker is not typed again', async () => {
+  // The tear falls inside the accepted line, so the id is unreadable but the
+  // marker is there: the server took the prompt. Typing it now would deliver
+  // the text twice, so this is the same "do NOT resend" case as a whole marker.
   // What must never happen is this script exiting 5: that is jq's parse-error
   // status, and agent-send counts 5 as "nothing was sent" and queues the text,
   // which would deliver it twice. The read is tolerant, so a tear inside the
-  // marker is simply "no id", not a fatal status.
+  // marker is simply "no id", never a fatal status.
   const entry = await writeEntry('{"ok":true,"phase":"accepted","messageI\n', 5);
   const r = await send(['--to', WID, '--text', 'nothing provable', '--timeout', '3'], { AGENT_SWITCHBOARD_OPENCODE_PROMPT: entry });
   assert.notEqual(r.code, 5, `a jq tear must not become the script's exit: ${r.out}${r.err}`);
-  assert.match(r.err, /typing it into window/);
-  assert.equal(await typed(), true);
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
+  assert.match(r.err, /torn and its message id is unreadable/);
+  assert.match(r.err, /do NOT send it again blind/);
+  assert.equal(await typed(), false, 'a torn accepted marker must never fall through to typing');
 });
 
 test('a stream with no accepted line is a genuine nothing-sent, and the typed path runs', async () => {

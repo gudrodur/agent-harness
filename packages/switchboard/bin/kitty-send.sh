@@ -783,6 +783,13 @@ opencode_api_send() { # $1 = session id, $2 = steer|queue
       note "delivered to session $1 through its OpenCode server (message ${mid:-?}, delivery $2); nothing was typed into the tab"
       exit 0 ;;
   esac
+  # A tear can fall inside the accepted line itself, so `acc` is empty while the
+  # stream still carries the marker: the server took the prompt and only its id
+  # is lost. That is the same do-not-resend case, never a fall-through to typing.
+  if [ -z "$acc" ] && grep -q '"phase"[[:space:]]*:[[:space:]]*"accepted"' <<<"$out"; then
+    note "the OpenCode server took the prompt for session $1, but the accepted marker was torn and its message id is unreadable (${why:-the call was stopped before the read-back answered})."
+    die "not proven delivered — do NOT send it again blind; look at the session first" 3
+  fi
   if [ "$rc" = 3 ] || [ -n "$acc" ]; then
     note "the OpenCode server took the prompt for session $1 as message ${acc:-${mid:-?}}, but its message could not be read back (${why:-the call was stopped before the read-back answered})."
     die "not proven delivered — do NOT send it again blind; look at the session first" 3
