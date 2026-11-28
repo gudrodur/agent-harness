@@ -65,7 +65,10 @@ before(async () => {
     `transcript=${JSON.stringify(transcript)}`,
     'row() { jq -cn --arg t "$1" \'{type:"user",message:{role:"user",content:$t}}\' >> "$transcript"; }',
     'case "$1/$2" in',
-    `  @/ls) if [ -f "$state/nonclaude" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed 's/"cmdline":\\["claude"\\]/"cmdline":["pi"]/'; elif [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
+    // title_after_send: the title the live window shows once keystrokes have
+    // gone out (a turn starts), so a read after `sent` must not be served the
+    // title the window had before the send.
+    `  @/ls) if [ -f "$state/nonclaude" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed 's/"cmdline":\\["claude"\\]/"cmdline":["pi"]/'; elif [ -f "$state/title_after_send" ] && [ -f "$state/sent" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title_after_send")/"; elif [ -f "$state/title" ]; then printf '%s\\n' ${JSON.stringify(lsJson)} | sed "s/✳ Claude Code/$(cat "$state/title")/"; else printf '%s\\n' ${JSON.stringify(lsJson)}; fi ;;`,
     '  @/send-text)',
     '    text="${@: -1}"',
     '    [ -f "$state/sent" ] || cat "$state/reads" > "$state/sent_at" 2>/dev/null',
@@ -117,7 +120,7 @@ after(async () => {
 });
 
 const reset = async (mode, status = 'idle') => {
-  for (const f of ['calls', 'composer', 'eat', 'title', 'screen', 'screen_dyn', 'dialog_after_send', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude', 'after_text', 'after_enter', 'waiting_at']) await fs.rm(path.join(stateDir, f), { force: true });
+  for (const f of ['calls', 'composer', 'eat', 'title', 'title_after_send', 'screen', 'screen_dyn', 'dialog_after_send', 'screen_late', 'late_at', 'reads', 'sent', 'nonclaude', 'after_text', 'after_enter', 'waiting_at']) await fs.rm(path.join(stateDir, f), { force: true });
   await fs.writeFile(path.join(stateDir, 'mode'), mode);
   await fs.writeFile(transcript, '{"type":"user","message":{"role":"user","content":"an earlier prompt"}}\n');
   await fs.writeFile(
@@ -808,6 +811,28 @@ test('no extra Enter once the title shows a running turn (the command was submit
   const r = await runScript(['--to', WID, '--text', '/rename x', '--now', '--timeout', '3']);
   assert.notEqual(r.code, 16, `${r.out}${r.err}`);
   assert.deepEqual(await calls(), ['burst']);
+});
+
+// The spinner read decides whether a second Enter is sent, so it reads fresh:
+// with the cache on, a title cached before the send shows no spinner and the
+// second Enter must still be withheld. Reverting `fresh` on that read passes
+// every other test and fails this one.
+test('the spinner read is fresh: a title cached before the send does not hide the running turn', async () => {
+  const ttl = { AGENT_KITTY_LS_TTL_MS: '60000' };
+  const KITTY_LS = fileURLToPath(new URL('../lib/kitty-ls.mjs', import.meta.url));
+  const primeEnv = isolatedEnv({ ...ttl, PATH: `${binDir}:${process.env.PATH}`, XDG_RUNTIME_DIR: stateDir, KITTY_WINDOW_ID: WID });
+  await live('never');
+  // --fresh: replace any entry an earlier test in this file left cached.
+  const primed = await run(process.execPath, [KITTY_LS, '--match', `id:${WID}`, '--fresh'], { env: primeEnv });
+  assert.doesNotMatch(primed.stdout, /⠋/, 'the cache holds the idle title');
+  await put('title_after_send', '⠋ Claude Code');
+  // The cache still answers the idle title: the fresh read after the send is
+  // what must see the spinner, not the cache.
+  const cached = await run(process.execPath, [KITTY_LS, '--match', `id:${WID}`], { env: primeEnv });
+  assert.match(cached.stdout, /✳ Claude Code/, 'a non-fresh read is served from the cache');
+  const r = await runScript(['--to', WID, '--text', '/rename x', '--now', '--timeout', '3'], ttl);
+  assert.notEqual(r.code, 16, `${r.out}${r.err}`);
+  assert.deepEqual(await calls(), ['burst'], `no extra Enter: the fresh title shows the turn already runs. ${r.out}${r.err}`);
 });
 
 test('a tab that is not Claude Code gets no extra Enter', async () => {

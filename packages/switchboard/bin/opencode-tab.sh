@@ -172,7 +172,10 @@ LAUNCHER=$(printf '%s' "$LAUNCHER" | tr -d ' \t\r\n@')
 # The one-slot gate: tab_ledger_slot_holders (lib/tab-ledger.sh).
 BRIEF_REF="brief:$(basename "$BRIEF")"
 if [ -z "$SLOT_OVERRIDE" ]; then
-  holders=$(tab_ledger_slot_holders)
+  # The read runs in a subshell, so its own die (exit 2) leaves only the
+  # subshell: without this, an unanswered read came back empty and the launch
+  # went ahead with no slot check.
+  holders=$(tab_ledger_slot_holders) || exit $?
   [ -z "$holders" ] || die "another seat holds the package-tab slot — nothing launched.
         live tab(s): $holders
         Re-run with --slot-override \"<reason>\" only when the overlap is deliberate."

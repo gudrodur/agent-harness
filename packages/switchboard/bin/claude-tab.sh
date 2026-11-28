@@ -273,7 +273,10 @@ BRIEF_REF="brief:$(basename "${BRIEF:-none}")"
 if [ "$SEAT" = 1 ]; then
   : # a seat is not a package tab: it neither checks nor holds the slot
 elif [ -z "$SLOT_OVERRIDE" ]; then
-  holders=$(tab_ledger_slot_holders)
+  # The read runs in a subshell, so its own die (exit 2) leaves only the
+  # subshell: without this, an unanswered read came back empty and the launch
+  # went ahead with no slot check.
+  holders=$(tab_ledger_slot_holders) || exit $?
   [ -z "$holders" ] || die "another seat holds the package-tab slot — nothing launched.
         live tab(s): $holders
         Re-run with --slot-override \"<reason>\" only when the overlap is deliberate."
@@ -302,7 +305,11 @@ if [ -n "$RESEAT" ]; then
   # the window from its own environment, not this one's.
   PIN=""
   [ -n "${AGENT_SWITCHBOARD_DB:-}" ] && PIN="AGENT_SWITCHBOARD_DB=$(printf '%q' "$AGENT_SWITCHBOARD_DB") "
-  MSG="This tab replaces the seat in window $RESEAT (claude-tab.sh --reseat${RC_NAME:+, Remote Control \"$RC_NAME\"}). Before anything else run these two commands in order and read their output: 1) ${PIN}node $HERE/agent-send.mjs --claim-role $ROLE --take-over   2) ${PIN}$HERE/claude-tab.sh --retire $RESEAT   The second closes the old window and refuses, with an exit code and a reason, when closing it is not safe: report that reason and do not close the window another way."
+  # The operator's reseat rules, under the same config root as the other files
+  # the briefs name: a fresh seat that has not run a reseat learns them the hard
+  # way (four avoidable mistakes on 2026-11-27).
+  RESEAT_RULES="$(config_root)/skills/seat-refresh-restart/references/reseat-one-seat.md"
+  MSG="This tab replaces the seat in window $RESEAT (claude-tab.sh --reseat${RC_NAME:+, Remote Control \"$RC_NAME\"}). Before anything else run these two commands in order and read their output: 1) ${PIN}node $HERE/agent-send.mjs --claim-role $ROLE --take-over   2) ${PIN}$HERE/claude-tab.sh --retire $RESEAT   The second closes the old window and refuses, with an exit code and a reason, when closing it is not safe: report that reason and do not close the window another way. Then read $RESEAT_RULES, the operator's rules for handing one seat to a fresh tab, and follow them."
   if [ -n "$BRIEF" ]; then MSG="$MSG Then read $BRIEF and carry it out in full."
   else MSG="$MSG Then reply with one line saying you are ready, then wait for instructions."; fi
 elif [ -n "$BRIEF" ]; then
