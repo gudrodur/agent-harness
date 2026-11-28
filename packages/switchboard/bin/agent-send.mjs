@@ -142,9 +142,14 @@ const usage = () => `Usage:
                 no dialog, empty prompt line) when you send, or later, gets
                 it typed in once it has been idle AGENT_SEND_IDLE_WAIT_S
                 (default 5 s); exit 0. Without that proof nothing is typed
-                and one line says why. A
-                recipient mid-turn keeps the row queued and takes it at its
-                next tool call or when the turn ends. So --queue is safe to
+                and one line says why. A Claude Code recipient mid-turn keeps
+                the row queued and takes it at its next tool call or when the
+                turn ends. An OpenCode seat is reached through its server
+                instead: a steer, delivered before the agent's next model call
+                even mid-turn, and any backlog the inbox still holds as queue
+                goes as ONE combined note carrying each note and the time it
+                was queued (a seat looping inside one turn never ends it, which
+                is how window 3 held 18 notes on 2026-11-28). So --queue is safe to
                 send to an idle seat. The wait is unbounded unless --deadline
                 caps it, and a recipient with no kitty window to read waits
                 for its own drain
@@ -223,7 +228,9 @@ const usage = () => `Usage:
     0   delivered: acked in the mailbox, or kitty-send proved the text landed
     3   pending, do not resend: queued in the mailbox for the consumer (a
         Claude Code seat drains it at its next tool call, its next prompt
-        or when its current turn ends; a window showing the busy marker is
+        or when its current turn ends; an OpenCode seat is steered through
+        its own server before its next model call instead, so a turn that
+        never ends does not hold it; a window showing the busy marker is
         never typed into, whatever the mode, so its row stays queued),
         re-queued after kitty-send sent nothing, a kitty --queue waiter
         started (its verdict lands in the queue log), or kitty-send sent it
@@ -699,7 +706,7 @@ const main = (argv) => {
       process.stdout.write(`typed, delivery unproven (at ${found.ackTs}${via}); do not resend, look at the window\n`);
       return exitAfterStdout(10);
     }
-    // The server took the prompt but the read-back did not find its message:
+    // The server took the prompt but the read-back did not find its item:
     // it may well be there, so this is the same do-not-resend verdict as a
     // typed send, pointed at the session instead of the window.
     if (found.state === 'delivered' && found.deliveredAs === 'apiUnproven') {
@@ -1176,9 +1183,12 @@ const main = (argv) => {
   // under load it does not answer at all while the session keeps running. The
   // server takes the text into the session's inbox (steer: before the agent's
   // next model call, and it starts a run on an idle session; queue: after the
-  // current work) and answers with the message it created, which the helper
-  // reads back as the proof. The mailbox row is written and closed at once, so
-  // the recipient's own drain cannot deliver the text a second time.
+  // current work) and answers with the item it created, which the helper reads
+  // back — from that inbox, then the message log it becomes once consumed. The
+  // beacon's pid is passed too, so a `--standalone` tab's own server is asked
+  // before the shared registry's, which only has the session's record. The
+  // mailbox row is written and closed at once, so the recipient's own drain
+  // cannot deliver the text a second time.
   //
   // A server that is not there is not an error: this falls through to the
   // mailbox and the kitty fallback exactly as before, and --verbose says which
@@ -1187,10 +1197,17 @@ const main = (argv) => {
   const deliverThroughServer = () => {
     if (noWait) return false;
     if (!isOpencodeSessionId(recipient.sessionId)) return false;
-    const delivery = priority === 'queue' || priority === 'idle' ? 'queue' : 'steer';
+    // Always steer. The server's `queue` delivery waits for the end of the
+    // current work, and a seat looping inside one turn (the supervisor's merge
+    // queue) never ends it: 18 notes sat queued that way on 2026-11-28. A steer
+    // is delivered before the agent's next model call, mid-work. `--drain` also
+    // folds any backlog the inbox still holds into one combined note, each
+    // note with the time it was queued, so a long backlog is one interruption.
+    const delivery = 'steer';
     const budget = opencodeBudgetMs();
-    const args = [opencodePrompt(), 'send', '--session', recipient.sessionId, '--delivery', delivery, '--timeout', String(budget)];
+    const args = [opencodePrompt(), 'send', '--session', recipient.sessionId, '--delivery', delivery, '--drain', '--timeout', String(budget)];
     if (recipient.cwd) args.push('--directory', recipient.cwd);
+    if (recipient.pid != null) args.push('--pid', String(recipient.pid));
     const r = spawnSync(process.execPath, args, { input: text, encoding: 'utf8', timeout: opencodeSpawnTimeoutMs(budget) });
     // The output is a stream: the entry prints an `accepted` line the moment
     // the server takes the prompt, then its final answer. If this process is
@@ -1203,6 +1220,13 @@ const main = (argv) => {
         return true; // not reached: recordUnproven exits
       }
       trace(`agent-send: ${recipient.sessionId} is an OpenCode session but its server answered nothing usable; falling back to the mailbox\n`);
+      return false;
+    }
+    // A drain that did not resolve means this text was NOT sent: the entry
+    // stops before it posts when the backlog cannot be folded, so the row must
+    // stay a mailbox row (exit 3, pending) rather than be closed as unproven.
+    if (answer.phase === 'drain') {
+      trace(`agent-send: the drain for ${recipient.sessionId} did not resolve (${answer.code ?? 'refused'}); this text is queued in the mailbox, not posted\n`);
       return false;
     }
     // The server knows the session and took the prompt: it is delivered, or it
@@ -1231,10 +1255,10 @@ const main = (argv) => {
   const recordUnproven = (messageId, why) => {
     const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
     const row = recordApiDelivery({
-      to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery: (priority === 'queue' || priority === 'idle' ? 'queue' : 'steer'),
+      to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery: 'steer',
       messageId: messageId ?? null, unproven: true,
     });
-    process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as message ${messageId ?? '(no id)'} but reading it back failed (${why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
+    process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as item ${messageId ?? '(no id)'} but it could not be read back from the inbox or message log (${why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
     process.exit(3);
   };
   // Delivered, or exited with its own verdict; returns false to fall through.

@@ -22,7 +22,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { isolatedEnv } from './helpers/isolate-env.mjs';
 import { startStubServer, writeRegistry } from './helpers/opencode-stub.mjs';
-import { isOpencodeSessionId, resolveService, deliverPrompt, parsePromptStream } from '../lib/opencode-server.mjs';
+import { isOpencodeSessionId, resolveService, deliverPrompt, parsePromptStream, discoverServerUrls } from '../lib/opencode-server.mjs';
 import { listSeats, readRows, resetOpencodeLivenessCache } from '../lib/agent-mailbox.mjs';
 import { procStat, currentBootId } from '../lib/presence.mjs';
 
@@ -187,6 +187,236 @@ test('a prompt the server took but cannot read back is exit 3, never silent', as
   }
 });
 
+// The prompt's 200 is a Session.Inbox.User: it sits in the session's inbox
+// until the agent consumes it, and only then is there a message to read. An
+// attached seat that has not started a run therefore had every real delivery
+// reported as unproven (exit 3, "could not be read back"), while the text was
+// in the inbox all along. The accepted item's own home is the proof.
+test('a prompt held in the session inbox is delivered, not unproven', async () => {
+  const stub = await startStubServer({ inbox: true });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-inbox.json') });
+  try {
+    const r = await runEntry(['send', '--session', SID, '--text', 'waiting for the turn'], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.answer?.ok, true);
+    assert.equal(r.answer?.proof, 'inbox');
+    assert.equal(r.answer?.messageId, stub.state.prompts[0].messageId);
+    assert.deepEqual(stub.state.inboxReads.map((x) => x.sessionId), [SID]);
+    assert.deepEqual(stub.state.reads, [], 'an unconsumed item is not looked for in the message log');
+  } finally {
+    await stub.close();
+  }
+});
+
+// The ruling of 2026-11-28: a `queue` item is delivered only when the current
+// work ends, and a seat looping inside one turn never ends it — window 3 held
+// 18 notes that way. The drain turns the backlog into ONE steer, delivered
+// before the agent's next model call, and each note carries the time it was
+// queued so a stale one is visible as stale.
+const jsonLines = (text) =>
+  String(text ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+const queuedSeed = (id, text, iso) => ({
+  id, sessionID: SID, type: 'user', delivery: 'queue', time: { created: Date.parse(iso) }, payload: { text },
+});
+
+test('send --drain folds a queued backlog into one steer, each note with the time it was queued', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [
+      queuedSeed('msg_backlog01', 'first queued note', '2026-11-28T10:02:03.000Z'),
+      queuedSeed('msg_backlog02', 'second queued note', '2026-11-28T10:44:05.000Z'),
+      queuedSeed('msg_backlog03', 'third queued note', '2026-11-28T11:22:00.000Z'),
+    ],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-send.json') });
+  try {
+    const r = await runEntryWithStdin(
+      ['send', '--session', SID, '--delivery', 'steer', '--drain', '--timeout', '8000'],
+      { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg },
+      'the new note\n',
+    );
+    assert.equal(r.code, 0, r.err);
+    assert.equal(stub.state.prompts.length, 2, 'one combined steer for the backlog, then the new note');
+    const [combined, fresh] = stub.state.prompts;
+    assert.equal(combined.body.delivery, 'steer');
+    assert.match(combined.body.text, /3 notes queued while your turn was running/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T10:02:03.000Z\] first queued note/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T10:44:05.000Z\] second queued note/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T11:22:00.000Z\] third queued note/);
+    assert.equal(fresh.body.text.trim(), 'the new note');
+    assert.equal(fresh.body.delivery, 'steer');
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_backlog01', 'msg_backlog02', 'msg_backlog03']);
+    assert.ok(!stub.state.prompts.some((p) => p.body.delivery === 'queue'), 'no note is left on the never-ending queue');
+    assert.ok(!stub.state.inboxItems.some((i) => i.delivery === 'queue'), 'the backlog is gone from the inbox');
+    const drained = jsonLines(r.out).find((l) => l.phase === 'drained');
+    assert.equal(drained?.drained, 3);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('drain alone posts the backlog as one steer, and a second drain with an empty inbox sends nothing', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [
+      queuedSeed('msg_only00001', 'one held note', '2026-11-28T09:00:00.000Z'),
+      queuedSeed('msg_only00002', 'another held note', '2026-11-28T09:30:00.000Z'),
+    ],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-only.json') });
+  try {
+    const first = await runEntry(['drain', '--session', SID], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(first.code, 0, first.err);
+    assert.equal(first.answer?.drained, 2);
+    assert.equal(stub.state.prompts.length, 1);
+    assert.equal(stub.state.prompts[0].body.delivery, 'steer');
+    assert.match(stub.state.prompts[0].body.text, /2 notes queued/);
+    assert.match(stub.state.prompts[0].body.text, /\[queued 2026-11-28T09:00:00.000Z\] one held note/);
+    const second = await runEntry(['drain', '--session', SID], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(second.code, 0, second.err);
+    assert.equal(second.answer?.drained, 0);
+    assert.equal(stub.state.prompts.length, 1, 'the first drain is the only one that posts');
+    assert.equal(stub.state.inboxDeletes.length, 2);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('a drain leaves a steer item alone: only what is waiting on the queue is coalesced', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [
+      { id: 'msg_steer0001', sessionID: SID, type: 'user', delivery: 'steer', time: { created: Date.parse('2026-11-28T11:00:00.000Z') }, payload: { text: 'already going to the next call' } },
+      queuedSeed('msg_queued001', 'held for the turn end', '2026-11-28T11:01:00.000Z'),
+    ],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-mixed.json') });
+  try {
+    const r = await runEntry(['drain', '--session', SID], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.answer?.drained, 1);
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_queued001'], 'the steer item is not deleted');
+    assert.match(stub.state.prompts[0].body.text, /1 note queued/);
+    assert.doesNotMatch(stub.state.prompts[0].body.text, /already going to the next call/);
+  } finally {
+    await stub.close();
+  }
+});
+
+// A resume started with `--standalone` runs its own server on the loopback:
+// the session lives there, and the shared registry's server only has the
+// session's record, where it would take the prompt into an inbox nobody reads.
+// The tab's own server is tried first, and the read-back is done on it.
+test('the tab own server takes the prompt before the shared registry', async () => {
+  const own = await startStubServer({ inbox: true });
+  const shared = await startStubServer({ inbox: true });
+  const reg = writeRegistry(dir, shared.port, shared.password, { file: path.join(dir, 'reg-own.json') });
+  try {
+    const r = await runEntry(
+      ['send', '--session', SID, '--text', 'into the tab', '--server', own.url],
+      { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg },
+    );
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.answer?.server, own.url);
+    assert.equal(own.state.prompts.length, 1);
+    assert.equal(own.state.inboxReads.length, 1);
+    assert.equal(shared.state.prompts.length, 0, 'the shared server must not take a prompt it cannot deliver');
+  } finally {
+    await own.close();
+    await shared.close();
+  }
+});
+
+test('a candidate that does not know the session hands the prompt to the registry server', async () => {
+  const own = await startStubServer({ promptStatus: 404 });
+  const shared = await startStubServer({ inbox: true });
+  const reg = writeRegistry(dir, shared.port, shared.password, { file: path.join(dir, 'reg-next.json') });
+  try {
+    const r = await runEntry(
+      ['send', '--session', SID, '--text', 'the tab moved servers', '--server', own.url],
+      { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg },
+    );
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.answer?.server, shared.url);
+    assert.equal(shared.state.prompts.length, 1);
+  } finally {
+    await own.close();
+    await shared.close();
+  }
+});
+
+// A server that accepts the POST and then does not answer may have taken the
+// prompt: the answer is what was lost. The walk stops there, because asking the
+// next server would deliver the same text twice.
+test('a candidate that does not answer ends the walk, never a second delivery', async () => {
+  const own = await startStubServer({ inbox: true, delayMs: 5000 });
+  const shared = await startStubServer({ inbox: true });
+  const reg = writeRegistry(dir, shared.port, shared.password, { file: path.join(dir, 'reg-slow.json') });
+  try {
+    const r = await runEntry(
+      ['send', '--session', SID, '--text', 'only once', '--server', own.url, '--timeout', '600'],
+      { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg },
+    );
+    assert.equal(r.code, 12, r.err);
+    assert.equal(shared.state.prompts.length, 0, 'the registry server was never asked');
+  } finally {
+    await own.close();
+    await shared.close();
+  }
+});
+
+// The tab's server is found from the tab: the process family's loopback
+// listeners, the way the launcher finds them, so no registry has to know them.
+test('send --pid reaches the server the tab process holds', async () => {
+  const stub = await startStubServer({ inbox: true });
+  // The registry is dead, and only its password is shared with the tab's own
+  // server: the candidate list is what has to find the server that holds it.
+  const reg = writeRegistry(dir, 1, stub.password, { file: path.join(dir, 'reg-dead.json') });
+  try {
+    const r = await runEntry(
+      ['send', '--session', SID, '--text', 'find the tab server', '--pid', String(process.pid)],
+      { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg },
+    );
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.answer?.server, stub.url);
+    assert.equal(stub.state.prompts.length, 1);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('the servers a process family listens on are the candidate list', () => {
+  const proc = fs.mkdtempSync(path.join(dir, 'fake-proc-'));
+  const mk = (pid, children = []) => {
+    fs.mkdirSync(path.join(proc, String(pid), 'task', String(pid)), { recursive: true });
+    fs.mkdirSync(path.join(proc, String(pid), 'fd'), { recursive: true });
+    fs.writeFileSync(path.join(proc, String(pid), 'task', String(pid), 'children'), children.length ? `${children.join(' ')}\n` : '');
+  };
+  const fd = (pid, n, target) => fs.symlinkSync(target, path.join(proc, String(pid), 'fd', String(n)));
+  mk(4001, [4002]);
+  mk(4002, [4003]);
+  mk(4003);
+  fd(4001, 3, '/dev/null');
+  fd(4002, 4, 'socket:[71]');
+  fd(4003, 5, 'socket:[72]');
+  const listening = new Map([[71, 5102], [72, 5101]]);
+  assert.deepEqual(discoverServerUrls(4001, { procDir: proc, listening }), ['http://127.0.0.1:5101', 'http://127.0.0.1:5102']);
+  assert.deepEqual(discoverServerUrls(4999, { procDir: proc, listening }), []);
+  fs.rmSync(proc, { recursive: true, force: true });
+});
+
 test('a read-back that answers with another id is unproven too', async () => {
   const stub = await startStubServer({ readBack: 'different' });
   const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-4.json') });
@@ -333,14 +563,52 @@ test('agent-send delivers to an OpenCode seat through its server and closes the 
   }
 });
 
-test('agent-send --queue asks the server to queue after the current work', async () => {
-  const stub = await startStubServer();
+// A `queue` delivery waits for the end of the current work, which a seat
+// looping inside one turn never reaches: 18 notes were held that way by the
+// supervisor on 2026-11-28. --queue therefore posts a steer (delivered before
+// the agent's next model call, mid-work) and drains any backlog the inbox still
+// holds as ONE combined note, each with the time it was queued.
+test('agent-send --queue to an OpenCode seat steers mid-turn and folds the backlog into one note', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [queuedSeed('msg_held00001', 'earlier queued note', '2026-11-28T10:10:00.000Z')],
+  });
   const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-12.json') });
   writeBeacon();
   try {
     const r = await runSend(['--to', KEY, '--queue', '--text', 'when you finish, list the CI failures'], agentEnv(reg));
     assert.equal(r.code, 0, `${r.out}${r.err}`);
-    assert.equal(stub.state.prompts[0].body.delivery, 'queue');
+    assert.equal(stub.state.prompts.length, 2);
+    assert.equal(stub.state.prompts[0].body.delivery, 'steer', 'the backlog does not wait for the turn end');
+    assert.match(stub.state.prompts[0].body.text, /\[queued 2026-11-28T10:10:00.000Z\] earlier queued note/);
+    assert.equal(stub.state.prompts[1].body.delivery, 'steer', 'the new note does not wait for the turn end either');
+    assert.equal(stub.state.prompts[1].body.text, 'when you finish, list the CI failures');
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_held00001']);
+  } finally {
+    await stub.close();
+  }
+});
+
+// A drain that cannot resolve stops the send before it posts: the new text was
+// never sent, so its row must stay pending (a later drain delivers it), not be
+// closed as an unproven delivery.
+test('agent-send keeps the text pending when the drain itself is refused', async () => {
+  const stub = await startStubServer({
+    drainStatus: 500,
+    inboxItems: [queuedSeed('msg_held00002', 'held note the drain could not fold', '2026-11-28T11:05:00.000Z')],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-refused.json') });
+  writeBeacon();
+  try {
+    const r = await runSend(['--to', KEY, '--queue', '--deadline', '1', '--text', 'this text was never posted'], agentEnv(reg));
+    assert.equal(r.code, 3, `${r.out}${r.err}`);
+    assert.equal(stub.state.prompts.length, 0, 'the new text was not posted after the refused drain');
+    assert.equal(stub.state.inboxReads.length, 1, 'the drain really asked the inbox, so the backlog was in the way');
+    assert.equal(stub.state.inboxDeletes.length, 0, 'nothing was deleted while the combined note was refused');
+    const rows = readRows(KEY, { dir: mboxDir });
+    const msg = rows.find((x) => x && typeof x.id === 'string' && x.text === 'this text was never posted');
+    assert.ok(msg, 'the text is queued in the mailbox');
+    assert.equal(rows.find((x) => x && x.ack === msg.id), undefined, 'the row is not closed');
   } finally {
     await stub.close();
   }
@@ -380,6 +648,28 @@ test('agent-send falls back to the mailbox when no server answers', async () => 
   const msg = rows.find((x) => x && x.id && x.text === 'the server is down');
   assert.ok(msg, 'the text is in the mailbox');
   assert.doesNotMatch(r.err, /through its OpenCode server/);
+});
+
+test("agent-send names the seat process, so a standalone tab's own server is asked", async () => {
+  // The beacon's pid is the seat's own process, and a `--standalone` tab's
+  // server is found from it. The entry here records its argv and answers
+  // nothing, so the send falls back to the mailbox; the pid is what this pins.
+  const argvFile = path.join(dir, `argv-${n}.json`);
+  const entry = path.join(dir, `entry-argv-${n}.mjs`);
+  fs.writeFileSync(entry, `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.exit(1);\n`);
+  const reg = writeRegistry(dir, 1, 'x', { file: path.join(dir, 'reg-pid.json') });
+  // The row's host identity is the client process (the default), the way an
+  // OpenCode seat records it.
+  writeBeacon();
+  try {
+    const r = await runSend(['--to', KEY, '--deadline', '1', '--text', 'let the tab server answer'], agentEnv(reg, { AGENT_SEND_OPENCODE_PROMPT: entry }));
+    assert.equal(r.code, 3, `${r.out}${r.err}`);
+    const args = JSON.parse(fs.readFileSync(argvFile, 'utf8'));
+    assert.equal(args[args.indexOf('--pid') + 1], String(process.pid));
+  } finally {
+    fs.rmSync(entry, { force: true });
+    fs.rmSync(argvFile, { force: true });
+  }
 });
 
 test('a sender report names the file, never the registry password', async () => {  const secret = 'never-print-me-7c1d';

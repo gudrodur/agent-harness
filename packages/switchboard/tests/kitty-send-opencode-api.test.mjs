@@ -3,11 +3,14 @@
 // kitty-send types into a window and then reads the screen back through kitty.
 // An OpenCode seat is reached through its own server instead (the same route
 // its phone client uses): the prompt enters the session's inbox, the server
-// answers with the message it created, and reading that message back is the
-// proof — no keystroke, no screen read, and nothing to swallow when a loaded
-// machine's kitty stops answering. A machine with no server, or one that does
-// not answer, must fall back to typing exactly as before; a server that TOOK
-// the prompt but could not be read back is exit 3 and is never retried blind.
+// answers with the inbox item it created, and reading that item back — from the
+// inbox, or the message log once a run consumed it — is the proof. No
+// keystroke, no screen read, and nothing to swallow when a loaded machine's
+// kitty stops answering. A tab running its own `--standalone` server is asked
+// there first, before the shared registry's. A machine with no server, or one
+// that does not answer, must fall back to typing exactly as before; a server
+// that TOOK the prompt but could not be read back is exit 3 and is never
+// retried blind.
 //
 // The stub server runs in this process and the script in a child, so the
 // child's HTTP calls are answered while the test awaits it.
@@ -135,13 +138,34 @@ test('a plain send goes through the server and never types into the tab', async 
   }
 });
 
-test('--queue hands the wait to the session and returns without a waiter', async () => {
-  const stub = await startStubServer();
+// A `queue` item waits for the end of the current work, and a seat looping
+// inside one turn never ends it. --queue posts a steer instead (delivered
+// before the agent's next model call), and the drain folds anything the inbox
+// still holds as `queue` into one combined note carrying each queued time.
+test('--queue to an OpenCode tab steers mid-turn and drains a held backlog, with no waiter', async () => {
+  const stub = await startStubServer({
+    inboxItems: [
+      {
+        id: 'msg_heldkitty01',
+        sessionID: SID,
+        type: 'user',
+        delivery: 'queue',
+        time: { created: Date.parse('2026-11-28T10:30:00.000Z') },
+        payload: { text: 'held while the turn ran' },
+      },
+    ],
+  });
   const reg = registry(stub);
   try {
     const r = await send(['--to', WID, '--queue', '--text', 'when the render is done, report it'], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
     assert.equal(r.code, 0, `${r.out}${r.err}`);
-    assert.equal(stub.state.prompts[0].body.delivery, 'queue');
+    assert.equal(stub.state.prompts.length, 2, 'one combined steer for the backlog, then this note');
+    assert.equal(stub.state.prompts[0].body.delivery, 'steer');
+    assert.match(stub.state.prompts[0].body.text, /\[queued 2026-11-28T10:30:00.000Z\] held while the turn ran/);
+    assert.equal(stub.state.prompts[1].body.delivery, 'steer');
+    assert.equal(stub.state.prompts[1].body.text, 'when the render is done, report it');
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_heldkitty01']);
+    assert.match(r.err, /1 earlier queued note\(s\) went with it as one combined steer/);
     assert.equal(await typed(), false);
     // No detached waiter was left polling a screen.
     const files = await fs.readdir(stateDir).catch(() => []);
@@ -200,6 +224,22 @@ test('--cancel on an OpenCode tab says the server already took the prompt', asyn
   assert.match(r.err, /nothing can be withdrawn/);
 });
 
+test('the tab own process is handed to the entry, so its private server is asked', async () => {
+  // A `--standalone` tab serves its own session on the loopback; the entry
+  // finds that port from the tab's process, so the pid has to travel with the
+  // send. The entry here records its argv and sends nothing, which makes
+  // kitty-send fall through to its typed path exactly as before.
+  const argvFile = path.join(stateDir, `argv-${n}.out`);
+  const entry = path.join(stateDir, `entry-argv-${n}.mjs`);
+  await fs.writeFile(entry, `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.exit(1);\n`);
+  const r = await send(['--to', WID, '--text', 'name the tab server', '--timeout', '4'], { AGENT_SWITCHBOARD_OPENCODE_PROMPT: entry });
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
+  assert.match(r.err, /typing it into window/);
+  const args = JSON.parse(await fs.readFile(argvFile, 'utf8'));
+  assert.deepEqual(args.slice(0, 2), ['send', '--session']);
+  assert.equal(args[args.indexOf('--pid') + 1], String(process.pid));
+});
+
 // ---- a helper killed mid-write must not become a second delivery -----------
 //
 // The entry prints an `accepted` line, then its final answer. A helper killed
@@ -242,7 +282,7 @@ test('a torn accepted marker is not typed again', async () => {
   const r = await send(['--to', WID, '--text', 'nothing provable', '--timeout', '3'], { AGENT_SWITCHBOARD_OPENCODE_PROMPT: entry });
   assert.notEqual(r.code, 5, `a jq tear must not become the script's exit: ${r.out}${r.err}`);
   assert.equal(r.code, 3, `${r.out}${r.err}`);
-  assert.match(r.err, /torn and its message id is unreadable/);
+  assert.match(r.err, /torn and its item id is unreadable/);
   assert.match(r.err, /do NOT send it again blind/);
   assert.equal(await typed(), false, 'a torn accepted marker must never fall through to typing');
 });

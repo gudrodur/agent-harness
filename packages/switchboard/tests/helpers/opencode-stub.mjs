@@ -25,11 +25,25 @@ export const startStubServer = async ({
   sessions = null,
   delayMs = 0,
   readBackDelayMs = 0,
+  // The prompt accepted here stays in the session's inbox, the way an attached
+  // seat that has not started a run holds it: listed by GET .../inbox, absent
+  // from the message log. This is the shape that reported a real delivery as
+  // unproven.
+  inbox = false,
+  // Items the inbox already holds at start (a `queue` backlog), each as the
+  // server lists it: {id, type, delivery, time: {created}, payload: {text}}.
+  inboxItems = [],
+  // The answer to a drain's combined POST, so a test can make the drain fail
+  // while a plain prompt would succeed.
+  drainStatus = 200,
 } = {}) => {
   const state = {
     requests: [],
     prompts: [],
     reads: [],
+    inboxReads: [],
+    inboxItems: [...inboxItems],
+    inboxDeletes: [],
     authFailures: 0,
     // Set by a test that wants the next prompt refused after one success.
     promptStatus,
@@ -77,6 +91,10 @@ export const startStubServer = async ({
     }
     const prompt = /^\/api\/session\/([^/]+)\/prompt$/.exec(p);
     if (prompt && method === 'POST') {
+      if (body?.metadata?.switchboardDrain && drainStatus !== 200) {
+        json(res, drainStatus, { message: 'the combined note was refused' });
+        return;
+      }
       if (state.promptStatus !== 200) {
         json(res, state.promptStatus, state.promptStatus === 404 ? { _tag: 'SessionNotFoundError', message: 'no such session' } : { message: 'refused' });
         return;
@@ -84,12 +102,37 @@ export const startStubServer = async ({
       created += 1;
       const id = `msg_stub${String(created).padStart(6, '0')}`;
       state.prompts.push({ sessionId: prompt[1], body, query: Object.fromEntries(url.searchParams), messageId: id });
-      json(res, 200, { data: { id, sessionID: prompt[1], type: 'user', delivery: body?.delivery ?? 'steer', payload: { text: body?.text ?? '' } } });
+      const item = { id, sessionID: prompt[1], type: 'user', delivery: body?.delivery ?? 'steer', time: { created: Date.now() }, payload: { text: body?.text ?? '' } };
+      if (inbox) state.inboxItems.push(item);
+      json(res, 200, { data: item });
+      return;
+    }
+    // The session's inbox: where an accepted prompt lives until the agent
+    // consumes it. A real server always has this route.
+    const inboxRoute = /^\/api\/session\/([^/]+)\/inbox$/.exec(p);
+    if (inboxRoute && method === 'GET') {
+      state.inboxReads.push({ sessionId: inboxRoute[1] });
+      json(res, 200, { data: state.inboxItems });
+      return;
+    }
+    // One item: DELETE drops a queued item (the drain's coalescing step). A
+    // real server answers a no-op when the item is already gone.
+    const inboxItem = /^\/api\/session\/([^/]+)\/inbox\/([^/]+)$/.exec(p);
+    if (inboxItem && method === 'DELETE') {
+      state.inboxDeletes.push({ sessionId: inboxItem[1], id: inboxItem[2] });
+      state.inboxItems = state.inboxItems.filter((i) => i.id !== inboxItem[2]);
+      json(res, 200, { ok: true });
       return;
     }
     const read = /^\/api\/session\/([^/]+)\/message\/([^/]+)$/.exec(p);
     if (read) {
       state.reads.push({ sessionId: read[1], messageId: read[2] });
+      // An item still in the inbox is not a message: the message log does not
+      // have it, which is exactly the answer that was read as "unproven".
+      if (state.inboxItems.some((i) => i.id === read[2])) {
+        json(res, 404, { _tag: 'MessageNotFoundError', message: 'no such message' });
+        return;
+      }
       const answer = () => {
         if (state.readBack === 'missing') {
           json(res, 404, { _tag: 'NotFoundError', message: 'no such message' });
