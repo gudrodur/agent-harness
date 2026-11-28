@@ -16,7 +16,9 @@
 // when kitty-send sends nothing the message goes back in the mailbox; both
 // exit 3. A recipient with no registered consumer
 // (beacon mailbox flag, set by the consumer hook each turn) falls through to
-// kitty-send.sh (resolved relative to this file) and says so on stderr; so does a window id or title with no
+// kitty-send.sh (resolved relative to this file) and says so on stderr; when the
+// recipient is a role, whose holder's mailbox key is known, a failed typing
+// attempt parks the row there instead (exit 3, pending). So does a window id or title with no
 // mailbox consumer behind it at all (a plain shell — the
 // supervisor steer path), while an ambiguous window stays a fatal error.
 // --stop is an alias of --now there; only a window that is not busy is typed
@@ -958,10 +960,12 @@ const main = (argv) => {
   //
   // A --queue send types into the window, so it gets the same proof as the
   // mailbox path (typingVerdict, one function): without proof nothing is typed.
-  // With a mailbox key (`queueKey`, an idle seat) the text is queued there for
-  // the seat's own drain and the exit is 3; without one nothing is queued and
-  // the exit is 1, so the sender knows the message did not go.
-  const kittyFallback = (why, queueKey = null) => {
+  // With a mailbox key (`queueKey`, an idle seat or a role holder whose beacon
+  // has no consumer flag) the text is queued there for the seat's own drain and
+  // the exit is 3: for a --queue send always, for a role holder's row also when
+  // kitty-send sends nothing (`requeueOnNothing`, #77). Without a key nothing is
+  // queued and the exit is 1, so the sender knows the message did not go.
+  const kittyFallback = (why, queueKey = null, { requeueOnNothing = false } = {}) => {
     const t = recipient?.role != null ? recipient.beaconWindowId : to;
     refuseEnding(t);
     // --no-wait only writes a mailbox row: never type, never wait on a proof.
@@ -974,7 +978,6 @@ const main = (argv) => {
       );
       process.exit(3);
     }
-    if (t == null) die(`${why}, and role ${recipient.role} has no kitty window to fall back to`);
     // Park the row in the seat's own mailbox (exit 3), or say the message did not go.
     const requeueForSeat = (reason, kittyStatus = null, detail = null, proofWhy = null, when = 'at its next prompt') => {
       if (queueKey == null) return false;
@@ -988,6 +991,14 @@ const main = (argv) => {
       process.exit(3);
     };
     const noQueueDie = (reason) => die(`${reason} and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer`);
+    // No window to type into is not a lost message when the seat's mailbox key
+    // is known: park it there and report it pending. Without a key there is
+    // nowhere to put it, so say so.
+    if (t == null) {
+      const noWindow = `${why}, and ${recipient?.role != null ? `role ${recipient.role}` : to} has no kitty window to fall back to`;
+      requeueForSeat(noWindow);
+      die(noWindow);
+    }
     // A typed fallback never lands on a busy seat: typing mid-turn discards the
     // tool result in flight. The busy marker is read from the window now, and a
     // busy seat gets the row in its mailbox, where its tool-boundary drain
@@ -1034,13 +1045,20 @@ const main = (argv) => {
     // (the proof just passed, so the seat is idle now): its verdict is the
     // sender's. A detached --queue waiter would answer exit 3 "do not resend"
     // and then, if its own late proof refused, lose the message with nobody told.
-    const st = runKittySend(why, t, text, null, { requeue: priority === 'queue', midTurnHeld: mode == null });
-    if (priority === 'queue' && KITTY_SENT_NOTHING.has(st)) {
+    const st = runKittySend(why, t, text, null, { requeue: (queueKey != null && (priority === 'queue' || requeueOnNothing)) || priority === 'queue', midTurnHeld: mode == null });
+    // A role holder's failed typing attempt loses nothing: its mailbox key is
+    // known, so the row parks there and the sender sees exit 3 (#77). Other
+    // sends keep kitty-send's verdict. The mid-turn case below has its own line.
+    const parksOnNothing = queueKey != null && (priority === 'queue' || requeueOnNothing);
+    if (KITTY_SENT_NOTHING.has(st) && !(st === 7 && mode == null)) {
       const reason = KITTY_NOTHING_REASON[st] ?? 'see kitty-send.sh';
-      requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st, `not typed: ${reason}`);
-      process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
-      if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
-      process.exit(exitOfKittySend(st));
+      if (parksOnNothing) requeueForSeat(`kitty-send exit ${st} sent nothing (${reason})`, st, `not typed: ${reason}`);
+      // requeue was true, so kitty-send's own line was held: print the verdict.
+      if (priority === 'queue') {
+        process.stderr.write(`agent-send: kitty-send exit ${st} for ${t}: nothing was sent (${reason}) and nothing is queued: this is a failure, the message did not go; send again when the seat is idle with an empty composer\n`);
+        if (rcDown(st)) peerChannelHint({ sessionId: recipient?.sessionId ?? thrownSession, queuedId: null });
+        process.exit(exitOfKittySend(st));
+      }
     }
     // A bare send that kitty-send found mid-turn (exit 7, nothing sent) must not
     // be dropped and must not go with --now (the in-flight tool result would be
@@ -1209,7 +1227,11 @@ const main = (argv) => {
   deliverThroughServer();
   if (!recipient.hasConsumer && recipient.mailboxOnly !== true) {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
-    kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);
+    // A role's holder is addressed through its mailbox, and the key is known
+    // even when its beacon says no consumer: park there rather than report a
+    // message that did not go (#77). A window target keeps its older contract,
+    // where a flag-off window means the text was not sent.
+    kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`, recipient.role != null ? recipient.key ?? null : null, { requeueOnNothing: recipient.role != null });
   }
   // Where the row would be typed if nobody drains it.
   const target = recipient.windowId ?? recipient.beaconWindowId ?? (/__/.test(to) || recipient.role != null ? null : to);
