@@ -6,7 +6,7 @@
 |---|---|
 | 0 | Acked, or proven by the terminal fallback, or delivered to an OpenCode seat through its server and read back by its inbox item id (or from the message log once a run consumed it). |
 | 2 | A refused flag pair: `--no-wait` with `--now`, `--stop`, `--idle-when` or `--deadline`. Nothing was written or sent. |
-| 3 | Not delivered yet (queued, or no proof): do not resend; `--status --id <id>` asks later (when an ack wait ended without an ack the sender prints that command). `--status` itself exits 3 for a pending row. Queued for a role with no live holder also exits 3, and `--no-wait` exits 3 as soon as the row is written. An OpenCode server that accepted the prompt but whose item is in neither the session's inbox nor its message log is also 3, and the row is closed as `apiUnproven`: the text may be there, so it is not resent. |
+| 3 | Not delivered yet (queued, or no proof): do not resend; `--status --id <id>` asks later (when an ack wait ended without an ack the sender prints that command). `--status` itself exits 3 for a pending row. Queued for a role with no live holder also exits 3, and `--no-wait` exits 3 as soon as the row is written. An OpenCode server that accepted the prompt but whose item is in neither the session's inbox nor its message log is also 3, and the row is closed as `apiUnproven`: the text may be there, so it is not resent. A drain that does not resolve (the inbox could not be read, or the combined note was refused) stops the send before its own text is posted, so that case stays a pending row and a later drain delivers it. |
 | 10 | Typed but not proven submitted: look at the window before resending. Also the OpenCode-server counterpart: the server took the prompt but its item could not be read back from the inbox or the message log, so look at the session. `--status` also exits 10 for either kind of unproven send. |
 | 11 | `--claim-role`: a live seat holds the role; the claim changed nothing (`--take-over` takes it). |
 | 12 | `--release-role`: another session holds the role. |
@@ -17,11 +17,21 @@
 | 23 | Refused: a command that ends or wipes the conversation (`/exit`, `/quit`, `/clear`, `/new`, `/reset`, with or without arguments, or a bare `exit`, `quit`, `:q`, `:q!`, `:wq`, `:wq!`) for a Claude Code seat that is idle only because background work runs, in every mode (bare, `--queue`, `--now`, `--no-wait` included), or kitty-send's 23 passed through. Nothing was sent and nothing is queued: send it once that work has finished. The same code as `--retire` and `--close` below, for the same loss. |
 | other | `bin/kitty-send.sh`'s code, below, except its 11 and 12, which agent-send reports as 1 because its own 11 and 12 mean a refused role claim or release. |
 
+## opencode-prompt.mjs
+
+| Code | Meaning |
+|---|---|
+| 0 | `send`: delivered and proven. `drain`: the combined note was accepted and proven, or the inbox held nothing queued (`"drained": 0`, nothing posted). |
+| 1 | Refused: not an OpenCode session, 404, 401, 400/409. |
+| 2 | Usage error (unknown command, missing `--session`, `--delivery` other than `steer`/`queue`). |
+| 3 | The server took the item (the combined drain note, or the prompt) but the read-back did not prove it: do not resend, look at the session. `send --drain` does not post its own text after a drain that ends this way. |
+| 12 | No server configured, or none answered. |
+
 ## kitty-send.sh
 
 | Code | Meaning |
 |---|---|
-| 0 | Sent and proven (a new user row in the tab's session record, or for an OpenCode tab the inbox item its server created, read back by id). Under `--queue` it means only that the background waiter started; the verdict lands in the queue log. An OpenCode tab's `--queue` is the server's queue: it is delivered when sent, so there is no waiter and `--cancel` cannot withdraw it. |
+| 0 | Sent and proven (a new user row in the tab's session record, or for an OpenCode tab the inbox item its server created, read back by id). Under `--queue` it means only that the background waiter started; the verdict lands in the queue log. An OpenCode tab's `--queue` posts a steer (delivered before the agent's next model call, mid-turn) and folds anything the session's inbox still holds as `queue` into ONE combined note carrying each note and the time it was queued: it is delivered when sent, so there is no waiter and `--cancel` cannot withdraw it. |
 | 1 | Usage or precondition error (no such window, a refused flag pair). |
 | 12 | Kitty remote control unavailable (`kitty @ ls` timed out, the socket is unreachable, or kitty is overloaded and every process is backing off; the message then says until when and not to retry before then): nothing sent. A bounded wait whose window stops answering exits 12 at its end, not 5; kitty not answering is never read as the window being gone. agent-send reports it as 1, keeps any queued row, and prints one stderr line telling the calling Claude Code session to deliver with `ListAgents` plus `SendMessage` and to `--cancel --id <id>` the row. |
 | 3 | Sent, but could not prove it landed: do not resend. Any failure after the keystrokes went out (a screen read, say) also exits 3, never 1 or 11. So does an Enter withheld after the text (`Enter withheld` on stderr): a prompt had opened, or no composer was left on the screen to prove that none had, and that Enter could have selected its highlighted answer. An OpenCode server that took the prompt but whose item could not be read back from the session's inbox or message log exits 3 too, and nothing is typed after it. |
