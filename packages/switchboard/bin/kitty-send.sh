@@ -769,19 +769,23 @@ stream_field() { # $1 = raw stream, $2 = jq filter over the parsed objects
   printf '%s' "$1" | jq -R -s -r "split(\"\n\") | map(fromjson? // empty) | map(select(type == \"object\")) | $2" 2>/dev/null || true
 }
 # An OpenCode tab is reached through its own server first. The prompt enters the
-# session's inbox (`delivery=queue` after the current work, `steer` before the
-# next model call) and the server answers with the item it created, which the
-# entry reads back from the inbox: that proof does not depend on the tab
-# redrawing at all, and a loaded machine that starves kitty cannot swallow the
-# message. A `--standalone` tab runs its own server, so the tab's own process is
-# named too and its loopback server is asked before the shared registry's. A
-# machine with no server configured, or one that does not answer, falls through
-# to the typed path, whose receipt is a new row in the tab's own store.
+# session's inbox (`steer` is delivered before the next model call, mid-work;
+# `queue` waits for the end of the current work) and the server answers with the
+# item it created, which the entry reads back from the inbox: that proof does not
+# depend on the tab redrawing at all, and a loaded machine that starves kitty
+# cannot swallow the message. `drain` (the third argument) first turns anything
+# the inbox still holds as `queue` into ONE steer carrying each note with the
+# time it was queued, because a seat looping inside one turn never ends it. A
+# `--standalone` tab runs its own server, so the tab's own process is named too
+# and its loopback server is asked before the shared registry's. A machine with
+# no server configured, or one that does not answer, falls through to the typed
+# path, whose receipt is a new row in the tab's own store.
 # Exit 0 delivered; 3 the server took it but the read-back failed (never
 # resend blind); 1 nothing was sent through the server, so type instead.
-opencode_api_send() { # $1 = session id, $2 = steer|queue
-  local out rc why mid acc api_ms
+opencode_api_send() { # $1 = session id, $2 = steer|queue, $3 = drain
+  local out rc why mid acc drn api_ms
   local args=(send --session "$1" --delivery "$2")
+  [ -z "${3:-}" ] || args+=(--drain)
   case "${OPENCODE_TAB_PID:-}" in
     ''|*[!0-9]*) : ;;
     *) args+=(--pid "$OPENCODE_TAB_PID") ;;
@@ -793,6 +797,7 @@ opencode_api_send() { # $1 = session id, $2 = steer|queue
   out=$(printf '%s' "$TEXT" | node "$OPENCODE_PROMPT_JS" "${args[@]}" 2>/dev/null) || rc=$?
   why=$(stream_field "$out" 'map(select(.phase != "accepted")) | last | .why // empty')
   mid=$(stream_field "$out" 'map(select(.phase != "accepted")) | last | .messageId // empty')
+  drn=$(stream_field "$out" 'map(select(.phase == "drained")) | last | .drained // empty')
   # The entry prints an `accepted` line the moment the server takes the prompt,
   # before the read-back. Seeing it with no final answer means the proof was cut
   # off, not that nothing was sent: typing now would deliver the text twice.
@@ -800,6 +805,9 @@ opencode_api_send() { # $1 = session id, $2 = steer|queue
   case "$rc" in
     0)
       note "delivered to session $1 through its OpenCode server (message ${mid:-?}, delivery $2); nothing was typed into the tab"
+      if [ -n "$drn" ] && [ "$drn" != 0 ]; then
+        note "$drn earlier queued note(s) went with it as one combined steer, each with the time it was queued"
+      fi
       exit 0 ;;
   esac
   # A tear can fall inside the accepted line itself, so `acc` is empty while the
@@ -868,13 +876,14 @@ if [ -n "$copilot_pid" ] && copilot_dir=$(copilot_session_for_pid "$copilot_pid"
   [ -r "$COPILOT_EVENTS" ] && COPILOT_TAB=1
 fi
 
-# --queue to an OpenCode tab: the server's own queue IS the wait, so the
-# message is delivered now and held by the session until its current work ends,
-# instead of a detached waiter polling a screen that may never redraw (a loaded
-# machine made those wait the whole 15 minutes and deliver nothing).
+# --queue to an OpenCode tab: the session's server takes the message now and a
+# steer is delivered before the agent's next model call, even mid-work, instead
+# of a detached waiter polling a screen that may never go idle (a seat looping
+# inside one turn never does). The drain also folds anything the inbox still
+# holds as `queue` into one combined steer, so no note waits for a turn end.
 if [ "$QUEUE" = 1 ] && oc=$(opencode_tab_session "$WID"); then
   OPENCODE_TAB_PID=$(opencode_tab_pid "$WID" 2>/dev/null) || OPENCODE_TAB_PID=""
-  opencode_api_send "${oc#opencode:}" queue || true
+  opencode_api_send "${oc#opencode:}" steer drain || true
 fi
 
 # --queue: hand the wait to a detached waiter and return. The waiter is this
@@ -1099,7 +1108,7 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID" "$pre_rec"); then
         OPENCODE_HEAD=$(printf '%s' "$TEXT" | cut -c1-40 | tr -d '[:space:]')
         # Its server first (see opencode_api_send): a prompt that needs no
         # screen read. Typing with the store-row proof is the fallback.
-        opencode_api_send "$OPENCODE_SID" steer || true
+        opencode_api_send "$OPENCODE_SID" steer drain || true
         ;;
       *) : ;;  # no other tab kind has a record to prove a send by
     esac

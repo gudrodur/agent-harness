@@ -208,6 +208,113 @@ test('a prompt held in the session inbox is delivered, not unproven', async () =
   }
 });
 
+// The ruling of 2026-11-28: a `queue` item is delivered only when the current
+// work ends, and a seat looping inside one turn never ends it — window 3 held
+// 18 notes that way. The drain turns the backlog into ONE steer, delivered
+// before the agent's next model call, and each note carries the time it was
+// queued so a stale one is visible as stale.
+const jsonLines = (text) =>
+  String(text ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+const queuedSeed = (id, text, iso) => ({
+  id, sessionID: SID, type: 'user', delivery: 'queue', time: { created: Date.parse(iso) }, payload: { text },
+});
+
+test('send --drain folds a queued backlog into one steer, each note with the time it was queued', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [
+      queuedSeed('msg_backlog01', 'first queued note', '2026-11-28T10:02:03.000Z'),
+      queuedSeed('msg_backlog02', 'second queued note', '2026-11-28T10:44:05.000Z'),
+      queuedSeed('msg_backlog03', 'third queued note', '2026-11-28T11:22:00.000Z'),
+    ],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-send.json') });
+  try {
+    const r = await runEntryWithStdin(
+      ['send', '--session', SID, '--delivery', 'steer', '--drain', '--timeout', '8000'],
+      { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg },
+      'the new note\n',
+    );
+    assert.equal(r.code, 0, r.err);
+    assert.equal(stub.state.prompts.length, 2, 'one combined steer for the backlog, then the new note');
+    const [combined, fresh] = stub.state.prompts;
+    assert.equal(combined.body.delivery, 'steer');
+    assert.match(combined.body.text, /3 notes queued while your turn was running/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T10:02:03.000Z\] first queued note/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T10:44:05.000Z\] second queued note/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T11:22:00.000Z\] third queued note/);
+    assert.equal(fresh.body.text.trim(), 'the new note');
+    assert.equal(fresh.body.delivery, 'steer');
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_backlog01', 'msg_backlog02', 'msg_backlog03']);
+    assert.ok(!stub.state.prompts.some((p) => p.body.delivery === 'queue'), 'no note is left on the never-ending queue');
+    assert.ok(!stub.state.inboxItems.some((i) => i.delivery === 'queue'), 'the backlog is gone from the inbox');
+    const drained = jsonLines(r.out).find((l) => l.phase === 'drained');
+    assert.equal(drained?.drained, 3);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('drain alone posts the backlog as one steer, and a second drain with an empty inbox sends nothing', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [
+      queuedSeed('msg_only00001', 'one held note', '2026-11-28T09:00:00.000Z'),
+      queuedSeed('msg_only00002', 'another held note', '2026-11-28T09:30:00.000Z'),
+    ],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-only.json') });
+  try {
+    const first = await runEntry(['drain', '--session', SID], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(first.code, 0, first.err);
+    assert.equal(first.answer?.drained, 2);
+    assert.equal(stub.state.prompts.length, 1);
+    assert.equal(stub.state.prompts[0].body.delivery, 'steer');
+    assert.match(stub.state.prompts[0].body.text, /2 notes queued/);
+    assert.match(stub.state.prompts[0].body.text, /\[queued 2026-11-28T09:00:00.000Z\] one held note/);
+    const second = await runEntry(['drain', '--session', SID], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(second.code, 0, second.err);
+    assert.equal(second.answer?.drained, 0);
+    assert.equal(stub.state.prompts.length, 1, 'the first drain is the only one that posts');
+    assert.equal(stub.state.inboxDeletes.length, 2);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('a drain leaves a steer item alone: only what is waiting on the queue is coalesced', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [
+      { id: 'msg_steer0001', sessionID: SID, type: 'user', delivery: 'steer', time: { created: Date.parse('2026-11-28T11:00:00.000Z') }, payload: { text: 'already going to the next call' } },
+      queuedSeed('msg_queued001', 'held for the turn end', '2026-11-28T11:01:00.000Z'),
+    ],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-mixed.json') });
+  try {
+    const r = await runEntry(['drain', '--session', SID], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.answer?.drained, 1);
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_queued001'], 'the steer item is not deleted');
+    assert.match(stub.state.prompts[0].body.text, /1 note queued/);
+    assert.doesNotMatch(stub.state.prompts[0].body.text, /already going to the next call/);
+  } finally {
+    await stub.close();
+  }
+});
+
 // A resume started with `--standalone` runs its own server on the loopback:
 // the session lives there, and the shared registry's server only has the
 // session's record, where it would take the prompt into an inbox nobody reads.
@@ -456,14 +563,52 @@ test('agent-send delivers to an OpenCode seat through its server and closes the 
   }
 });
 
-test('agent-send --queue asks the server to queue after the current work', async () => {
-  const stub = await startStubServer();
+// A `queue` delivery waits for the end of the current work, which a seat
+// looping inside one turn never reaches: 18 notes were held that way by the
+// supervisor on 2026-11-28. --queue therefore posts a steer (delivered before
+// the agent's next model call, mid-work) and drains any backlog the inbox still
+// holds as ONE combined note, each with the time it was queued.
+test('agent-send --queue to an OpenCode seat steers mid-turn and folds the backlog into one note', async () => {
+  const stub = await startStubServer({
+    inbox: true,
+    inboxItems: [queuedSeed('msg_held00001', 'earlier queued note', '2026-11-28T10:10:00.000Z')],
+  });
   const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-12.json') });
   writeBeacon();
   try {
     const r = await runSend(['--to', KEY, '--queue', '--text', 'when you finish, list the CI failures'], agentEnv(reg));
     assert.equal(r.code, 0, `${r.out}${r.err}`);
-    assert.equal(stub.state.prompts[0].body.delivery, 'queue');
+    assert.equal(stub.state.prompts.length, 2);
+    assert.equal(stub.state.prompts[0].body.delivery, 'steer', 'the backlog does not wait for the turn end');
+    assert.match(stub.state.prompts[0].body.text, /\[queued 2026-11-28T10:10:00.000Z\] earlier queued note/);
+    assert.equal(stub.state.prompts[1].body.delivery, 'steer', 'the new note does not wait for the turn end either');
+    assert.equal(stub.state.prompts[1].body.text, 'when you finish, list the CI failures');
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_held00001']);
+  } finally {
+    await stub.close();
+  }
+});
+
+// A drain that cannot resolve stops the send before it posts: the new text was
+// never sent, so its row must stay pending (a later drain delivers it), not be
+// closed as an unproven delivery.
+test('agent-send keeps the text pending when the drain itself is refused', async () => {
+  const stub = await startStubServer({
+    drainStatus: 500,
+    inboxItems: [queuedSeed('msg_held00002', 'held note the drain could not fold', '2026-11-28T11:05:00.000Z')],
+  });
+  const reg = writeRegistry(dir, stub.port, stub.password, { file: path.join(dir, 'reg-drain-refused.json') });
+  writeBeacon();
+  try {
+    const r = await runSend(['--to', KEY, '--queue', '--deadline', '1', '--text', 'this text was never posted'], agentEnv(reg));
+    assert.equal(r.code, 3, `${r.out}${r.err}`);
+    assert.equal(stub.state.prompts.length, 0, 'the new text was not posted after the refused drain');
+    assert.equal(stub.state.inboxReads.length, 1, 'the drain really asked the inbox, so the backlog was in the way');
+    assert.equal(stub.state.inboxDeletes.length, 0, 'nothing was deleted while the combined note was refused');
+    const rows = readRows(KEY, { dir: mboxDir });
+    const msg = rows.find((x) => x && typeof x.id === 'string' && x.text === 'this text was never posted');
+    assert.ok(msg, 'the text is queued in the mailbox');
+    assert.equal(rows.find((x) => x && x.ack === msg.id), undefined, 'the row is not closed');
   } finally {
     await stub.close();
   }

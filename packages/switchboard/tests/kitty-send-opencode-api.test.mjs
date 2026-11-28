@@ -138,13 +138,34 @@ test('a plain send goes through the server and never types into the tab', async 
   }
 });
 
-test('--queue hands the wait to the session and returns without a waiter', async () => {
-  const stub = await startStubServer();
+// A `queue` item waits for the end of the current work, and a seat looping
+// inside one turn never ends it. --queue posts a steer instead (delivered
+// before the agent's next model call), and the drain folds anything the inbox
+// still holds as `queue` into one combined note carrying each queued time.
+test('--queue to an OpenCode tab steers mid-turn and drains a held backlog, with no waiter', async () => {
+  const stub = await startStubServer({
+    inboxItems: [
+      {
+        id: 'msg_heldkitty01',
+        sessionID: SID,
+        type: 'user',
+        delivery: 'queue',
+        time: { created: Date.parse('2026-11-28T10:30:00.000Z') },
+        payload: { text: 'held while the turn ran' },
+      },
+    ],
+  });
   const reg = registry(stub);
   try {
     const r = await send(['--to', WID, '--queue', '--text', 'when the render is done, report it'], { AGENT_SWITCHBOARD_OPENCODE_SERVICE: reg });
     assert.equal(r.code, 0, `${r.out}${r.err}`);
-    assert.equal(stub.state.prompts[0].body.delivery, 'queue');
+    assert.equal(stub.state.prompts.length, 2, 'one combined steer for the backlog, then this note');
+    assert.equal(stub.state.prompts[0].body.delivery, 'steer');
+    assert.match(stub.state.prompts[0].body.text, /\[queued 2026-11-28T10:30:00.000Z\] held while the turn ran/);
+    assert.equal(stub.state.prompts[1].body.delivery, 'steer');
+    assert.equal(stub.state.prompts[1].body.text, 'when the render is done, report it');
+    assert.deepEqual(stub.state.inboxDeletes.map((x) => x.id), ['msg_heldkitty01']);
+    assert.match(r.err, /1 earlier queued note\(s\) went with it as one combined steer/);
     assert.equal(await typed(), false);
     // No detached waiter was left polling a screen.
     const files = await fs.readdir(stateDir).catch(() => []);

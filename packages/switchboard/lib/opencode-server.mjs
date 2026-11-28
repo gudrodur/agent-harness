@@ -293,6 +293,63 @@ export const parsePromptStream = (text) => {
 // short queue cannot hide the item behind the default limit.
 const INBOX_PAGE = 200;
 
+const inboxPath = (sessionId) => `/api/session/${encodeURIComponent(sessionId)}/inbox`;
+const inboxItemPath = (sessionId, itemId) => `${inboxPath(sessionId)}/${encodeURIComponent(itemId)}`;
+
+// The candidate servers in order: the tab's own servers (`servers`), then the
+// registry's. A caller's list is URLs from this machine, so the registry's
+// password is the one they all use.
+const candidateServices = (service, servers) => {
+  const seen = new Set();
+  const list = [];
+  for (const url of [...(servers ?? []), service?.url]) {
+    if (typeof url !== 'string' || url === '' || seen.has(url)) continue;
+    seen.add(url);
+    list.push({ url, password: service?.password, primary: url === service?.url });
+  }
+  return list;
+};
+
+// Prove an accepted prompt item is really in the session: its own id in the
+// inbox first (where an unconsumed prompt lives), the message log second (where
+// a consumed one went). The inbox page is asked generously so a busy seat's
+// queue cannot push this item past the limit; an item not found on a full page
+// is not called proven — a false "unproven" costs a look, a false "delivered"
+// loses the text.
+//
+// Answers {ok: true, messageId, proof, message?} or the unproven failure.
+const provePromptItem = async ({ service, sessionId, messageId, deadline, what = 'the prompt' }) => {
+  const left = () => deadline - Date.now();
+  if (left() < 100) {
+    return { ok: false, code: 'unproven', messageId, why: `no time was left in the budget to read item ${messageId} back` };
+  }
+  const inboxBudget = Math.max(100, Math.min(left() - 100, Math.floor(left() * 0.5)));
+  const inbox = await requestJson({
+    service,
+    apiPath: `${inboxPath(sessionId)}?limit=${INBOX_PAGE}`,
+    timeoutMs: inboxBudget,
+  });
+  const items = inbox.ok && Array.isArray(inbox.data?.data) ? inbox.data.data : [];
+  if (items.some((item) => item?.id === messageId)) return { ok: true, messageId, proof: 'inbox' };
+  const backBudget = left();
+  if (backBudget < 100) {
+    return { ok: false, code: 'unproven', messageId, why: `no time was left in the budget to read item ${messageId} back` };
+  }
+  const back = await requestJson({
+    service,
+    apiPath: `/api/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
+    timeoutMs: backBudget,
+  });
+  if (back.ok && back.data?.data?.id === messageId) return { ok: true, messageId, proof: 'message', message: back.data.data };
+  const logWhy = back.ok ? 'the message log answered with a different id' : back.why;
+  return {
+    ok: false,
+    code: 'unproven',
+    messageId,
+    why: `${what}'s item ${messageId} is in neither the session's inbox (${inbox.ok ? 'not listed' : inbox.why}) nor its message log (${logWhy})`,
+  };
+};
+
 // Put the text in the session's inbox and prove it is there. `delivery` is the
 // server's own vocabulary: `steer` reaches the agent before its next model
 // call (and starts a run when the session is idle), `queue` waits until the
@@ -345,16 +402,8 @@ export const deliverPrompt = async ({
   const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
   const promptPath = `/api/session/${encodeURIComponent(sessionId)}/prompt${query}`;
 
-  // The candidates in order: the tab's own servers, then the registry's. A
-  // caller's list is URLs from this machine, so the registry's password is the
-  // one they all use.
-  const seen = new Set();
-  const candidates = [];
-  for (const url of [...servers, service.url]) {
-    if (typeof url !== 'string' || url === '' || seen.has(url)) continue;
-    seen.add(url);
-    candidates.push({ url, password: service.password, primary: url === service.url });
-  }
+  // The candidates in order: the tab's own servers, then the registry's.
+  const candidates = candidateServices(service, servers);
   if (candidates.length === 0) return { ok: false, code: 'unconfigured', why: service.why ?? 'no server configured' };
 
   let sent = null;
@@ -394,42 +443,109 @@ export const deliverPrompt = async ({
     }
   }
 
-  const remaining = timeoutMs - (Date.now() - startedAt);
-  if (remaining < 100) {
-    return { ok: false, code: 'unproven', messageId, why: `no time was left in the ${timeoutMs} ms budget to read message ${messageId} back` };
+  const proof = await provePromptItem({ service: chosen, sessionId, messageId, deadline: startedAt + timeoutMs });
+  if (!proof.ok) return proof;
+  return { ok: true, messageId, delivery, directory, server: chosen.url, proof: proof.proof, ...(proof.message ? { message: proof.message } : {}) };
+};
+
+// Every item the session's inbox still holds, read from the first candidate
+// server that answers. Reading is safe to repeat, so an unreachable candidate
+// simply hands the read to the next one; the registry server is last.
+export const readInboxItems = async ({ sessionId, service = resolveService(), servers = [], timeoutMs = 5000 } = {}) => {
+  if (!isOpencodeSessionId(sessionId)) return { ok: false, code: 'not-opencode', why: 'not an OpenCode session id' };
+  if (!service?.password) return { ok: false, code: 'unconfigured', why: service?.why ?? 'no password for the server' };
+  const candidates = candidateServices(service, servers);
+  if (candidates.length === 0) return { ok: false, code: 'unconfigured', why: service.why ?? 'no server configured' };
+  const startedAt = Date.now();
+  let last = null;
+  for (const candidate of candidates) {
+    const budget = Math.max(150, Math.min(timeoutMs - (Date.now() - startedAt), 2000));
+    const r = await requestJson({ service: candidate, apiPath: `${inboxPath(sessionId)}?limit=${INBOX_PAGE}`, timeoutMs: budget });
+    if (r.ok) {
+      return { ok: true, server: candidate, items: Array.isArray(r.data?.data) ? r.data.data : [] };
+    }
+    if (r.code === 'refused' || r.code === 'unauthorized') return r;
+    last = r;
+    if (timeoutMs - (Date.now() - startedAt) < 150) break;
   }
-  // The inbox first (where an unconsumed prompt lives), then the message log
-  // (where a consumed one went). The inbox page is asked generously so a busy
-  // seat's queue cannot push this item past the limit; an item not found on a
-  // full page is not called proven — a false "unproven" costs a look, a false
-  // "delivered" loses the text.
-  const inboxBudget = Math.max(100, Math.min(remaining - 100, Math.floor(remaining * 0.5)));
-  const inbox = await requestJson({
-    service: chosen,
-    apiPath: `/api/session/${encodeURIComponent(sessionId)}/inbox?limit=${INBOX_PAGE}`,
-    timeoutMs: inboxBudget,
+  return last ?? { ok: false, code: 'unconfigured', why: service.why ?? 'no server configured' };
+};
+
+// One line of a coalesced note: the note's text and when it was queued, so the
+// seat can tell a stale note from one that just arrived.
+export const queuedNoteLine = (item) => {
+  const created = Number(item?.time?.created);
+  const at = Number.isFinite(created) ? new Date(created).toISOString() : 'unknown time';
+  return `- [queued ${at}] ${String(item?.payload?.text ?? '').trim()}`;
+};
+
+// The queue a `queue` delivery leaves for a seat whose turn never ends: the
+// server holds every item with `delivery: queue` until the current work
+// finishes, which a seat looping inside one turn never does (window 3 held 18
+// notes for this reason on 2026-11-28). A drain turns that backlog back into
+// ONE steer item — delivered before the agent's next model call, mid-work —
+// carrying every note's text and the time it was queued. The originals are
+// deleted only once the combined item is accepted, so a crash loses nothing;
+// a delete that fails is reported, and that note may then arrive again.
+//
+// Answers {ok: true, drained, messageId?, server, proof?, undeleted?, text?};
+// `drained: 0` when the inbox holds nothing queued. Otherwise the requestJson
+// failure, or {ok: false, code: 'unproven', ...} when the combined item could
+// not be read back (do not resend: it is in the inbox).
+export const drainQueuedPrompt = async ({ sessionId, service = resolveService(), servers = [], timeoutMs = 8000 } = {}) => {
+  if (!isOpencodeSessionId(sessionId)) return { ok: false, code: 'not-opencode', why: 'not an OpenCode session id' };
+  if (!service?.password) return { ok: false, code: 'unconfigured', why: service?.why ?? 'no password for the server' };
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const left = () => deadline - Date.now();
+  const read = await readInboxItems({ sessionId, service, servers, timeoutMs: Math.max(200, Math.floor(timeoutMs * 0.3)) });
+  if (!read.ok) return read;
+  const queued = read.items.filter(
+    (item) => item?.type === 'user' && item?.delivery === 'queue' && typeof item?.payload?.text === 'string' && item.payload.text.trim() !== '',
+  );
+  if (queued.length === 0) return { ok: true, drained: 0, sessionId, server: read.server.url };
+  const header = `[switchboard] ${queued.length} note${queued.length === 1 ? '' : 's'} queued while your turn was running; one steer carries ${queued.length === 1 ? 'it' : 'them'} in the order they arrived:`;
+  const text = [header, ...queued.map(queuedNoteLine)].join('\n');
+  const postBudget = Math.max(300, Math.min(left() - 100, Math.floor(timeoutMs * 0.5)));
+  const sent = await requestJson({
+    service: read.server,
+    apiPath: `/api/session/${encodeURIComponent(sessionId)}/prompt`,
+    method: 'POST',
+    body: { text, delivery: 'steer', metadata: { switchboardDrain: queued.map((i) => i.id) } },
+    timeoutMs: postBudget,
   });
-  const items = inbox.ok && Array.isArray(inbox.data?.data) ? inbox.data.data : [];
-  if (items.some((item) => item?.id === messageId)) {
-    return { ok: true, messageId, delivery, directory, server: chosen.url, proof: 'inbox' };
+  // Nothing is deleted unless the server took the combined item: the backlog
+  // stays intact and the caller can try again.
+  if (!sent.ok) return sent;
+  const messageId = sent.data?.data?.id ?? null;
+  if (typeof messageId !== 'string' || messageId === '') {
+    return { ok: false, code: 'unproven', messageId: null, drained: 0, why: 'the server accepted the combined note but named no item id; the queued notes are still in the inbox' };
   }
-  const backBudget = timeoutMs - (Date.now() - startedAt);
-  if (backBudget < 100) {
-    return { ok: false, code: 'unproven', messageId, why: `no time was left in the ${timeoutMs} ms budget to read message ${messageId} back` };
+  const undeleted = [];
+  for (const item of queued) {
+    if (left() < 150) {
+      undeleted.push(item.id);
+      continue;
+    }
+    const del = await requestJson({
+      service: read.server,
+      apiPath: inboxItemPath(sessionId, item.id),
+      method: 'DELETE',
+      timeoutMs: Math.max(150, Math.min(1000, left() - 100)),
+    });
+    if (!del.ok) undeleted.push(item.id);
   }
-  const back = await requestJson({
-    service: chosen,
-    apiPath: `/api/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
-    timeoutMs: backBudget,
-  });
-  if (back.ok && back.data?.data?.id === messageId) {
-    return { ok: true, messageId, delivery, directory, server: chosen.url, proof: 'message', message: back.data.data };
-  }
-  const logWhy = back.ok ? 'the message log answered with a different id' : back.why;
+  const proof = await provePromptItem({ service: read.server, sessionId, messageId, deadline, what: 'the drain' });
+  if (!proof.ok) return { ...proof, drained: queued.length, undeleted };
   return {
-    ok: false,
-    code: 'unproven',
+    ok: true,
+    drained: queued.length,
     messageId,
-    why: `the prompt's item ${messageId} is in neither the session's inbox (${inbox.ok ? 'not listed' : inbox.why}) nor its message log (${logWhy})`,
+    delivery: 'steer',
+    sessionId,
+    server: read.server.url,
+    proof: proof.proof,
+    undeleted,
+    text,
   };
 };
