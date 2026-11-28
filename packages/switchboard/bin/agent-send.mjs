@@ -86,7 +86,7 @@ import {
 import { claudeSessionsDir, procStat, switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
 import { nextDelay } from '../lib/backoff.mjs';
-import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
+import { claimRole, SEAT_CLOSED, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
 import { defaultStorePath } from '../lib/store.mjs';
 import { typingVerdict, proofVerdict, endingVerdict, windowIsBusy as recordIsBusy, PROVEN, REFUSED, ENDING_BACKGROUND } from '../lib/typing-proof.mjs';
@@ -188,7 +188,9 @@ const usage = () => `Usage:
                 purpose naming the job (lead, ship, history-scrub); a seat may
                 hold several roles. A role whose holder is live is NOT taken:
                 exit 11 names the holder's window (close it, or --take-over).
-                A dead or absent holder is taken without the flag.
+                A dead or absent holder is taken without the flag. A session
+                that sent its LOKA-DONE marker has finished: its roles were
+                released then and it cannot claim one again (exit 11).
   --take-over   with --claim-role: take the role from a live holder and queue
                 a mailbox row to the displaced session saying so
   --release-role  give up a role this session holds, e.g. a placeholder
@@ -240,7 +242,8 @@ const usage = () => `Usage:
         name>, message}) and, if a row is queued (exit 3), to withdraw it
         with --cancel --id <id>
     2   --no-wait refused: it cannot take --deadline, --now, --stop or --idle-when
-    11  --claim-role refused: the role's holder is live (nothing changed)
+    11  --claim-role refused: the role's holder is live (nothing changed), or the
+        session sent its LOKA-DONE marker and has finished
     12  --release-role refused: another session holds the role (nothing changed)
     13  --cancel found the row already delivered or already withdrawn (nothing written);
         --status: the row was withdrawn
@@ -606,7 +609,7 @@ const main = (argv) => {
     const sessionId = asSession ?? process.env.CLAUDE_CODE_SESSION_ID ?? null;
     if (sessionId == null) die('--claim-role needs --as <session-id> outside a host-agent session');
     const wid = senderWindowId();
-    const outcome = withRolesDb((db) => {
+    const runClaim = () => withRolesDb((db) => {
       const live = liveRoleHolder(db, claimRoleName, { sessionId });
       if (live && !takeOver) return { refused: live };
       const before = db.get('SELECT session_id FROM seat_roles WHERE role = ?', claimRoleName);
@@ -628,6 +631,16 @@ const main = (argv) => {
       }
       return { prev: before?.session_id ?? null, displaced: live };
     });
+    let outcome;
+    try {
+      outcome = runClaim();
+    } catch (e) {
+      // A session that sent its LOKA-DONE marker has finished: the marker
+      // released its roles and it cannot take one back (lib/seat-roles.mjs
+      // closeSeat). Refuse like any other claim the store would not make.
+      if (e?.code === SEAT_CLOSED) die(`--claim-role refused: ${e.message}`, 11);
+      throw e;
+    }
     if (outcome.refused) {
       const h = outcome.refused;
       const hw = h.window_id ?? h.beacon?.windowId ?? null;
@@ -640,6 +653,7 @@ const main = (argv) => {
         to: recipientKey({ cwd: b.cwd, sessionId: b.sessionId }),
         from: recipientKey({ cwd: process.cwd(), sessionId }),
         priority: 'now',
+        roleEvent: true,
         text: `role ${claimRoleName} was taken over by window ${wid ?? '(unknown)'} (session ${sessionId}); mail addressed to role:${claimRoleName} no longer reaches you`,
       });
     }

@@ -8,12 +8,20 @@
 //       {finished: false, reason}              it is not; reason is one of
 //         no-marker     no LOKA-DONE row from this session since <since-ms>
 //                       (a withdrawn row does not count)
-//         holds-role    the session holds a role in seat_roles
+//         holds-role    the session claimed a role AFTER its marker (the marker
+//                       itself ends the claims it held, and the close releases them)
 //         holds-lease   the session holds a live resource lease, or waits in a resource queue
 //                       (lib/resource-leases.mjs)
-//         later-mail    a message row from or to the session is newer than the marker
+//         later-mail    a message row from or to the session is newer than the marker;
+//                       role-store events (row.roleEvent, e.g. a takeover notice) are
+//                       bookkeeping and are not counted
 //         later-turn    the transcript has a prompt newer than the marker
 //         no-transcript the transcript cannot be read, so activity cannot be ruled out
+//
+// A finished verdict also ends the seat's claims in the store: every role row
+// it still holds is released and its session id is marked closed, so a seat
+// whose marker was recorded before that rule existed is cleaned up here, and
+// nothing can claim the role back (lib/seat-roles.mjs closeSeat).
 //
 // THE MARKER. The seat's /loka close-out reports its end with one message whose
 // text is exactly
@@ -30,11 +38,12 @@
 // {finished: false}; it is never created here.
 import fs from 'node:fs';
 import { isMainModule } from '../lib/cli-entry.mjs';
-import { sanitizeSessionId } from '../lib/agent-mailbox.mjs';
-import { readRolesDb, rolesForSession } from '../lib/seat-roles.mjs';
+import { sanitizeSessionId } from '../lib/session-id.mjs';
+import { lokaMarker } from '../lib/loka-marker.mjs';
+import { closeSeat, readRolesDb, roleClaimsForSession } from '../lib/seat-roles.mjs';
 import { heldBy, waitingFor } from '../lib/resource-leases.mjs';
 
-export const lokaMarker = (sessionId) => `LOKA-DONE ${sessionId}`;
+export { lokaMarker };
 
 const messages = (db, sinceIso) =>
   db.all("SELECT recipient_key, row_json FROM mailbox_rows WHERE kind = 'message' AND ts >= ? ORDER BY rowid", sinceIso)
@@ -61,8 +70,6 @@ const promptAfter = (transcript, afterMs) => {
 };
 
 export const finishedVerdict = (db, { sessionId, sinceMs = 0, transcript = null }) => {
-  if (rolesForSession(db, sessionId).length) return { finished: false, reason: 'holds-role' };
-  if (heldBy(db, { sessionId }).length || waitingFor(db, { sessionId }).length) return { finished: false, reason: 'holds-lease' };
   const sid = sanitizeSessionId(sessionId);
   const suffix = `__${sid}`;
   const sinceIso = new Date(Number(sinceMs)).toISOString();
@@ -73,7 +80,17 @@ export const finishedVerdict = (db, { sessionId, sinceMs = 0, transcript = null 
   ).at(-1);
   if (!marker) return { finished: false, reason: 'no-marker' };
   const markerMs = Date.parse(marker.ts);
-  const later = rows.some((m) => m.id !== marker.id && !withdrawn.has(m.id) && Date.parse(m.ts) > markerMs
+  // The marker ends the claims the seat held when it sent it; only a claim made
+  // AFTER it is the seat working again. (A picky claim after the marker is
+  // refused at the store, lib/seat-roles.mjs claimRole; this covers a row that
+  // was written before that rule, or by hand.)
+  if (roleClaimsForSession(db, sessionId).some((r) => Number(r.claimed_at ?? 0) > markerMs)) {
+    return { finished: false, reason: 'holds-role' };
+  }
+  if (heldBy(db, { sessionId }).length || waitingFor(db, { sessionId }).length) return { finished: false, reason: 'holds-lease' };
+  // Role-store events (a takeover notice, say) are delivered like mail but are
+  // bookkeeping: they do not make the finished seat "working again".
+  const later = rows.some((m) => m.id !== marker.id && !withdrawn.has(m.id) && m.roleEvent !== true && Date.parse(m.ts) > markerMs
     && (String(m.from ?? '').endsWith(suffix) || m.recipientKey.endsWith(suffix)));
   if (later) return { finished: false, reason: 'later-mail' };
   if (!transcript) return { finished: false, reason: 'no-transcript' };
@@ -89,7 +106,11 @@ if (isMainModule(import.meta.url)) {
   const [cmd, ...a] = process.argv.slice(2);
   if (cmd === 'check' && a.length === 3) {
     try {
-      const v = readRolesDb((db) => finishedVerdict(db, { sessionId: a[0], sinceMs: a[1], transcript: a[2] }), null);
+      const v = readRolesDb((db) => {
+        const verdict = finishedVerdict(db, { sessionId: a[0], sinceMs: a[1], transcript: a[2] });
+        if (verdict.finished) closeSeat(db, { sessionId: a[0], markerId: verdict.id, now: Date.parse(verdict.ts) });
+        return verdict;
+      }, null);
       process.stdout.write(`${JSON.stringify(v ?? { finished: false, reason: 'no-marker' })}\n`);
     } catch (e) {
       process.stderr.write(`seat-finished: ${e.message}\n`);

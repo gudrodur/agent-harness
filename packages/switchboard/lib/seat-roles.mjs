@@ -31,6 +31,13 @@ export const roleMailboxKey = (role) => `${ROLE_PREFIX}${validateRoleName(role)}
 export const claimRole = (db, { role, sessionId, cwd = null, windowId = null, now = Date.now() } = {}) => {
   validateRoleName(role);
   if (sessionId == null || sessionId === '') throw new Error('claimRole needs a session id');
+  const closed = seatClosed(db, sessionId);
+  if (closed) {
+    const e = new Error(`session ${sessionId} sent its LOKA-DONE marker at ${new Date(closed.ts).toISOString()} and is finished; it cannot claim role ${role} again`);
+    e.code = SEAT_CLOSED;
+    e.closed = closed;
+    throw e;
+  }
   db.run(
     `INSERT INTO seat_roles (role, session_id, cwd, window_id, claimed_at) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT (role) DO UPDATE SET
@@ -61,6 +68,35 @@ export const rolesForSession = (db, sessionId) =>
   sessionId == null
     ? []
     : db.all('SELECT role FROM seat_roles WHERE session_id = ? ORDER BY role', String(sessionId)).map((r) => r.role);
+
+// The roles a session holds, with their claim times: a close needs to tell a
+// claim made before the LOKA-DONE marker (ended by it) from one made after
+// (the seat working again).
+export const roleClaimsForSession = (db, sessionId) =>
+  sessionId == null
+    ? []
+    : db.all('SELECT role, cwd, window_id, claimed_at FROM seat_roles WHERE session_id = ? ORDER BY claimed_at, role', String(sessionId));
+
+// The marker's rule, in the store: a finished session holds no role and cannot
+// take one back. Every role row for the session is deleted, whatever location
+// it was claimed in, and the closure is recorded so claimRole refuses later.
+// Returns what it ended.
+export const closeSeat = (db, { sessionId, markerId = null, now = Date.now() } = {}) => {
+  if (sessionId == null || sessionId === '') throw new Error('closeSeat needs a session id');
+  const ended = rolesForSession(db, sessionId);
+  db.run('DELETE FROM seat_roles WHERE session_id = ?', String(sessionId));
+  db.run(
+    'INSERT INTO seat_closed (session_id, ts, marker_id) VALUES (?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET ts = excluded.ts, marker_id = excluded.marker_id',
+    String(sessionId), Number(now), markerId,
+  );
+  return { sessionId: String(sessionId), ended };
+};
+
+// The closure row {session_id, ts, marker_id}, or null.
+export const seatClosed = (db, sessionId) =>
+  sessionId == null ? null : db.get('SELECT * FROM seat_closed WHERE session_id = ?', String(sessionId)) ?? null;
+
+export const SEAT_CLOSED = 'SEAT_CLOSED';
 
 // The same, newest claim first (ties by name): the role a session took last is the one it runs as.
 export const rolesForSessionLatest = (db, sessionId) =>

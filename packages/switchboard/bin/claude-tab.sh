@@ -51,13 +51,15 @@
 #   --close ID --after-loka  close window ID, which this script did not launch, once
 #                its seat is shown to be finished: the session in the window sent ONE
 #                message whose whole text is "LOKA-DONE <its session id>" after it
-#                started (read from the store), holds no seat role, has no mail or
-#                prompt newer than that message, and is idle. The sender is
-#                self-asserted, so the marker can be forged. Refuses the caller's
-#                own window (exit 22), a busy seat (23), and a window with no
-#                Claude Code session, no marker, a role or later activity (24,
-#                naming which). Plain --close still refuses a window this script
-#                did not launch.
+#                started (read from the store), holds no seat role claimed after that
+#                marker (the marker itself releases the roles it held), has no mail
+#                or prompt newer than that message, and is idle. Role-store events
+#                (a takeover notice) are not mail. The sender is self-asserted, so
+#                the marker can be forged. Refuses the caller's own window (exit 22),
+#                a busy seat (23), and a window with no Claude Code session, no
+#                marker, a role claimed after it or later activity (24, naming
+#                which). Plain --close still refuses a window this script did not
+#                launch.
 #   --retire ID  close window ID, which this script did not launch, only for the
 #                session that took its role over: a handover row written by
 #                `agent-send --claim-role ... --take-over` must name ID and the
@@ -95,8 +97,9 @@
 # --close ID --after-loka exit codes (0 closed, or the window was already gone; 1 and 2 as above):
 #   22  the id is the caller's own window
 #   23  the seat is not idle (busy, or its state cannot be proven)
-#   24  no finished proof: no session, no LOKA-DONE marker, a seat role held, or
-#       activity after the marker
+#   24  no finished proof: no session, no LOKA-DONE marker, a role claimed AFTER
+#       the marker, or activity after the marker (a role held when the marker was
+#       sent is ended by it, not a refusal)
 #   25  the session holds a live resource lease, or waits in a resource queue
 # HELP-END
 #

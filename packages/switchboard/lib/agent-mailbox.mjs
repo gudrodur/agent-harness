@@ -29,10 +29,13 @@ import { AGENT_COMM_NAMES, PRESENCE_FILE, PRESENCE_STALE_MS, classifyBeacons, pr
 export { AGENT_COMM_NAMES };
 import { kittyLs, kittyKnownDown, kittyDownMessage } from './kitty-ls.mjs';
 import { defaultStorePath, withRetriedStore, pruneRetention } from './store.mjs';
+import { markerSessionFor } from './loka-marker.mjs';
+import { sanitizeSessionId } from './session-id.mjs';
 import {
   ROLE_PREFIX,
   allRoleHolders,
   claimRole,
+  closeSeat,
   roleFromTarget,
   roleHolder,
   rolesForSession,
@@ -41,6 +44,10 @@ import {
   withRolesDb,
   markNudged,
 } from './seat-roles.mjs';
+// The mailbox's key suffix and the marker's own suffix must agree; both use
+// this one sanitizer (lib/session-id.mjs), so a marker row is recognised by
+// the same key scan that finds a session's mail.
+export { sanitizeSessionId };
 
 export const MAILBOX_DIR =
   process.env.AGENT_SWITCHBOARD_MAILBOX_DIR ?? process.env.AGENT_MAILBOX_DIR ?? path.join(switchboardDir(), 'mailbox');
@@ -95,9 +102,8 @@ const dbReadRows = (store, key) =>
 // the suffix scan below matches what recipientKey builds. Every key ends in
 // `__<sanitized session id>`, which is what makes a session's mailbox
 // findable after its cwd moves (EnterWorktree changes the cwd half, never
-// the session id).
-export const sanitizeSessionId = (sessionId) =>
-  String(sessionId ?? 'anon').replace(/[^A-Za-z0-9._-]+/g, '_') || 'anon';
+// the session id). The function itself lives in lib/session-id.mjs so the
+// seat-close helpers can use it without importing this file (a cycle).
 
 // Filesystem-safe and deterministic: the same session always maps to the same
 // key from any caller. Leading '/' becomes '-', every other unsafe run '_'.
@@ -853,7 +859,7 @@ export const formatInboxLines = (found) =>
 
 export const TOPIC_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-export const appendMessage = ({ to, from, priority, text, topic, via, id, replaces, now = Date.now(), dir } = {}) => {
+export const appendMessage = ({ to, from, priority, text, topic, via, id, replaces, roleEvent, now = Date.now(), dir } = {}) => {
   if (!PRIORITIES.includes(priority)) throw new Error(`priority must be one of ${PRIORITIES.join('|')}, got '${priority}'`);
   if (topic != null && !TOPIC_RE.test(topic)) throw new Error(`topic must match ${TOPIC_RE}, got '${topic}'`);
   const row = {
@@ -865,6 +871,10 @@ export const appendMessage = ({ to, from, priority, text, topic, via, id, replac
     text,
   };
   if (via != null) row.via = via;
+  // A row an agent wrote about the role store (a takeover notice) is a role
+  // event, not mail: it is delivered, but it is not the recipient "working
+  // again" after its LOKA-DONE marker (bin/seat-finished.mjs).
+  if (roleEvent === true) row.roleEvent = true;
   // The row this one stands in for after the sender withdrew it (a re-queue or
   // the typed fallback), so --status on the old id can follow to the live row.
   if (replaces != null) row.replaces = replaces;
@@ -879,17 +889,31 @@ export const appendMessage = ({ to, from, priority, text, topic, via, id, replac
     return row;
   }
   if (useMailboxDb(dir)) {
-    withMailboxDb((store) =>
+    withMailboxDb((store) => {
       store.run(
         'INSERT INTO mailbox_rows (recipient_key, kind, msg_id, ts, row_json) VALUES (?, ?, ?, ?, ?)',
         to, 'message', row.id, row.ts, JSON.stringify(row),
-      ),
-    );
+      );
+      closeSeatOnMarker(store, row);
+    });
     return row;
   }
   fs.mkdirSync(resolveMailboxDir(dir), { recursive: true });
   fs.appendFileSync(mailboxPath(to, { dir }), `${JSON.stringify(row)}\n`);
+  const sessionId = markerSessionFor(row);
+  if (sessionId != null) withRolesDb((db) => closeSeat(db, { sessionId, markerId: row.id, now: Date.parse(row.ts) }));
   return row;
+};
+
+// A LOKA-DONE marker is the seat's own end, so recording it ends the seat's
+// claims in the same transaction: every role it holds goes, and its session id
+// cannot claim one again (lib/seat-roles.mjs closeSeat). This is the marker's
+// rule wherever the row is written, so a fresh marker never leaves a seat that
+// "took its role back". A marker recorded before this rule is still handled by
+// the close itself (bin/seat-finished.mjs ends the claims on a finished verdict).
+const closeSeatOnMarker = (store, row) => {
+  const sessionId = markerSessionFor(row);
+  if (sessionId != null) closeSeat(store, { sessionId, markerId: row.id, now: Date.parse(row.ts) });
 };
 
 const appendRow = (key, kind, row, dir) => {

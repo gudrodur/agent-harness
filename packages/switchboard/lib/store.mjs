@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS seat_roles (
   window_id TEXT,
   claimed_at INTEGER
 );
+-- One row per session that sent its LOKA-DONE marker: the marker ends the
+-- seat's claims, so the roles it held were released and a later claim by the
+-- same session is refused (the seat is finished, not moved). ts is the
+-- marker's own timestamp; marker_id names the row that proved it.
+CREATE TABLE IF NOT EXISTS seat_closed (
+  session_id TEXT PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  marker_id TEXT
+);
 -- One row per session that has been shown the claim-role nudge, so the nudge
 -- fires once however many hooks write presence for the same prompt.
 CREATE TABLE IF NOT EXISTS seat_nudges (
@@ -406,6 +415,9 @@ export const pruneRetention = (store, { now = Date.now() } = {}) => {
       deleted += Number(r.changes ?? 0);
     }
     store.run('DELETE FROM seat_nudges WHERE nudged_at < ?', now - RETENTION_MS);
+    // A finished session is long gone after 14 days; the closure only has to
+    // outlive the session (and any replay of its last tool calls).
+    store.run('DELETE FROM seat_closed WHERE ts < ?', now - RETENTION_MS);
   });
   return { deleted };
 };
