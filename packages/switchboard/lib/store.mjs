@@ -22,6 +22,9 @@
 //   removes an unacked row.
 // - seat_nudges rows are deleted 14 days after the nudge: a session still
 //   alive after that may see the claim-role nudge once more.
+// - seat_claim_refusals rows are deleted 14 days after the refusal: the notice
+//   is for the seat that met it, and a session still alive after that may see
+//   it once more.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -106,6 +109,15 @@ CREATE TABLE IF NOT EXISTS seat_closed (
 CREATE TABLE IF NOT EXISTS seat_nudges (
   session_id TEXT PRIMARY KEY,
   nudged_at INTEGER NOT NULL
+);
+-- One row per session whose AGENT_SEAT_ROLE the store refused to claim (a
+-- closed session), so the notice reaches the first prompt once and no later
+-- one. ts is the refusal time, detail the store's own message.
+CREATE TABLE IF NOT EXISTS seat_claim_refusals (
+  session_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  detail TEXT NOT NULL
 );
 -- One row per takeover that displaced another session: the evidence that lets
 -- the taker retire (close) the displaced seat's window and nothing else.
@@ -415,6 +427,7 @@ export const pruneRetention = (store, { now = Date.now() } = {}) => {
       deleted += Number(r.changes ?? 0);
     }
     store.run('DELETE FROM seat_nudges WHERE nudged_at < ?', now - RETENTION_MS);
+    store.run('DELETE FROM seat_claim_refusals WHERE ts < ?', now - RETENTION_MS);
     // A finished session is long gone after 14 days; the closure only has to
     // outlive the session (and any replay of its last tool calls).
     store.run('DELETE FROM seat_closed WHERE ts < ?', now - RETENTION_MS);
