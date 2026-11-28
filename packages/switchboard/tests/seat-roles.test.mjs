@@ -217,6 +217,43 @@ test('a replaced seat does not take its role back from a live successor', async 
   await withDb((db) => assert.equal(roleHolder(db, 'relay').session_id, 'succ-new'));
 });
 
+// A resumed session keeps its session id, and its LOKA-DONE marker has closed
+// it: the hook's AGENT_SEAT_ROLE claim is then refused. Every error used to be
+// swallowed, so the seat ran with no role and left no trace anywhere. It says
+// why once, on stderr, on the first prompt.
+test('a claim the marker closed says why once on stderr', async () => {
+  const { claimRoleFromEnv } = await import('../lib/agent-mailbox.mjs');
+  const { closeSeat } = await roles();
+  await withDb((db) => closeSeat(db, { sessionId: 'resumed-1', now: Date.now() - 60_000 }));
+  const lines = [];
+  const stderr = { write: (s) => lines.push(s) };
+  assert.equal(claimRoleFromEnv({ sessionId: 'resumed-1', role: 'seat-role', stderr }), null);
+  assert.equal(lines.length, 1, `one line, got ${JSON.stringify(lines)}`);
+  assert.match(lines[0], /^\[mailbox\] AGENT_SEAT_ROLE seat-role was not claimed: /);
+  assert.match(lines[0], /LOKA-DONE/);
+  assert.equal((lines[0].match(/\n/g) ?? []).length, 1, 'the notice is one line');
+  assert.equal(claimRoleFromEnv({ sessionId: 'resumed-1', role: 'seat-role', stderr }), null);
+  assert.equal(lines.length, 1, 'not repeated on the next prompt');
+});
+
+// The same through the real hook, which is where the seat reads it: one stderr
+// line on the first prompt, nothing on the next.
+test('the inject hook prints the closed-claim notice once', async () => {
+  const { closeSeat } = await roles();
+  await withDb((db) => closeSeat(db, { sessionId: 'closed-seat-1' }));
+  const run = () => spawnSync('node', [INJECT], {
+    encoding: 'utf-8',
+    input: JSON.stringify({ session_id: 'closed-seat-1', cwd: '/repo/proj' }),
+    env: childEnv({ AGENT_SEAT_ROLE: 'relay-closed' }),
+    timeout: 30_000,
+  });
+  const first = run();
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(first.stderr.trim().split('\n').length, 1, `one line only: ${first.stderr}`);
+  assert.match(first.stderr, /closed-seat-1 sent its LOKA-DONE marker .*is finished; it cannot claim role relay-closed again/);
+  assert.equal(run().stderr, '', 'a second prompt stays silent');
+});
+
 // ---- naming the store when it holds no live seats (#73) ----
 //
 // Run without the machine's AGENT_SWITCHBOARD_DB, the bin opens a different,
@@ -380,6 +417,20 @@ test('retention drops seat_nudges rows after 14 days', async () => {
     const left = db.all('SELECT session_id FROM seat_nudges').map((r) => r.session_id);
     assert.ok(!left.includes('old-nudge'));
     assert.ok(left.includes('new-nudge'));
+  });
+});
+
+test('retention drops a stale seat_claim_refusals row, so the notice can fire again', async () => {
+  const { markClaimRefusal } = await roles();
+  const { pruneRetention, RETENTION_MS } = await import('../lib/store.mjs');
+  const now = Date.now();
+  await withDb((db) => {
+    assert.equal(markClaimRefusal(db, 'old-refusal', { role: 'r', detail: 'd', now: now - RETENTION_MS - 1000 }), true);
+    assert.equal(markClaimRefusal(db, 'old-refusal', { role: 'r', detail: 'd', now }), false);
+    assert.equal(markClaimRefusal(db, 'new-refusal', { role: 'r', detail: 'd', now }), true);
+    pruneRetention(db, { now });
+    const left = db.all("SELECT session_id FROM seat_claim_refusals WHERE session_id LIKE '%refusal'").map((r) => r.session_id);
+    assert.deepEqual(left, ['new-refusal']);
   });
 });
 
