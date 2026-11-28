@@ -77,6 +77,7 @@ import {
   kittyWindows,
   recipientKey,
   findRecentTopicDelivery,
+  recordApiDelivery,
   recordTypedDelivery,
   supersedesNote,
   TOPIC_RE,
@@ -85,6 +86,7 @@ import {
 } from '../lib/agent-mailbox.mjs';
 import { claudeSessionsDir, procStat, switchboardDir } from '../lib/presence.mjs';
 import { kittyLs, kittyKnownDown, flattenWindows } from '../lib/kitty-ls.mjs';
+import { isOpencodeSessionId } from '../lib/opencode-server.mjs';
 import { nextDelay } from '../lib/backoff.mjs';
 import { claimRole, releaseRole, validateRoleName, withRolesDb } from '../lib/seat-roles.mjs';
 import { recordHandover } from '../lib/seat-handover.mjs';
@@ -258,6 +260,10 @@ const usage = () => `Usage:
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const kittySend = () => process.env.AGENT_SEND_KITTY_SEND ?? process.env.AGENT_SWITCHBOARD_SEND ?? path.join(HERE, 'kitty-send.sh');
+// The OpenCode prompt entry (`send` / `active`), the one place that talks to
+// an OpenCode server. A test seam, like AGENT_SEND_KITTY_SEND.
+const opencodePrompt = () => process.env.AGENT_SEND_OPENCODE_PROMPT ?? path.join(HERE, 'opencode-prompt.mjs');
+const OPENCODE_PROMPT_TIMEOUT_MS = 15000;
 // kitty-send.sh exit codes that mean NOTHING WAS SENT (its header's table):
 // 1 usage or precondition, 4 a dialog was open, 5 the idle wait ran out, 6 a
 // send is already queued, 7 mid-turn without --now/--queue/--wait-idle, 9
@@ -1115,6 +1121,63 @@ const main = (argv) => {
     warnNoLiveSeats();
     process.exit(3);
   }
+  // An OpenCode seat is reached through its own server, the way its phone
+  // client reaches it, never through kitty: kitty needs the tab to redraw, and
+  // under load it does not answer at all while the session keeps running. The
+  // server takes the text into the session's inbox (steer: before the agent's
+  // next model call, and it starts a run on an idle session; queue: after the
+  // current work) and answers with the message it created, which the helper
+  // reads back as the proof. The mailbox row is written and closed at once, so
+  // the recipient's own drain cannot deliver the text a second time.
+  //
+  // A server that is not there is not an error: this falls through to the
+  // mailbox and the kitty fallback exactly as before, and --verbose says which
+  // of the two answered and why. --no-wait keeps its promise (one durable row,
+  // no call), and --read/--who/--status never come here.
+  const deliverThroughServer = () => {
+    if (noWait) return false;
+    if (!isOpencodeSessionId(recipient.sessionId)) return false;
+    const delivery = priority === 'queue' || priority === 'idle' ? 'queue' : 'steer';
+    const args = [opencodePrompt(), 'send', '--session', recipient.sessionId, '--delivery', delivery, '--timeout', String(OPENCODE_PROMPT_TIMEOUT_MS)];
+    if (recipient.cwd) args.push('--directory', recipient.cwd);
+    const r = spawnSync(process.execPath, args, { input: text, encoding: 'utf8', timeout: OPENCODE_PROMPT_TIMEOUT_MS + 5000 });
+    let answer = null;
+    try {
+      answer = JSON.parse(String(r.stdout ?? '').trim().split('\n').filter(Boolean).pop() ?? 'null');
+    } catch {
+      answer = null;
+    }
+    if (answer == null) {
+      trace(`agent-send: ${recipient.sessionId} is an OpenCode session but its server answered nothing usable; falling back to the mailbox\n`);
+      return false;
+    }
+    // The server knows the session and took the prompt: it is delivered, or it
+    // is there and could not be read back. Either way the mailbox stays closed.
+    if (answer.ok === true && typeof answer.messageId === 'string') {
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const row = recordApiDelivery({
+        to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery, messageId: answer.messageId,
+      });
+      verdict(
+        `agent-send: delivered to ${to} through its OpenCode server (message ${answer.messageId}, ${delivery}; id ${row.id}; exit 0)\n`,
+        `agent-send: delivered to ${to}: POST /api/session/${recipient.sessionId}/prompt with delivery ${delivery} in ${recipient.cwd ?? '(no directory)'}, message ${answer.messageId} read back from the server; row ${row.id} in ${mailboxPath(recipient.key)} is closed as api (exit 0)\n`,
+      );
+      process.exit(0);
+    }
+    if (answer.code === 'unproven') {
+      const from = recipientKey({ cwd: process.cwd(), sessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null });
+      const row = recordApiDelivery({
+        to: recipient.key, from, priority, text, topic, id: takeRowId(), delivery,
+        messageId: answer.messageId ?? null, unproven: true,
+      });
+      process.stderr.write(`agent-send: the OpenCode server took the prompt for ${to} as message ${answer.messageId ?? '(no id)'} but reading it back failed (${answer.why}); row ${row.id} is closed so the text cannot arrive twice, and it is not resent: look at the session before sending again (exit 3: pending, do not resend)\n`);
+      process.exit(3);
+    }
+    trace(`agent-send: ${recipient.sessionId} was not delivered through its OpenCode server (${answer.code}: ${answer.why}); falling back to the mailbox\n`);
+    return false;
+  };
+  // Delivered, or exited with its own verdict; returns false to fall through.
+  deliverThroughServer();
   if (!recipient.hasConsumer && recipient.mailboxOnly !== true) {
     if (recipient.idleMinutes != null) kittyFallback(`seat idle ${recipient.idleMinutes}m, typing to wake it`, recipient.key ?? null);
     kittyFallback(`no mailbox consumer flag for ${to} (live beacon, flag off)`);

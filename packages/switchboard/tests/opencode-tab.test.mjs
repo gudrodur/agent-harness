@@ -278,13 +278,28 @@ test('a variant mismatch still closes the window and exits 3', async () => {
   assert.match(await fs.readFile(path.join(stateDir, 'closed'), 'utf8'), new RegExp(`id:${WID}`));
 });
 
-test('no beacon for the window: exit 3, window left open for a look', async () => {
+test('no beacon in the store: the launcher records one from the session and window it launched', async () => {
+  // A session on a shared server has no plugin in the client, so nothing writes
+  // a beacon for this tab. The launcher knows the session, the window and the
+  // client pid, and records the row itself rather than waiting 90 s for one
+  // that will never come (and leaving the tab invisible to --who meanwhile).
+  const sbDir = await fs.mkdtemp(path.join(os.tmpdir(), 'octab-sb-'));
+  const lib = fileURLToPath(new URL('../lib/presence.mjs', import.meta.url));
   await beacon(WID + 1);
   addSession('ses_new', MODEL);
-  const r = await tab(full());
-  assert.equal(r.code, 3);
-  assert.match(r.err, /not proven within 90 s \(beacon=0 session=ses_new\)/);
-  assert.equal(await exists('closed'), false);
+  try {
+    const r = await tab(full(), { AGENT_SWITCHBOARD_DIR: sbDir });
+    assert.equal(r.code, 0, `${r.out}${r.err}`);
+    assert.match(r.out, /SESSION=ses_new/);
+    assert.match(r.err, /this launcher recorded one/);
+    const read = await run(process.execPath, ['--input-type=module', '-e',
+      'const p = await import(process.argv[1]); const rows = p.readAllPresence(); console.log(JSON.stringify(rows.map((b) => ({ s: b.sessionId, w: b.windowId }))));',
+      lib], { env: isolatedEnv({ AGENT_SWITCHBOARD_DIR: sbDir }) });
+    const rows = JSON.parse(read.stdout.trim());
+    assert.deepEqual(rows, [{ s: 'ses_new', w: WID }]);
+  } finally {
+    await fs.rm(sbDir, { recursive: true, force: true });
+  }
 });
 
 test('a session older than the launch is not taken as proof', async () => {

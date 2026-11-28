@@ -288,7 +288,10 @@ Options:
   --cancel    with --to: kill that window's queued waiter, if any, and
               nothing else. It kills the pid recorded at --queue time, never
               a pattern: `pkill -f` with the target's own argv also matches
-              the shell running the pkill (seen twice, exit 144).
+              the shell running the pkill (seen twice, exit 144). An
+              OpenCode tab's --queue is the server's queue, not a waiter: it
+              was delivered when it was sent, so --cancel cannot withdraw it
+              from there and says so.
   --quiet     only errors on stderr
 
 No option, --now included, types a command that ends or wipes the
@@ -735,10 +738,54 @@ case "$TO" in
   *) WID="$TO" ;;
 esac
 
+# An OpenCode tab's session, as `opencode:<sid>`, or exit 1 when the window is
+# not an OpenCode tab (or its state cannot be read). One read serves the API
+# route below and the typed fallback's proof further down.
+opencode_tab_session() { # $1 = window id
+  local js sid
+  js=$(tab_state_json "$1" "${WREC:-}") || return 1
+  sid=$(printf '%s' "$js" | jq -r '.session // ""' 2>/dev/null)
+  case "$sid" in opencode:?*) printf '%s' "$sid" ;; *) return 1 ;; esac
+}
+# The OpenCode prompt entry: the one place here that talks to a server.
+OPENCODE_PROMPT_JS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/opencode-prompt.mjs"
+# An OpenCode tab is reached through its own server first. The prompt enters the
+# session's inbox (`delivery=queue` after the current work, `steer` before the
+# next model call) and the server answers with the message it created, which the
+# entry reads back: that proof does not depend on the tab redrawing at all, and
+# a loaded machine that starves kitty cannot swallow the message. A machine with
+# no server configured, or one that does not answer, falls through to the typed
+# path, whose receipt is a new row in the tab's own store.
+# Exit 0 delivered; 3 the server took it but the read-back failed (never
+# resend blind); 1 nothing was sent through the server, so type instead.
+opencode_api_send() { # $1 = session id, $2 = steer|queue
+  local out rc why mid api_ms
+  case "$TIMEOUT" in ''|*[!0-9]*) api_ms=15000 ;; *) api_ms=$(( TIMEOUT * 1000 )) ;; esac
+  [ "$api_ms" -ge 1000 ] || api_ms=1000
+  rc=0
+  out=$(printf '%s' "$TEXT" | node "$OPENCODE_PROMPT_JS" send --session "$1" --delivery "$2" --timeout "$api_ms" 2>/dev/null) || rc=$?
+  why=$(printf '%s' "$out" | jq -r '.why // empty' 2>/dev/null)
+  mid=$(printf '%s' "$out" | jq -r '.messageId // empty' 2>/dev/null)
+  case "$rc" in
+    0)
+      note "delivered to session $1 through its OpenCode server (message ${mid:-?}, delivery $2); nothing was typed into the tab"
+      exit 0 ;;
+    3)
+      note "the OpenCode server took the prompt for session $1 as message ${mid:-?}, but its message could not be read back (${why:-no reason given})."
+      die "not proven delivered — do NOT send it again blind; look at the session first" 3 ;;
+    *)
+      note "session $1 did not take the prompt through its OpenCode server (${why:-no answer}); typing it into window $WID instead"
+      return 1 ;;
+  esac
+}
+
 # --cancel: the waiter is what is being stopped, so a dead window is not an
 # error here — its waiter (if any) is killed and the pid file removed either way.
 if [ "$CANCEL" = 1 ]; then
   pf=$(queue_pidfile "$WID"); lf=$(queue_logfile "$WID")
+  if [ ! -f "$pf" ] && oc=$(opencode_tab_session "$WID"); then
+    die "window $WID is an OpenCode tab and its --queue was handed to the session's server, which took it at send time: there is no waiter to cancel and nothing can be withdrawn from here (message sent to ${oc#opencode:})" 1
+  fi
   [ -f "$pf" ] || die "nothing is queued for window $WID" 1
   qpid=$(cat "$pf" 2>/dev/null || true)
   if [ -n "$qpid" ] && kill -0 "$qpid" 2>/dev/null; then
@@ -781,6 +828,14 @@ COPILOT_TAB=0; COPILOT_EVENTS=""; COPILOT_HEAD=""
 if [ -n "$copilot_pid" ] && copilot_dir=$(copilot_session_for_pid "$copilot_pid"); then
   COPILOT_EVENTS="$copilot_dir/events.jsonl"
   [ -r "$COPILOT_EVENTS" ] && COPILOT_TAB=1
+fi
+
+# --queue to an OpenCode tab: the server's own queue IS the wait, so the
+# message is delivered now and held by the session until its current work ends,
+# instead of a detached waiter polling a screen that may never redraw (a loaded
+# machine made those wait the whole 15 minutes and deliver nothing).
+if [ "$QUEUE" = 1 ] && oc=$(opencode_tab_session "$WID"); then
+  opencode_api_send "${oc#opencode:}" queue || true
 fi
 
 # --queue: hand the wait to a detached waiter and return. The waiter is this
@@ -1001,6 +1056,9 @@ if [ "$CLAUDE_TAB" = 0 ] && state_json=$(tab_state_json "$WID" "$pre_rec"); then
         # the proof below is a NEW type:user row past it.
         OPENCODE_TAB=1; OPENCODE_SID="${TAB_SESSION#opencode:}"; STATE_KNOWN=1
         OPENCODE_HEAD=$(printf '%s' "$TEXT" | cut -c1-40 | tr -d '[:space:]')
+        # Its server first (see opencode_api_send): a prompt that needs no
+        # screen read. Typing with the store-row proof is the fallback.
+        opencode_api_send "$OPENCODE_SID" steer || true
         ;;
       *) : ;;  # no other tab kind has a record to prove a send by
     esac
