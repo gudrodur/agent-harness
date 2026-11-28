@@ -98,6 +98,15 @@ export const seatClosed = (db, sessionId) =>
 
 export const SEAT_CLOSED = 'SEAT_CLOSED';
 
+// Record a refused AGENT_SEAT_ROLE claim. True only for the first caller: the
+// hook for one prompt runs more than once (and every later prompt runs it
+// again), so INSERT OR IGNORE is what makes the notice once per session.
+export const markClaimRefusal = (db, sessionId, { role, detail, now = Date.now() } = {}) =>
+  Number(db.run(
+    'INSERT OR IGNORE INTO seat_claim_refusals (session_id, role, ts, detail) VALUES (?, ?, ?, ?)',
+    String(sessionId), String(role), Number(now), String(detail),
+  ).changes ?? 0) === 1;
+
 // The same, newest claim first (ties by name): the role a session took last is the one it runs as.
 export const rolesForSessionLatest = (db, sessionId) =>
   sessionId == null

@@ -34,9 +34,11 @@ import { markerSessionFor } from './loka-marker.mjs';
 import { sanitizeSessionId } from './session-id.mjs';
 import {
   ROLE_PREFIX,
+  SEAT_CLOSED,
   allRoleHolders,
   claimRole,
   closeSeat,
+  markClaimRefusal,
   roleFromTarget,
   roleHolder,
   rolesForSession,
@@ -628,14 +630,27 @@ export const liveRoleHolder = (db, role, { sessionId = null, presenceFile, inclu
   return beacons.length > 0 ? { ...held, beacon: beacons.find((b) => b.windowId != null) ?? beacons[0] } : null;
 };
 
-export const claimRoleFromEnv = ({ sessionId, cwd = null, windowId = null, role = process.env.AGENT_SEAT_ROLE, presenceFile } = {}) => {
+// Claim the role this session was launched with (AGENT_SEAT_ROLE) on its first
+// prompt. A refusal that is not worth a word (a live holder, an invalid name,
+// an unreadable store) is still silent; SEAT_CLOSED is not, because a resumed
+// session otherwise runs with no role and leaves no trace of why. It says so
+// once, on stderr, on the first prompt (seat_claim_refusals).
+export const claimRoleFromEnv = ({ sessionId, cwd = null, windowId = null, role = process.env.AGENT_SEAT_ROLE, presenceFile, stderr = process.stderr } = {}) => {
   if (!role || sessionId == null) return null;
   try {
     validateRoleName(role);
     return withRolesDb((db) => {
       if (roleHolder(db, role)?.session_id === String(sessionId)) return null;
       if (liveRoleHolder(db, role, { sessionId, presenceFile })) return null;
-      claimRole(db, { role, sessionId, cwd, windowId });
+      try {
+        claimRole(db, { role, sessionId, cwd, windowId });
+      } catch (e) {
+        if (e?.code !== SEAT_CLOSED) throw e;
+        if (markClaimRefusal(db, sessionId, { role, detail: e.message })) {
+          stderr.write(`[mailbox] AGENT_SEAT_ROLE ${role} was not claimed: ${e.message}\n`);
+        }
+        return null;
+      }
       return role;
     });
   } catch {
