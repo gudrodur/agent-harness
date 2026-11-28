@@ -236,7 +236,7 @@ test('send --drain folds a queued backlog into one steer, each note with the tim
     inbox: true,
     inboxItems: [
       queuedSeed('msg_backlog01', 'first queued note', '2026-11-28T10:02:03.000Z'),
-      queuedSeed('msg_backlog02', 'second queued note', '2026-11-28T10:44:05.000Z'),
+      queuedSeed('msg_backlog02', 'second queued note\nwith a second line', '2026-11-28T10:44:05.000Z'),
       queuedSeed('msg_backlog03', 'third queued note', '2026-11-28T11:22:00.000Z'),
     ],
   });
@@ -253,7 +253,7 @@ test('send --drain folds a queued backlog into one steer, each note with the tim
     assert.equal(combined.body.delivery, 'steer');
     assert.match(combined.body.text, /3 notes queued while your turn was running/);
     assert.match(combined.body.text, /- \[queued 2026-11-28T10:02:03.000Z\] first queued note/);
-    assert.match(combined.body.text, /- \[queued 2026-11-28T10:44:05.000Z\] second queued note/);
+    assert.match(combined.body.text, /- \[queued 2026-11-28T10:44:05.000Z\] second queued note\n {2}with a second line/, 'a multi-line note stays indented under its line');
     assert.match(combined.body.text, /- \[queued 2026-11-28T11:22:00.000Z\] third queued note/);
     assert.equal(fresh.body.text.trim(), 'the new note');
     assert.equal(fresh.body.delivery, 'steer');

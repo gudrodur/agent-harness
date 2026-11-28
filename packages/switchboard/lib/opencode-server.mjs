@@ -472,11 +472,14 @@ export const readInboxItems = async ({ sessionId, service = resolveService(), se
 };
 
 // One line of a coalesced note: the note's text and when it was queued, so the
-// seat can tell a stale note from one that just arrived.
+// seat can tell a stale note from one that just arrived. A multi-line note keeps
+// its following lines indented under its `- [queued …]` line, so the combined
+// note still reads as one list.
 export const queuedNoteLine = (item) => {
   const created = Number(item?.time?.created);
   const at = Number.isFinite(created) ? new Date(created).toISOString() : 'unknown time';
-  return `- [queued ${at}] ${String(item?.payload?.text ?? '').trim()}`;
+  const [first, ...rest] = String(item?.payload?.text ?? '').trim().split('\n');
+  return [`- [queued ${at}] ${first}`, ...rest.map((l) => `  ${l}`)].join('\n');
 };
 
 // The queue a `queue` delivery leaves for a seat whose turn never ends: the
