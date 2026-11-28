@@ -199,3 +199,56 @@ test('--cancel on an OpenCode tab says the server already took the prompt', asyn
   assert.match(r.err, /handed to the session's server/);
   assert.match(r.err, /nothing can be withdrawn/);
 });
+
+// ---- a helper killed mid-write must not become a second delivery -----------
+//
+// The entry prints an `accepted` line, then its final answer. A helper killed
+// between them leaves a torn last line. jq without a tolerant read exits 5 on
+// that line, and under `set -euo pipefail` the whole script would then exit 5:
+// agent-send's KITTY_SENT_NOTHING set, so the text would be queued and
+// delivered a second time. The read must yield "no accepted id" instead.
+const writeEntry = async (text, code) => {
+  const payload = path.join(stateDir, `entry-${n}.out`);
+  const script = path.join(stateDir, `entry-${n}.mjs`);
+  await fs.writeFile(payload, text);
+  // Run by `node`, like the real entry: a bash stub would be a syntax error.
+  await fs.writeFile(script, `import fs from 'node:fs';\nfs.writeSync(1, fs.readFileSync(${JSON.stringify(payload)}, 'utf8'));\nprocess.exit(${code});\n`);
+  return script;
+};
+
+test('a torn stream after the accepted line is exit 3, not 5, and nothing is typed', async () => {
+  // Exactly a killed helper: the accepted line is whole, the final line is not.
+  const entry = await writeEntry(
+    `${JSON.stringify({ ok: true, phase: 'accepted', messageId: 'msg_cut' })}\n{"ok":true,"message`,
+    5,
+  );
+  const r = await send(['--to', WID, '--text', 'one copy only'], { AGENT_SWITCHBOARD_OPENCODE_PROMPT: entry });
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
+  assert.match(r.err, /could not be read back/);
+  assert.match(r.err, /do NOT send it again blind/);
+  assert.match(r.err, /msg_cut/);
+  assert.equal(await typed(), false, 'a torn stream must never fall through to typing');
+});
+
+test('a torn accepted line is a fall-through, never jq\'s exit status as the script\'s', async () => {
+  // The id is unreadable, so nothing can be proven and the typed path is right.
+  // What must never happen is this script exiting 5: that is jq's parse-error
+  // status, and agent-send counts 5 as "nothing was sent" and queues the text,
+  // which would deliver it twice. The read is tolerant, so a tear inside the
+  // marker is simply "no id", not a fatal status.
+  const entry = await writeEntry('{"ok":true,"phase":"accepted","messageI\n', 5);
+  const r = await send(['--to', WID, '--text', 'nothing provable', '--timeout', '3'], { AGENT_SWITCHBOARD_OPENCODE_PROMPT: entry });
+  assert.notEqual(r.code, 5, `a jq tear must not become the script's exit: ${r.out}${r.err}`);
+  assert.match(r.err, /typing it into window/);
+  assert.equal(await typed(), true);
+});
+
+test('a stream with no accepted line is a genuine nothing-sent, and the typed path runs', async () => {
+  // Nothing was accepted, so falling back is right: this pins that the
+  // tolerance above did not turn every failure into "do not resend".
+  const entry = await writeEntry('not json at all\n', 5);
+  const r = await send(['--to', WID, '--text', 'typed after all', '--timeout', '4'], { AGENT_SWITCHBOARD_OPENCODE_PROMPT: entry });
+  assert.equal(r.code, 3, `${r.out}${r.err}`);
+  assert.match(r.err, /typing it into window/);
+  assert.equal(await typed(), true);
+});

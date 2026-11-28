@@ -748,7 +748,15 @@ opencode_tab_session() { # $1 = window id
   case "$sid" in opencode:?*) printf '%s' "$sid" ;; *) return 1 ;; esac
 }
 # The OpenCode prompt entry: the one place here that talks to a server.
-OPENCODE_PROMPT_JS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/opencode-prompt.mjs"
+OPENCODE_PROMPT_JS="${AGENT_SWITCHBOARD_OPENCODE_PROMPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/opencode-prompt.mjs}"
+# Read the entry's JSON stream one line at a time. `-R` keeps a torn last line
+# as raw text and `fromjson?` drops it, so a helper killed mid-write yields
+# "nothing found" instead of jq's exit status: under `set -euo pipefail` an
+# unguarded jq would abort this script with 5, which is in agent-send's
+# "nothing was sent" set, so the text would be delivered a second time.
+stream_field() { # $1 = raw stream, $2 = jq filter over the parsed objects
+  printf '%s' "$1" | jq -R -s -r "split(\"\n\") | map(fromjson? // empty) | map(select(type == \"object\")) | $2" 2>/dev/null || true
+}
 # An OpenCode tab is reached through its own server first. The prompt enters the
 # session's inbox (`delivery=queue` after the current work, `steer` before the
 # next model call) and the server answers with the message it created, which the
@@ -764,12 +772,12 @@ opencode_api_send() { # $1 = session id, $2 = steer|queue
   [ "$api_ms" -ge 1000 ] || api_ms=1000
   rc=0
   out=$(printf '%s' "$TEXT" | node "$OPENCODE_PROMPT_JS" send --session "$1" --delivery "$2" --timeout "$api_ms" 2>/dev/null) || rc=$?
-  why=$(printf '%s' "$out" | jq -r 'select(.phase != "accepted") | .why // empty' 2>/dev/null | tail -1)
-  mid=$(printf '%s' "$out" | jq -r 'select(.phase != "accepted") | .messageId // empty' 2>/dev/null | tail -1)
+  why=$(stream_field "$out" 'map(select(.phase != "accepted")) | last | .why // empty')
+  mid=$(stream_field "$out" 'map(select(.phase != "accepted")) | last | .messageId // empty')
   # The entry prints an `accepted` line the moment the server takes the prompt,
   # before the read-back. Seeing it with no final answer means the proof was cut
   # off, not that nothing was sent: typing now would deliver the text twice.
-  acc=$(printf '%s' "$out" | jq -r 'select(.phase == "accepted") | .messageId // empty' 2>/dev/null | tail -1)
+  acc=$(stream_field "$out" 'map(select(.phase == "accepted")) | last | .messageId // empty')
   case "$rc" in
     0)
       note "delivered to session $1 through its OpenCode server (message ${mid:-?}, delivery $2); nothing was typed into the tab"
